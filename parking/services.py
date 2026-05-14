@@ -58,10 +58,10 @@ def seed_demo_data() -> None:
         ("C4", "standard", 4, 3),
     ]
     for section, spot_type, x, y in specs:
-        ParkingSpot.objects.get_or_create(
+        ParkingSpot.objects.update_or_create(
             lot=lot,
             section=section,
-            defaults={"spot_type": spot_type, "status": "vacant", "coord_x": x, "coord_y": y},
+            defaults={"spot_type": spot_type, "coord_x": x, "coord_y": y},
         )
     lot.total_capacity = lot.spots.count()
     lot.save(update_fields=["total_capacity"])
