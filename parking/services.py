@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Iterable
 
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
@@ -43,19 +42,24 @@ def seed_demo_data() -> None:
         lot_id=1,
         defaults={"name": "Hanium Smart Parking", "address": "Seoul Demo Campus", "total_capacity": 12},
     )
-    specs: Iterable[tuple[str, str, float, float]] = [
-        ("A1", "standard", 1, 1),
-        ("A2", "standard", 2, 1),
-        ("A3", "compact", 3, 1),
-        ("A4", "ev", 4, 1),
-        ("B1", "standard", 1, 2),
-        ("B2", "standard", 2, 2),
-        ("B3", "compact", 3, 2),
-        ("B4", "disabled", 4, 2),
-        ("C1", "standard", 1, 3),
-        ("C2", "standard", 2, 3),
-        ("C3", "ev", 3, 3),
-        ("C4", "standard", 4, 3),
+    # Layout dimensions (mm): spot 200x300, line 25, aisle 550
+    # Origin (0, 0) = 주차장 입구 (bottom-left)
+    _PITCH = 225.0    # spot_width(200) + line_width(25)
+    _START_X = 175.0  # left margin ~75mm + half spot width 100mm
+    _A_Y = 1000.0     # spot_depth(300) + aisle(550) + half_depth(150)
+    _B_Y = 150.0      # half_depth(150) from bottom
+
+    specs: list[tuple[str, str, float, float]] = [
+        # A열 — 출구 방향 (위쪽)
+        ("A1", "standard", _START_X,               _A_Y),
+        ("A2", "standard", _START_X + _PITCH,       _A_Y),
+        ("A3", "standard", _START_X + _PITCH * 2,   _A_Y),
+        ("A4", "standard", _START_X + _PITCH * 3,   _A_Y),
+        # B열 — 입구 방향 (아래쪽)
+        ("B1", "standard", _START_X,               _B_Y),
+        ("B2", "standard", _START_X + _PITCH,       _B_Y),
+        ("B3", "standard", _START_X + _PITCH * 2,   _B_Y),
+        ("B4", "standard", _START_X + _PITCH * 3,   _B_Y),
     ]
     for section, spot_type, x, y in specs:
         ParkingSpot.objects.update_or_create(
