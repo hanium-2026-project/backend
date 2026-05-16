@@ -43,7 +43,13 @@ def seed_demo_data() -> None:
     """
     lot, _ = ParkingLot.objects.get_or_create(
         lot_id=1,
-        defaults={"name": "Hanium Smart Parking", "address": "Seoul Demo Campus", "total_capacity": 12},
+        defaults={
+            "name": "Hanium Smart Parking",
+            "address": "Seoul Demo Campus",
+            "total_capacity": 8,
+            "lot_width": 1200.0,
+            "lot_height": 1200.0,
+        },
     )
     # Layout dimensions (mm): spot 200x300, line 25, aisle 550
     # Origin (0, 0) = 주차장 입구 (bottom-left)
