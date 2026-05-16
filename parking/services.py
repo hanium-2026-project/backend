@@ -45,8 +45,8 @@ def seed_demo_data() -> None:
     # Layout dimensions (mm): spot 200x300, line 25, aisle 550
     # Origin (0, 0) = 주차장 입구 (bottom-left)
     _PITCH = 225.0    # spot_width(200) + line_width(25)
-    _START_X = 175.0  # left margin ~75mm + half spot width 100mm
-    _A_Y = 1000.0     # spot_depth(300) + aisle(550) + half_depth(150)
+    _START_X = 425.0  
+    _A_Y = 1050.0     # B_depth(300) + line(25) + aisle(550) + line(25) + half_depth(150)
     _B_Y = 150.0      # half_depth(150) from bottom
 
     specs: list[tuple[str, str, float, float]] = [
