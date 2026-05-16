@@ -71,6 +71,10 @@ def seed_demo_data() -> None:
         ("B3", "standard", _START_X + _PITCH * 2,   _B_Y),
         ("B4", "standard", _START_X + _PITCH * 3,   _B_Y),
     ]
+    # specs에 없는 스팟 제거 (ex. 이전 C열 잔존 데이터 정리)
+    current_sections = [section for section, *_ in specs]
+    lot.spots.exclude(section__in=current_sections).delete()
+
     for section, spot_type, x, y in specs:
         ParkingSpot.objects.update_or_create(
             lot=lot,
