@@ -24,6 +24,7 @@ from .models import (
 
 ENTRY_POINT: tuple[float, float] = (150.0, 0.0)      # 주차장 입구 — 좌측 도로(300mm) 중심, 하단
 EXIT_POINT: tuple[float, float] = (150.0, 1200.0)    # 주차장 출구 — 좌측 도로(300mm) 중심, 상단
+AISLE_Y: float = 600.0                               # 중앙 주행로 y좌표 — B열(150)과 A열(1050) 사이 중간
 
 SPOT_PREFERENCE_BY_VEHICLE = {
     "ev": ["ev", "standard", "compact"],
@@ -126,11 +127,19 @@ def recommend_spot(lot_id: int | None = None, vehicle_type: str = "sedan") -> Pa
 
 
 def build_route_plan(vehicle: Vehicle, target_spot: ParkingSpot, start: tuple[float, float] = ENTRY_POINT) -> RoutePlan:
-    """Create a simple waypoint route that can later be replaced by RL output."""
+    """Create a polyline waypoint route along the actual driving path.
+
+    MVP 수준의 단순 route graph: 대각선 이동 없이 직교 경로(entry → aisle 진입 →
+    aisle 수평 이동 → spot 진입)로 구성해 프론트 polyline 렌더링이 실제 차량
+    이동처럼 보이도록 한다.
+    """
     start_x, start_y = start
+    # aisle_entry: 입구에서 수직으로 중앙 주행로까지 이동
+    # aisle: 주행로를 수평으로 목표 칸 x까지 이동 후 수직 진입
     waypoints = [
         {"x": start_x, "y": start_y, "label": "entry"},
-        {"x": target_spot.coord_x, "y": start_y, "label": "aisle"},
+        {"x": start_x, "y": AISLE_Y, "label": "aisle_entry"},
+        {"x": target_spot.coord_x, "y": AISLE_Y, "label": "aisle"},
         {"x": target_spot.coord_x, "y": target_spot.coord_y, "label": target_spot.section},
     ]
     return RoutePlan.objects.create(
