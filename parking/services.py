@@ -22,6 +22,9 @@ from .models import (
 )
 
 
+ENTRY_POINT: tuple[float, float] = (150.0, 0.0)      # 주차장 입구 — 좌측 도로(300mm) 중심, 하단
+EXIT_POINT: tuple[float, float] = (150.0, 1200.0)    # 주차장 출구 — 좌측 도로(300mm) 중심, 상단
+
 SPOT_PREFERENCE_BY_VEHICLE = {
     "ev": ["ev", "standard", "compact"],
     "compact": ["compact", "standard"],
@@ -82,7 +85,7 @@ def seed_demo_data() -> None:
 
 def _distance_from_entry(spot: ParkingSpot) -> float:
     """Score a spot by distance from the current MVP entry coordinate."""
-    return (spot.coord_x**2 + spot.coord_y**2) ** 0.5
+    return ((spot.coord_x - ENTRY_POINT[0]) ** 2 + (spot.coord_y - ENTRY_POINT[1]) ** 2) ** 0.5
 
 
 def recommend_spot(lot_id: int | None = None, vehicle_type: str = "sedan") -> ParkingSpot:
@@ -116,7 +119,7 @@ def recommend_spot(lot_id: int | None = None, vehicle_type: str = "sedan") -> Pa
     return recommended
 
 
-def build_route_plan(vehicle: Vehicle, target_spot: ParkingSpot, start: tuple[float, float] = (0.0, 0.0)) -> RoutePlan:
+def build_route_plan(vehicle: Vehicle, target_spot: ParkingSpot, start: tuple[float, float] = ENTRY_POINT) -> RoutePlan:
     """Create a simple waypoint route that can later be replaced by RL output."""
     start_x, start_y = start
     waypoints = [
