@@ -2,7 +2,18 @@
 
 Django REST Framework backend for the intelligent parking scheduling and control MVP.
 
-## Setup
+## Quick start with Docker (recommended)
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+Backend serves on http://localhost:8000, Redis on 6379. The compose file
+attaches both containers to the `hanium` network and aliases Redis as
+`redis` so `REDIS_URL=redis://redis:6379/0` in `.env` works out of the box.
+
+## Local setup (conda / venv)
 
 ```bash
 python -m pip install -r requirements.txt
