@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
@@ -9,6 +10,8 @@ from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
+
+logger = logging.getLogger(__name__)
 
 from .models import (
     Camera,
@@ -42,7 +45,10 @@ def seed_demo_data() -> None:
     plus this function, while tests can call it repeatedly because lookups are
     idempotent.
     """
-    lot, _ = ParkingLot.objects.get_or_create(
+    # update_or_create ensures dimensions are refreshed on every seed run.
+    # get_or_create would silently keep the old 0.0 default for lots that were
+    # created before lot_width/lot_height were introduced (migration 0002).
+    lot, _ = ParkingLot.objects.update_or_create(
         lot_id=1,
         defaults={
             "name": "Hanium Smart Parking",
@@ -157,14 +163,33 @@ def build_route_plan(vehicle: Vehicle, target_spot: ParkingSpot, start: tuple[fl
 
 
 def _broadcast_state(event: str, payload: dict) -> None:
-    """Publish a state update to dashboard WebSocket clients when available."""
+    """Publish a state update to dashboard WebSocket clients when available.
+
+    Broadcast is a side-effect of business operations. A failure here (e.g.
+    Redis is briefly unavailable) must NOT roll back the surrounding DB
+    transaction, so any exception is logged and swallowed.
+    """
     channel_layer = get_channel_layer()
     if not channel_layer:
         return
-    async_to_sync(channel_layer.group_send)(
-        "parking_dashboard",
-        {"type": "parking.state", "payload": {"event": event, **payload}},
-    )
+    try:
+        async_to_sync(channel_layer.group_send)(
+            "parking_dashboard",
+            {"type": "parking.state", "payload": {"event": event, **payload}},
+        )
+    except Exception as exc:  # pragma: no cover - depends on broker availability
+        logger.warning("dashboard broadcast failed (event=%s): %s", event, exc)
+
+
+def _broadcast_after_commit(event: str, payload: dict) -> None:
+    """Schedule a broadcast to fire after the current DB transaction commits.
+
+    Without on_commit, the broadcast would observe (and downstream consumers
+    could react to) state that may still be rolled back. Combined with the
+    try/except inside _broadcast_state, this gives us at-most-once delivery
+    with no impact on transactional integrity.
+    """
+    transaction.on_commit(lambda: _broadcast_state(event, payload))
 
 
 @transaction.atomic
@@ -186,7 +211,7 @@ def process_entry(license_plate: str, vehicle_type: str = "sedan", lot_id: int |
     transaction_record = EntryExit.objects.create(vehicle=vehicle, spot=spot)
     ParkingAssignment.objects.create(vehicle=vehicle, spot=spot, status="occupied")
     route_plan = build_route_plan(vehicle=vehicle, target_spot=spot)
-    _broadcast_state(
+    _broadcast_after_commit(
         "entry",
         {"license_plate": license_plate, "spot_id": spot.spot_id, "transaction_id": transaction_record.transaction_id},
     )
@@ -215,7 +240,7 @@ def process_exit(license_plate: str) -> EntryExit:
         status="completed",
         released_at=timezone.now(),
     )
-    _broadcast_state(
+    _broadcast_after_commit(
         "exit",
         {"license_plate": license_plate, "spot_id": spot.spot_id, "transaction_id": transaction_record.transaction_id},
     )
@@ -227,7 +252,7 @@ def update_camera_heartbeat(camera: Camera, status: str = "online") -> Camera:
     camera.status = status
     camera.last_heartbeat = timezone.now()
     camera.save(update_fields=["status", "last_heartbeat"])
-    _broadcast_state("camera_heartbeat", {"camera_id": camera.camera_id, "status": camera.status})
+    _broadcast_after_commit("camera_heartbeat", {"camera_id": camera.camera_id, "status": camera.status})
     return camera
 
 
@@ -253,6 +278,8 @@ def dashboard_state() -> dict:
                 "name": lot.name,
                 "address": lot.address,
                 "total_capacity": lot.total_capacity,
+                "lot_width": lot.lot_width,
+                "lot_height": lot.lot_height,
                 "vacant_count": lot.vacant_count,
                 "occupied_count": lot.occupied_count,
                 "reserved_count": lot.reserved_count,
