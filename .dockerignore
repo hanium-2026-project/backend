@@ -1,0 +1,54 @@
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Local DB — 컨테이너 부팅 시 마이그레이션 + seed_demo로 깨끗하게 만들어진다.
+# 호스트 DB가 이미지에 섞이면 lot_width=0.0 같은 오래된 값을 끌고 오는 사고 발생.
+*.sqlite3
+*.sqlite3-journal
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Test / coverage
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Backups
+*.bak
+*.tmp
+
+# Docs / meta — 런타임에 필요 없음
+README.md
+
+# OS
+.DS_Store
+Thumbs.db
