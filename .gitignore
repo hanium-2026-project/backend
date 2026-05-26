@@ -8,3 +8,9 @@ staticfiles/
 media/
 .coverage
 htmlcov/
+outputs/
+*.mp4
+*.gif
+*.png
+tb_logs/
+models/
