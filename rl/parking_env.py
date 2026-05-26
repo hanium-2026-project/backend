@@ -98,6 +98,15 @@ SLOT_ROUTES: dict[str, list[str]] = {
 }
 BOTTLENECK_NODES: list[str] = ["entrance", "A_corridor", "B_corridor"]
 
+# Exit routes: reverse of each entry route (slot_front → … → entrance).
+# Exiting vehicles follow these paths and their intervals are registered
+# in _reservations with kind="exiting" so the Safety Shield detects
+# conflicts between entering and exiting traffic on shared waypoints.
+EXIT_ROUTES: dict[str, list[str]] = {
+    slot: list(reversed(route))
+    for slot, route in SLOT_ROUTES.items()
+}
+
 _ALL_NODES: list[str] = sorted(
     {node for route in SLOT_ROUTES.values() for node in route}
 )
@@ -213,6 +222,9 @@ class ParkingRoutingEnv(gym.Env):
         self.n_fallback_triggers: int = 0
         self._departure_count: int = 0
         self._fast_forward_count: int = 0
+        # Exiting vehicle log: accumulated per-episode for visualisation.
+        # Each entry: {id, slot, slot_idx, route, route_intervals, enter_time}
+        self._exiting_log: list[dict[str, Any]] = []
 
     # ─── Gymnasium API ────────────────────────────────────────────────────────
 
@@ -463,12 +475,19 @@ class ParkingRoutingEnv(gym.Env):
             v["remaining_eta"] = max(0.0, intervals[-1][1] - t)
 
             if t < intervals[-1][1]:
-                v["status"] = "moving"
+                # Still in transit — preserve "exiting" status, mark others "moving"
+                if v["status"] != "exiting":
+                    v["status"] = "moving"
                 still_moving.append(v)
             else:
-                v["status"] = "parked"
-                # Vehicle is now physically parked; stays in _parked_vehicles
-                # until depart_time is reached by _process_departures().
+                if v["status"] == "exiting":
+                    # Physical exit complete: purge exit-route reservations
+                    self._remove_reservations_for_vehicle(v["id"])
+                    # Not added to still_moving → removed from active_vehicles
+                else:
+                    v["status"] = "parked"
+                    # Entering vehicle physically parked; _parked_vehicles
+                    # handles the scheduled departure.
 
         self._active_vehicles = still_moving
 
@@ -505,15 +524,20 @@ class ParkingRoutingEnv(gym.Env):
     # ─── Departure Layer ──────────────────────────────────────────────────────
 
     def _process_departures(self) -> int:
-        """Free slots whose depart_time ≤ current_time.
+        """Initiate physical exit for vehicles whose depart_time has elapsed.
 
         For each departing vehicle:
-          - Sets _slot_statuses[slot_idx] = STATUS_FREE.
-          - Calls _remove_reservations_for_vehicle() to purge all of that
-            vehicle's entries from every node's reservation list.
-          - Increments _departure_count.
+          1. Sets _slot_statuses[slot_idx] = STATUS_FREE immediately so the
+             agent can assign the slot to an incoming vehicle right away.
+          2. Removes the parked-phase reservation (_remove_reservations_for_vehicle).
+          3. Calls _spawn_exiting_vehicle() which builds the exit route,
+             registers exit-route reservations (kind="exiting") in
+             _reservations, and adds the vehicle to _active_vehicles.
+          4. Increments _departure_count.
 
-        Returns the number of vehicles that departed this call.
+        departure_count is incremented at exit *start* (not completion).
+
+        Returns the number of exits initiated this call.
         """
         t = self._current_time
         still_parked: list[dict[str, Any]] = []
@@ -521,8 +545,13 @@ class ParkingRoutingEnv(gym.Env):
 
         for pv in self._parked_vehicles:
             if t >= pv["depart_time"]:
+                # Free the slot at exit start — new vehicles can be assigned
+                # immediately while this vehicle is still physically leaving.
                 self._slot_statuses[pv["slot_idx"]] = STATUS_FREE
+                # Remove parked-phase reservation before registering exit route
                 self._remove_reservations_for_vehicle(pv["id"])
+                # Create physical exiting vehicle
+                self._spawn_exiting_vehicle(pv)
                 self._departure_count += 1
                 n_departed += 1
             else:
@@ -530,6 +559,53 @@ class ParkingRoutingEnv(gym.Env):
 
         self._parked_vehicles = still_parked
         return n_departed
+
+    def _spawn_exiting_vehicle(self, parked_vehicle: dict[str, Any]) -> None:
+        """Create a physically-moving exit vehicle from a parked vehicle record.
+
+        Exit route = reversed entry route (slot_front → … → entrance).
+        Exit-route reservations are registered with kind="exiting" so the
+        Safety Shield detects conflicts between entering and exiting traffic.
+        The vehicle is added to _active_vehicles with status="exiting".
+        """
+        t_start   = self._current_time
+        slot      = parked_vehicle["slot"]
+        exit_route = EXIT_ROUTES[slot]
+        intervals  = self._build_intervals(exit_route, t_start)
+
+        # Register exit-route reservations (Safety Shield sees these)
+        self._register_reservation(
+            exit_route, intervals, parked_vehicle["id"], kind="exiting"
+        )
+
+        p0 = NODE_COORDINATES.get(exit_route[0], ENTRY_POINT)
+        vehicle: dict[str, Any] = {
+            "id":                 parked_vehicle["id"],
+            "slot":               slot,
+            "slot_idx":           parked_vehicle["slot_idx"],
+            "route":              exit_route,
+            "route_intervals":    intervals,
+            "route_index":        0,
+            "segment_start_time": intervals[0][0],
+            "segment_end_time":   intervals[0][1],
+            "current_node":       exit_route[0],
+            "next_node":          exit_route[1] if len(exit_route) > 1 else exit_route[0],
+            "current_position":   p0,
+            "remaining_eta":      intervals[-1][1] - t_start,
+            "status":             "exiting",
+            "enter_time":         t_start,
+        }
+        self._active_vehicles.append(vehicle)
+
+        # Append to episode-level log for visualisation
+        self._exiting_log.append({
+            "id":             parked_vehicle["id"],
+            "slot":           slot,
+            "slot_idx":       parked_vehicle["slot_idx"],
+            "route":          exit_route,
+            "route_intervals": intervals,
+            "enter_time":     t_start,
+        })
 
     def _remove_reservations_for_vehicle(self, vehicle_id: int) -> None:
         """Remove every reservation entry belonging to *vehicle_id*.
@@ -672,7 +748,11 @@ class ParkingRoutingEnv(gym.Env):
         num_nodes = max(len(_ALL_NODES), 1)
         max_eta   = _MAX_ROUTE_LEN * NODE_TRAVEL_TIME   # 4.0 s
 
-        for i, v in enumerate(self._active_vehicles[:MAX_ACTIVE_VEHICLES]):
+        # Only entering (moving) vehicles contribute to the obs.
+        # Exiting vehicles are hidden dynamics — exposing their ETA would
+        # give the agent an oracle on departure timing.
+        entering_only = [v for v in self._active_vehicles if v["status"] == "moving"]
+        for i, v in enumerate(entering_only[:MAX_ACTIVE_VEHICLES]):
             base = NUM_SLOTS + i * 3
             cur  = NODE_INDEX.get(v["current_node"], 0)
             nxt  = NODE_INDEX.get(v["next_node"],    0)
