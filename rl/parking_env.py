@@ -151,6 +151,13 @@ MAX_STEPS: int = 64   # increased from 16 to allow departure/reuse cycles
 STATUS_FREE:  float = 0.0
 STATUS_TAKEN: float = 1.0
 
+# ─── WAIT Action ─────────────────────────────────────────────────────────────
+WAIT_ACTION: int              = NUM_SLOTS   # action index 8  (0-7 = slots)
+WAIT_TIME: float              = 1.0         # seconds to advance on WAIT
+WAIT_PENALTY_BASE: float      = -0.2        # penalty for 1st consecutive wait
+WAIT_PENALTY_INCREMENT: float =  0.1        # escalation per consecutive wait
+MAX_CONSECUTIVE_WAITS: int    = 5           # WAIT masked after this many in a row
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 class ParkingRoutingEnv(gym.Env):
@@ -158,9 +165,21 @@ class ParkingRoutingEnv(gym.Env):
 
     RL interface (Gymnasium-compatible)
     ------------------------------------
-    observation_space : Box(0, 1, shape=(21,), dtype=float32)  ← unchanged
-    action_space      : Discrete(8)                             ← unchanged
-    action_masks()    : bool ndarray(8,)  for MaskablePPO
+    observation_space : Box(0, 1, shape=(21,), dtype=float32)  ← STATE_DIM=21 fixed
+    action_space      : Discrete(9)   — 0-7 slot assignment, 8=WAIT
+    action_masks()    : bool ndarray(9,)  for MaskablePPO
+
+    WAIT action (index 8)
+    ---------------------
+    Holds the pending vehicle at the entrance and advances the simulation
+    clock by WAIT_TIME=1.0 s.  No reservation is registered; physics and
+    departures proceed normally.  This lets the agent wait for an in-flight
+    vehicle to clear a shared waypoint before committing to a slot.
+
+    Penalty escalates with consecutive waits to prevent policy collapse:
+        penalty = WAIT_PENALTY_BASE − WAIT_PENALTY_INCREMENT × consecutive_waits
+    WAIT is masked (action_masks()[8] = False) after MAX_CONSECUTIVE_WAITS=5
+    consecutive WAIT actions to guarantee forward progress.
 
     Traffic simulator interface
     ---------------------------
@@ -197,7 +216,8 @@ class ParkingRoutingEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(STATE_DIM,), dtype=np.float32
         )
-        self.action_space = spaces.Discrete(NUM_SLOTS)
+        # action 0-7 = slot assignment, action 8 = WAIT
+        self.action_space = spaces.Discrete(NUM_SLOTS + 1)
         self._init_state()
 
     # ─── State Initialisation ────────────────────────────────────────────────
@@ -222,6 +242,9 @@ class ParkingRoutingEnv(gym.Env):
         self.n_fallback_triggers: int = 0
         self._departure_count: int = 0
         self._fast_forward_count: int = 0
+        # WAIT-action state
+        self._consecutive_waits: int = 0   # reset on each slot assignment
+        self._wait_count: int = 0          # total WAITs this episode
         # Exiting vehicle log: accumulated per-episode for visualisation.
         # Each entry: {id, slot, slot_idx, route, route_intervals, enter_time}
         self._exiting_log: list[dict[str, Any]] = []
@@ -280,10 +303,13 @@ class ParkingRoutingEnv(gym.Env):
     def step(
         self, action: int
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
-        """Assign one incoming vehicle to a slot.
+        """Execute one central-control decision tick.
 
-        Sequence
-        --------
+        action 0-7 : Assign the pending vehicle to the chosen slot.
+        action 8   : WAIT — hold the vehicle; advance clock by WAIT_TIME.
+
+        Sequence (slot action)
+        ----------------------
         1. Guard checks.
         2. If slot already taken → penalise and advance time.
         3. Build route intervals; check Safety Shield.
@@ -292,16 +318,48 @@ class ParkingRoutingEnv(gym.Env):
         5b. No conflict → register reservation, spawn vehicle, schedule parking.
         6. Sample IAT, advance clock (physics + departures).
         7. Check termination; pack info.
+
+        Sequence (WAIT action)
+        ----------------------
+        1. Compute escalating penalty: WAIT_PENALTY_BASE - WAIT_PENALTY_INCREMENT
+           × consecutive_waits.
+        2. Increment consecutive_waits and wait_count.
+        3. advance_time(WAIT_TIME) — physics + departures proceed normally.
+        4. No new IAT sampled; same vehicle remains pending.
         """
         if self._terminated:
             raise RuntimeError("Episode is over — call reset() first.")
-        if not (0 <= action < NUM_SLOTS):
-            raise ValueError(f"Action {action} out of range [0, {NUM_SLOTS}).")
+        if not (0 <= action < NUM_SLOTS + 1):
+            raise ValueError(f"Action {action} out of range [0, {NUM_SLOTS}].")
+
+        # ── WAIT action ───────────────────────────────────────────────────────
+        if action == WAIT_ACTION:
+            penalty = WAIT_PENALTY_BASE - WAIT_PENALTY_INCREMENT * self._consecutive_waits
+            self._consecutive_waits += 1
+            self._wait_count += 1
+            self._step_count += 1
+            self.advance_time(WAIT_TIME)
+            terminated = self._check_done()
+            self._terminated = terminated
+            info: dict[str, Any] = {
+                "slot":               None,
+                "conflict":           False,
+                "wait":               True,
+                "step":               self._step_count,
+                "inter_arrival_time": self._inter_arrival_time,
+            }
+            info.update(self._build_info_metrics())
+            return self._get_obs(), float(penalty), terminated, False, info
+
+        # ── slot action (0-7) ─────────────────────────────────────────────────
+        # Any slot action resets the consecutive-wait counter.
+        self._consecutive_waits = 0
 
         slot_name = SLOT_NAMES[action]
-        info: dict[str, Any] = {
+        info = {
             "slot":               slot_name,
             "conflict":           False,
+            "wait":               False,
             "step":               self._step_count,
             "inter_arrival_time": self._inter_arrival_time,
         }
@@ -387,41 +445,66 @@ class ParkingRoutingEnv(gym.Env):
     # ─── Action Masking ───────────────────────────────────────────────────────
 
     def action_masks(self) -> np.ndarray:
-        """Return bool mask: True = slot selectable this step.
+        """Return bool mask of shape (9,): True = action selectable this step.
 
-        Side-effect: if all slots are currently TAKEN, fast-forwards the
-        simulation clock to the next scheduled departure before computing
-        masks (prevents all-False deadlock in MaskablePPO).
+        Indices 0-7  slot assignment: True when slot is free AND no Safety-
+                     Shield conflict at current time.
+        Index   8    WAIT:            True when consecutive_waits <
+                     MAX_CONSECUTIVE_WAITS.
 
-        Fallback: if all free slots would conflict, opens the nearest free
-        slot (conflict penalty still applies in step()).
+        Masking policy
+        --------------
+        1. Compute slot masks (0-7).
+        2. Set WAIT mask (8).
+        3. Normal case — at least one action valid → return masks.
+        4. Safety net (WAIT disabled AND all slots conflict/taken):
+           a. _ensure_free_slot() fast-forwards to the next departure.
+           b. Recompute slot masks.
+           c. If still all False → forced-fallback to nearest free slot
+              (conflict penalty still applies in step()).
+
+        The forced fallback is now only reached when both WAIT is exhausted
+        (MAX_CONSECUTIVE_WAITS exceeded) and every free slot has a conflict —
+        a rare edge case that prevents MaskablePPO from seeing an all-False mask.
         """
-        if not self._terminated:
-            self._ensure_free_slot()
-
-        masks = np.ones(NUM_SLOTS, dtype=bool)
+        # ── slot masks ────────────────────────────────────────────────────────
+        masks = np.zeros(NUM_SLOTS + 1, dtype=bool)
         for i, name in enumerate(SLOT_NAMES):
-            if self._slot_statuses[i] >= STATUS_TAKEN:
-                masks[i] = False
-            elif self._quick_conflict_check(name):
-                masks[i] = False
+            if (self._slot_statuses[i] < STATUS_TAKEN
+                    and not self._quick_conflict_check(name)):
+                masks[i] = True
 
+        # ── WAIT mask ─────────────────────────────────────────────────────────
+        if not self._terminated:
+            masks[WAIT_ACTION] = (
+                self._consecutive_waits < MAX_CONSECUTIVE_WAITS
+            )
+
+        # ── safety net: all 9 actions False ───────────────────────────────────
         if not masks.any() and not self._terminated:
-            self.n_fallback_triggers += 1
-            free = [
-                i for i in range(NUM_SLOTS)
-                if self._slot_statuses[i] < STATUS_TAKEN
-            ]
-            if free:
-                ex, ey = ENTRY_POINT
-                best = min(
-                    free,
-                    key=lambda i: math.hypot(
-                        SLOT_COORDINATES[SLOT_NAMES[i]][0] - ex,
-                        SLOT_COORDINATES[SLOT_NAMES[i]][1] - ey,
-                    ),
-                )
-                masks[best] = True
+            # WAIT is disabled; ensure at least one slot is physically free
+            self._ensure_free_slot()
+            for i, name in enumerate(SLOT_NAMES):
+                if (self._slot_statuses[i] < STATUS_TAKEN
+                        and not self._quick_conflict_check(name)):
+                    masks[i] = True
+            # Still nothing valid → forced fallback to nearest free slot
+            if not masks.any():
+                self.n_fallback_triggers += 1
+                free = [
+                    i for i in range(NUM_SLOTS)
+                    if self._slot_statuses[i] < STATUS_TAKEN
+                ]
+                if free:
+                    ex, ey = ENTRY_POINT
+                    best = min(
+                        free,
+                        key=lambda i: math.hypot(
+                            SLOT_COORDINATES[SLOT_NAMES[i]][0] - ex,
+                            SLOT_COORDINATES[SLOT_NAMES[i]][1] - ey,
+                        ),
+                    )
+                    masks[best] = True
 
         return masks
 
@@ -728,6 +811,8 @@ class ParkingRoutingEnv(gym.Env):
             "free_slot_count":      int(np.sum(self._slot_statuses < STATUS_TAKEN)),
             "fast_forward_count":   self._fast_forward_count,
             "current_time":         self._current_time,
+            "wait_count":           self._wait_count,
+            "consecutive_waits":    self._consecutive_waits,
         }
 
     # ─── Observation Builder ──────────────────────────────────────────────────

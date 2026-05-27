@@ -100,30 +100,49 @@ def load_policy(model_path: str = "models/sb3_parking_policy.zip") -> Any | None
 # ─── Heuristic Fallback ───────────────────────────────────────────────────────
 
 def heuristic_policy(action_masks: np.ndarray) -> int:
-    """Distance-based greedy policy: select the nearest available slot.
+    """Distance-based greedy policy: nearest slot, WAIT only when forced.
 
-    Uses Euclidean distance from ENTRY_POINT to each slot's mm coordinate.
-    No trained model is required.
+    Strategy
+    --------
+    1. Rank slot indices 0-7 by Euclidean distance from ENTRY_POINT.
+    2. Return the nearest valid slot.
+    3. If no slots are valid but WAIT (index 8) is available → return WAIT.
+    4. If nothing is valid → return -1.
+
+    The heuristic never voluntarily waits — it is maximally aggressive.
+    It only chooses WAIT when all slot masks are False and WAIT is the sole
+    remaining valid action.  This creates a strong "always-assign" baseline
+    against which PPO's timing policy can be measured.
 
     Parameters
     ----------
-    action_masks : Boolean array (shape=(8,)) from ParkingRoutingEnv.action_masks().
+    action_masks : Boolean array shape=(9,) from ParkingRoutingEnv.action_masks().
+                   Index 8 is the WAIT action (Discrete(9) env).
 
     Returns
     -------
-    int — Index of the best available slot, or -1 if all slots are masked.
+    int — Slot index 0-7, WAIT_ACTION (8), or -1 if nothing is available.
     """
-    from .parking_env import ENTRY_POINT, SLOT_COORDINATES, SLOT_NAMES
+    from .parking_env import ENTRY_POINT, SLOT_COORDINATES, SLOT_NAMES, WAIT_ACTION
 
-    valid_indices = [i for i, ok in enumerate(action_masks) if ok]
-    if not valid_indices:
-        return -1  # No slot available
+    # Consider only slot indices 0-7 for distance ranking
+    valid_slots = [
+        i for i in range(len(SLOT_NAMES))
+        if i < len(action_masks) and action_masks[i]
+    ]
 
-    ex, ey = ENTRY_POINT
-    return min(
-        valid_indices,
-        key=lambda i: math.hypot(
-            SLOT_COORDINATES[SLOT_NAMES[i]][0] - ex,
-            SLOT_COORDINATES[SLOT_NAMES[i]][1] - ey,
-        ),
-    )
+    if valid_slots:
+        ex, ey = ENTRY_POINT
+        return min(
+            valid_slots,
+            key=lambda i: math.hypot(
+                SLOT_COORDINATES[SLOT_NAMES[i]][0] - ex,
+                SLOT_COORDINATES[SLOT_NAMES[i]][1] - ey,
+            ),
+        )
+
+    # No slot available — use WAIT if still valid
+    if WAIT_ACTION < len(action_masks) and action_masks[WAIT_ACTION]:
+        return WAIT_ACTION
+
+    return -1  # Full deadlock (should not occur with a properly masked env)

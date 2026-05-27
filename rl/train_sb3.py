@@ -255,12 +255,14 @@ def _run_episode(
 
     total_reward:    float = 0.0
     n_conflicts:     int   = 0
+    n_waits:         int   = 0
     n_steps:         int   = 0
     slots_assigned:  list[str]   = []
     travel_times:    list[float] = []
     free_slot_sum:   float = 0.0    # accumulated free slots each step (→ avg)
     departure_count: int   = 0
     fast_fwd_count:  int   = 0
+    max_consec_wait: int   = 0
 
     while True:
         masks: np.ndarray = env.action_masks()
@@ -289,12 +291,18 @@ def _run_episode(
         n_steps      += 1
         free_slot_sum += float(info.get("free_slot_count", 0))
 
-        if info.get("conflict"):
+        if info.get("wait"):
+            n_waits += 1
+            cw = int(info.get("consecutive_waits", 0))
+            if cw > max_consec_wait:
+                max_consec_wait = cw
+        elif info.get("conflict"):
             n_conflicts += 1
         elif info.get("reason") != "slot_already_taken":
-            slot = info["slot"]
-            slots_assigned.append(slot)
-            travel_times.append(len(SLOT_ROUTES[slot]) * NODE_TRAVEL_TIME)
+            slot = info.get("slot")
+            if slot is not None:
+                slots_assigned.append(slot)
+                travel_times.append(len(SLOT_ROUTES[slot]) * NODE_TRAVEL_TIME)
 
         # Capture latest episode-level counters from info
         departure_count = int(info.get("departure_count",    departure_count))
@@ -305,16 +313,21 @@ def _run_episode(
 
     throughput = len(slots_assigned)
     avg_travel = float(np.mean(travel_times)) if travel_times else 0.0
+    # efficiency = assignments per total step (WAIT steps count as steps)
     efficiency = throughput / max(n_steps, 1)
     # Slot reuse: assignments beyond the initial 8 (only meaningful if > 8)
     slot_reuse = max(0, throughput - 8)
     # Occupancy utilisation: average fraction of slots that were occupied
     avg_free      = free_slot_sum / max(n_steps, 1)
     occ_util      = 1.0 - avg_free / 8.0
+    wait_rate     = n_waits / max(n_steps, 1)
 
     return {
         "total_reward":     total_reward,
         "n_conflicts":      n_conflicts,
+        "n_waits":          n_waits,
+        "wait_rate":        wait_rate,
+        "max_consec_wait":  max_consec_wait,
         "n_steps":          n_steps,
         "throughput":       throughput,
         "avg_travel_time":  avg_travel,
@@ -344,6 +357,9 @@ def evaluate_policy(
 
     rewards:        list[float] = []
     conflicts:      list[int]   = []
+    waits:          list[int]   = []
+    wait_rates:     list[float] = []
+    max_consecs:    list[int]   = []
     throughputs:    list[int]   = []
     travel_times:   list[float] = []
     efficiencies:   list[float] = []
@@ -358,6 +374,9 @@ def evaluate_policy(
         m = _run_episode(policy_type, env, model)
         rewards.append(m["total_reward"])
         conflicts.append(m["n_conflicts"])
+        waits.append(m["n_waits"])
+        wait_rates.append(m["wait_rate"])
+        max_consecs.append(m["max_consec_wait"])
         throughputs.append(m["throughput"])
         travel_times.append(m["avg_travel_time"])
         efficiencies.append(m["efficiency"])
@@ -373,6 +392,9 @@ def evaluate_policy(
         "avg_reward":        float(np.mean(rewards)),
         "std_reward":        float(np.std(rewards)),
         "avg_conflicts":     float(np.mean(conflicts)),
+        "avg_waits":         float(np.mean(waits)),
+        "avg_wait_rate":     float(np.mean(wait_rates)),
+        "avg_max_consec":    float(np.mean(max_consecs)),
         "avg_throughput":    float(np.mean(throughputs)),
         "avg_travel_time":   float(np.mean(travel_times)),
         "avg_efficiency":    float(np.mean(efficiencies)),
@@ -385,6 +407,7 @@ def evaluate_policy(
         # raw lists for stability analysis
         "_rewards":    rewards,
         "_conflicts":  conflicts,
+        "_waits":      waits,
         "_fallbacks":  n_fallbacks,
         "_departures": departures,
         "_throughputs": throughputs,
@@ -459,6 +482,9 @@ def _print_results(results: dict[str, dict]) -> None:
         ("avg_reward",       "Avg Reward"),
         ("std_reward",       "Reward Std"),
         ("avg_conflicts",    "Avg Conflicts / ep"),
+        ("avg_waits",        "Avg WAITs / ep"),
+        ("avg_wait_rate",    "WAIT rate (waits/steps)"),
+        ("avg_max_consec",   "Avg Max Consec WAITs"),
         ("avg_throughput",   "Avg Throughput (slots)"),
         ("avg_slot_reuse",   "Avg Slot Reuse (>8 assigns)"),
         ("avg_departures",   "Avg Departures / ep"),
@@ -482,6 +508,7 @@ def _print_results(results: dict[str, dict]) -> None:
             f"  {ptype.capitalize():<10}"
             f" reward: {r['avg_reward']:+.3f}±{r['std_reward']:.2f}"
             f"  conflicts: {r['avg_conflicts']:.2f}"
+            f"  waits: {r['avg_waits']:.1f} ({r['avg_wait_rate']:.1%})"
             f"  throughput: {r['avg_throughput']:.2f}"
             f"  departures: {r['avg_departures']:.1f}"
             f"  occ: {r['avg_occ_util']:.2%}"
@@ -496,6 +523,7 @@ def _check_stability(results: dict[str, dict]) -> None:
     for ptype, r in results.items():
         rewards    = r["_rewards"]
         conflicts  = r["_conflicts"]
+        waits      = r["_waits"]
         fallbacks  = r["_fallbacks"]
         departures = r["_departures"]
 
@@ -509,11 +537,13 @@ def _check_stability(results: dict[str, dict]) -> None:
         max_entropy = math.log(8)
         entropy_pct = entropy / max_entropy * 100
 
-        avg_fb   = float(np.mean(fallbacks))
-        n_eps    = len(rewards)
-        fb_eps   = sum(1 for f in fallbacks if f > 0)
-        avg_conf = float(np.mean(conflicts))
-        avg_dep  = float(np.mean(departures))
+        avg_fb    = float(np.mean(fallbacks))
+        avg_wait  = float(np.mean(waits))
+        n_eps     = len(rewards)
+        fb_eps    = sum(1 for f in fallbacks if f > 0)
+        avg_conf  = float(np.mean(conflicts))
+        avg_dep   = float(np.mean(departures))
+        avg_mc    = float(r.get("avg_max_consec", 0))
 
         issues = []
         if nan_eps > 0:
@@ -526,6 +556,19 @@ def _check_stability(results: dict[str, dict]) -> None:
             issues.append(f"⚠  high fallback rate ({avg_fb:.1f}/ep) — conflicts dominate")
         if avg_dep < 1:
             issues.append("⚠  avg departures < 1/ep — departure dynamics not triggering")
+        # WAIT-collapse check: if waits > 30% of MAX_STEPS policy is over-waiting
+        from .parking_env import MAX_STEPS, MAX_CONSECUTIVE_WAITS
+        wait_collapse_threshold = MAX_STEPS * 0.30
+        if avg_wait > wait_collapse_threshold:
+            issues.append(
+                f"⚠  WAIT collapse risk: avg {avg_wait:.1f} waits/ep "
+                f"({avg_wait/MAX_STEPS*100:.0f}% of MAX_STEPS)"
+            )
+        if avg_mc >= MAX_CONSECUTIVE_WAITS:
+            issues.append(
+                f"⚠  hit MAX_CONSECUTIVE_WAITS={MAX_CONSECUTIVE_WAITS} "
+                f"— forced fallback triggered"
+            )
 
         print(f"\n  {ptype.upper()}")
         print(f"    NaN / Inf rewards    : {nan_eps} / {n_eps} episodes")
@@ -533,6 +576,7 @@ def _check_stability(results: dict[str, dict]) -> None:
         print(f"    Action entropy       : {entropy:.3f} / {max_entropy:.3f}  ({entropy_pct:.1f}%)")
         print(f"    Fallback triggers    : {avg_fb:.2f} avg / ep  ({fb_eps}/{n_eps} affected)")
         print(f"    Avg conflicts / ep   : {avg_conf:.2f}")
+        print(f"    Avg WAITs / ep       : {avg_wait:.2f}  (max consec: {avg_mc:.1f})")
         print(f"    Avg departures / ep  : {avg_dep:.2f}")
         if issues:
             for msg in issues:
