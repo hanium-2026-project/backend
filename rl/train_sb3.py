@@ -140,6 +140,7 @@ def train(
     n_envs: int          = DEFAULT_N_ENVS,
     run_bench: bool      = False,
     device: str | None   = None,
+    env_kwargs: dict | None = None,
 ) -> str:
     """Train a MaskablePPO agent on ParkingRoutingEnv and save the model.
 
@@ -182,8 +183,9 @@ def train(
         bench_winner = "dummy"
 
     # ── build vectorised env ──────────────────────────────────────────────────
+    ekw = env_kwargs or {}
     def _make_env():
-        return ActionMasker(ParkingRoutingEnv(), lambda e: e.action_masks())
+        return ActionMasker(ParkingRoutingEnv(**ekw), lambda e: e.action_masks())
 
     if bench_winner == "subproc" and n_envs > 1:
         from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -349,11 +351,12 @@ def evaluate_policy(
     policy_type: str,
     model: Any | None = None,
     n_episodes: int   = N_EVAL_EPISODES,
+    env_kwargs: dict | None = None,
 ) -> dict[str, Any]:
     """Run n_episodes and aggregate metrics."""
     from .parking_env import ParkingRoutingEnv, SLOT_NAMES
 
-    env = ParkingRoutingEnv()
+    env = ParkingRoutingEnv(**(env_kwargs or {}))
 
     rewards:        list[float] = []
     conflicts:      list[int]   = []
@@ -417,6 +420,7 @@ def evaluate_policy(
 def evaluate_all(
     model_path: str  = DEFAULT_MODEL_PATH,
     n_episodes: int  = N_EVAL_EPISODES,
+    env_kwargs: dict | None = None,
 ) -> dict[str, dict]:
     """Compare Random, Heuristic, PPO over n_episodes each."""
     ppo_model: Any | None = None
@@ -444,6 +448,7 @@ def evaluate_all(
             ptype,
             model=ppo_model if ptype == "ppo" else None,
             n_episodes=n_episodes,
+            env_kwargs=env_kwargs,
         )
         print("done")
 
@@ -641,11 +646,33 @@ def _parse_args() -> argparse.Namespace:
                    help="torch device: cuda / mps / cpu (auto if omitted)")
     p.add_argument("--bench",      action="store_true",
                    help="Benchmark DummyVecEnv vs SubprocVecEnv before training")
+    # ── WAIT-policy sweep knobs ────────────────────────────────────────────────
+    p.add_argument("--wait-penalty",      type=float, default=None, metavar="X",
+                   help="WAIT_PENALTY_BASE override (e.g. -0.2 / -1.0 / -2.0)")
+    p.add_argument("--wait-increment",    type=float, default=None, metavar="X",
+                   help="Penalty added per extra consecutive WAIT (default: 0.1)")
+    p.add_argument("--wait-time",         type=float, default=None, metavar="S",
+                   help="Seconds advanced per WAIT action (default: 1.0)")
+    p.add_argument("--max-consec-waits",  type=int,   default=None, metavar="N",
+                   help="Cap on consecutive WAITs before masking (default: 5)")
+    p.add_argument("--assignment-bonus",  type=float, default=0.0,  metavar="X",
+                   help="Bonus reward per successful assignment (default: 0)")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
+
+    # Collect env kwargs (only set what user provided so defaults remain)
+    env_kwargs: dict[str, Any] = {}
+    if args.wait_penalty     is not None: env_kwargs["wait_penalty_base"]      = args.wait_penalty
+    if args.wait_increment   is not None: env_kwargs["wait_penalty_increment"] = args.wait_increment
+    if args.wait_time        is not None: env_kwargs["wait_time"]              = args.wait_time
+    if args.max_consec_waits is not None: env_kwargs["max_consecutive_waits"]  = args.max_consec_waits
+    if args.assignment_bonus != 0.0:      env_kwargs["assignment_bonus"]       = args.assignment_bonus
+
+    if env_kwargs:
+        print(f"[env] overrides: {env_kwargs}")
 
     if not args.eval_only:
         train(
@@ -655,6 +682,11 @@ if __name__ == "__main__":
             n_envs=args.n_envs,
             run_bench=args.bench,
             device=args.device,
+            env_kwargs=env_kwargs or None,
         )
 
-    evaluate_all(model_path=args.model, n_episodes=args.episodes)
+    evaluate_all(
+        model_path=args.model,
+        n_episodes=args.episodes,
+        env_kwargs=env_kwargs or None,
+    )

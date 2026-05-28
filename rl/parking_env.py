@@ -211,13 +211,54 @@ class ParkingRoutingEnv(gym.Env):
 
     metadata: dict[str, Any] = {"render_modes": []}
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        wait_penalty_base:       float | None = None,
+        wait_penalty_increment:  float | None = None,
+        wait_time:               float | None = None,
+        max_consecutive_waits:   int   | None = None,
+        assignment_bonus:        float = 0.0,
+    ) -> None:
+        """Construct env with optional WAIT-policy hyperparameter overrides.
+
+        Parameters
+        ----------
+        wait_penalty_base       : Base penalty for the 1st consecutive WAIT.
+                                  Defaults to module constant WAIT_PENALTY_BASE.
+        wait_penalty_increment  : Additive penalty per extra consecutive WAIT.
+                                  Defaults to WAIT_PENALTY_INCREMENT.
+        wait_time               : Seconds to advance on each WAIT action.
+                                  Defaults to WAIT_TIME (1.0 s).
+        max_consecutive_waits   : Cap on consecutive WAITs before masking.
+                                  Defaults to MAX_CONSECUTIVE_WAITS (5).
+        assignment_bonus        : Additional reward added on a successful
+                                  (non-conflict) slot assignment.  0.0 = no
+                                  throughput bonus (default).  Useful for
+                                  sweeping the conflict-vs-throughput tradeoff.
+        """
         super().__init__()
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(STATE_DIM,), dtype=np.float32
         )
         # action 0-7 = slot assignment, action 8 = WAIT
         self.action_space = spaces.Discrete(NUM_SLOTS + 1)
+
+        # WAIT-policy hyperparameters (instance-level for sweep experiments)
+        self.wait_penalty_base      = (
+            WAIT_PENALTY_BASE      if wait_penalty_base      is None else float(wait_penalty_base)
+        )
+        self.wait_penalty_increment = (
+            WAIT_PENALTY_INCREMENT if wait_penalty_increment is None else float(wait_penalty_increment)
+        )
+        self.wait_time              = (
+            WAIT_TIME              if wait_time              is None else float(wait_time)
+        )
+        self.max_consecutive_waits  = (
+            MAX_CONSECUTIVE_WAITS  if max_consecutive_waits  is None else int(max_consecutive_waits)
+        )
+        self.assignment_bonus       = float(assignment_bonus)
+
         self._init_state()
 
     # ─── State Initialisation ────────────────────────────────────────────────
@@ -334,11 +375,14 @@ class ParkingRoutingEnv(gym.Env):
 
         # ── WAIT action ───────────────────────────────────────────────────────
         if action == WAIT_ACTION:
-            penalty = WAIT_PENALTY_BASE - WAIT_PENALTY_INCREMENT * self._consecutive_waits
+            penalty = (
+                self.wait_penalty_base
+                - self.wait_penalty_increment * self._consecutive_waits
+            )
             self._consecutive_waits += 1
             self._wait_count += 1
             self._step_count += 1
-            self.advance_time(WAIT_TIME)
+            self.advance_time(self.wait_time)
             terminated = self._check_done()
             self._terminated = terminated
             info: dict[str, Any] = {
@@ -396,6 +440,11 @@ class ParkingRoutingEnv(gym.Env):
         if conflict:
             info["conflict"] = True
         else:
+            # Throughput bonus on successful (non-conflict) assignment.
+            # 0.0 = disabled (default); used for sweep experiments to
+            # incentivise the agent to assign rather than WAIT.
+            if self.assignment_bonus != 0.0:
+                reward += self.assignment_bonus
             # ── commit ────────────────────────────────────────────────────────
             self._vehicle_id_counter += 1
             vid = self._vehicle_id_counter
@@ -477,7 +526,7 @@ class ParkingRoutingEnv(gym.Env):
         # ── WAIT mask ─────────────────────────────────────────────────────────
         if not self._terminated:
             masks[WAIT_ACTION] = (
-                self._consecutive_waits < MAX_CONSECUTIVE_WAITS
+                self._consecutive_waits < self.max_consecutive_waits
             )
 
         # ── safety net: all 9 actions False ───────────────────────────────────
