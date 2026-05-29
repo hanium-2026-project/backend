@@ -733,14 +733,21 @@ class ParkingRoutingEnv(gym.Env):
     def _process_departures(self) -> int:
         """Initiate physical exit for vehicles whose depart_time has elapsed.
 
-        For each departing vehicle:
-          1. Sets _slot_statuses[slot_idx] = STATUS_FREE immediately so the
-             agent can assign the slot to an incoming vehicle right away.
-          2. Removes the parked-phase reservation (_remove_reservations_for_vehicle).
-          3. Calls _spawn_exiting_vehicle() which builds the exit route,
-             registers exit-route reservations (kind="exiting") in
-             _reservations, and adds the vehicle to _active_vehicles.
-          4. Increments _departure_count.
+        For each vehicle whose depart_time has elapsed:
+          1. Build the exit route intervals starting at the current time.
+          2. Run the Safety Shield against the exit route, *excluding* this
+             vehicle's own (still-active) parked reservation.  If the lane is
+             busy (e.g. an entering vehicle is currently transiting junction
+             or lane_pt_4), defer the departure — the vehicle stays parked
+             and we retry on the next advance_time tick.  This mirrors real
+             world behaviour: a car cannot pull out of its slot until the
+             central lane is clear.
+          3. If the exit route is clear:
+               - Set _slot_statuses[slot_idx] = STATUS_FREE
+               - Remove the parked-phase reservation
+               - _spawn_exiting_vehicle() builds the physical exit movement
+                 and registers exit-route reservations (kind="exiting")
+               - Increment _departure_count
 
         departure_count is incremented at exit *start* (not completion).
 
@@ -751,21 +758,51 @@ class ParkingRoutingEnv(gym.Env):
         n_departed = 0
 
         for pv in self._parked_vehicles:
-            if t >= pv["depart_time"]:
-                # Free the slot at exit start — new vehicles can be assigned
-                # immediately while this vehicle is still physically leaving.
-                self._slot_statuses[pv["slot_idx"]] = STATUS_FREE
-                # Remove parked-phase reservation before registering exit route
-                self._remove_reservations_for_vehicle(pv["id"])
-                # Create physical exiting vehicle
-                self._spawn_exiting_vehicle(pv)
-                self._departure_count += 1
-                n_departed += 1
-            else:
+            if t < pv["depart_time"]:
                 still_parked.append(pv)
+                continue
+
+            # depart_time reached — Safety-Shield-check the exit route.
+            exit_route = EXIT_ROUTES[pv["slot"]]
+            intervals  = self._build_intervals(exit_route, t)
+
+            if self._check_conflict_excluding(exit_route, intervals, pv["id"]):
+                # Central lane is currently occupied → defer this departure.
+                # Slot stays TAKEN; we will retry on the next tick.
+                still_parked.append(pv)
+                continue
+
+            # Exit route is clear — proceed.
+            self._slot_statuses[pv["slot_idx"]] = STATUS_FREE
+            self._remove_reservations_for_vehicle(pv["id"])
+            self._spawn_exiting_vehicle(pv)
+            self._departure_count += 1
+            n_departed += 1
 
         self._parked_vehicles = still_parked
         return n_departed
+
+    def _check_conflict_excluding(
+        self,
+        route:      list[str],
+        intervals:  list[tuple[float, float]],
+        vehicle_id: int,
+    ) -> bool:
+        """Conflict check that ignores reservations belonging to *vehicle_id*.
+
+        Used by `_process_departures()` so the departing vehicle's own
+        parked-phase reservation on the slot front node does not count as
+        a self-conflict when probing the exit route.
+        """
+        for node, (t_start, t_end) in zip(route, intervals):
+            ps = t_start - SAFETY_MARGIN
+            pe = t_end   + SAFETY_MARGIN
+            for res in self._reservations.get(node, []):
+                if res["vehicle_id"] == vehicle_id:
+                    continue
+                if max(ps, res["start"]) < min(pe, res["end"]):
+                    return True
+        return False
 
     def _spawn_exiting_vehicle(self, parked_vehicle: dict[str, Any]) -> None:
         """Create a physically-moving exit vehicle from a parked vehicle record.
