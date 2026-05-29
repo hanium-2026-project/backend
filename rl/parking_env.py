@@ -76,13 +76,25 @@ STATE_DIM: int = (
 SLOT_NAMES: list[str] = ["A1", "A2", "A3", "A4", "B1", "B2", "B3", "B4"]
 SLOT_INDEX: dict[str, int] = {name: i for i, name in enumerate(SLOT_NAMES)}
 
+# Slot physical positions (mm).
+#
+# Distance convention: A4 / B4 are CLOSEST to the entrance, A1 / B1 are the
+# farthest.  The numbering within each row goes from far→near (1=far, 4=near).
+# The entrance sits between the A row (y=1050) and B row (y=150), so each
+# A-row slot has the same Euclidean distance as its B-row counterpart:
+#
+#     A4 = B4   (closest, x=425)
+#     A3 = B3   (x=650)
+#     A2 = B2   (x=875)
+#     A1 = B1   (farthest, x=1100)
 SLOT_COORDINATES: dict[str, tuple[float, float]] = {
-    "A1": (425.0, 1050.0), "A2": (650.0, 1050.0),
-    "A3": (875.0, 1050.0), "A4": (1100.0, 1050.0),
-    "B1": (425.0,  150.0), "B2": (650.0,  150.0),
-    "B3": (875.0,  150.0), "B4": (1100.0,  150.0),
+    "A1": (1100.0, 1050.0), "A2": (875.0, 1050.0),
+    "A3": ( 650.0, 1050.0), "A4": (425.0, 1050.0),
+    "B1": (1100.0,  150.0), "B2": (875.0,  150.0),
+    "B3": ( 650.0,  150.0), "B4": (425.0,  150.0),
 }
-ENTRY_POINT: tuple[float, float] = (150.0, 0.0)
+# Entrance located between A row (y=1050) and B row (y=150) for A==B symmetry.
+ENTRY_POINT: tuple[float, float] = (150.0, 600.0)
 MAX_DISTANCE: float = math.hypot(1200.0, 1200.0)
 
 # ─── Waypoint Graph ───────────────────────────────────────────────────────────
@@ -113,20 +125,25 @@ _ALL_NODES: list[str] = sorted(
 NODE_INDEX: dict[str, int] = {node: i for i, node in enumerate(_ALL_NODES)}
 
 # Node physical coordinates (mm).  Single source of truth for traffic simulator.
+#
+# *_front node positions match SLOT_COORDINATES — A4_front / B4_front sit at
+# the smallest x (closest to entrance), A1_front / B1_front at the largest x.
+# The entrance node is centred vertically (y=600) between A and B rows so
+# both rows are reached symmetrically.
 NODE_COORDINATES: dict[str, tuple[float, float]] = {
-    "entrance":   (150.0,   20.0),
-    "A_corridor": (150.0,  720.0),
-    "A_lane":     (300.0, 1050.0),
-    "A1_front":   (425.0, 1050.0),
-    "A2_front":   (650.0, 1050.0),
-    "A3_front":   (875.0, 1050.0),
-    "A4_front":  (1100.0, 1050.0),
-    "B_corridor": (150.0,  350.0),
-    "B_lane":     (300.0,  150.0),
-    "B1_front":   (425.0,  150.0),
-    "B2_front":   (650.0,  150.0),
-    "B3_front":   (875.0,  150.0),
-    "B4_front":  (1100.0,  150.0),
+    "entrance":   ( 150.0,  600.0),
+    "A_corridor": ( 150.0,  720.0),
+    "A_lane":     ( 300.0, 1050.0),
+    "A1_front":   (1100.0, 1050.0),
+    "A2_front":   ( 875.0, 1050.0),
+    "A3_front":   ( 650.0, 1050.0),
+    "A4_front":   ( 425.0, 1050.0),
+    "B_corridor": ( 150.0,  350.0),
+    "B_lane":     ( 300.0,  150.0),
+    "B1_front":   (1100.0,  150.0),
+    "B2_front":   ( 875.0,  150.0),
+    "B3_front":   ( 650.0,  150.0),
+    "B4_front":   ( 425.0,  150.0),
 }
 
 _MAX_ROUTE_LEN: int = max(len(r) for r in SLOT_ROUTES.values())  # 4

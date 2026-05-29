@@ -142,6 +142,7 @@ def record_episode(
         obs, reward, terminated, truncated, info = env.step(action)
 
         slot        = info["slot"]
+        is_wait     = info.get("wait", False)
         is_conflict = info.get("conflict", False)
         is_taken    = info.get("reason") == "slot_already_taken"
 
@@ -153,7 +154,15 @@ def record_episode(
             "reward":   reward,
             "conflict": is_conflict,
             "taken":    is_taken,
+            "wait":     is_wait,
         })
+
+        # WAIT action assigns no slot and registers no reservation — skip the
+        # rest of the loop body (no route, no vehicle record).
+        if is_wait or slot is None:
+            if terminated or truncated:
+                break
+            continue
 
         # ── build entering route_timed & reservations ────────────────────────
         route        = SLOT_ROUTES[slot]
@@ -411,8 +420,9 @@ def _draw_lot(
         SLOT_COORDINATES, SLOT_NAMES, SLOT_ROUTES, BOTTLENECK_NODES,
     )
 
-    ax.set_xlim(-80, 1320)
-    ax.set_ylim(-120, 1300)
+    # Extend left margin so the ENTER arrow (≈ x=30) is fully visible.
+    ax.set_xlim(-30, 1320)
+    ax.set_ylim(-50, 1200)
     ax.set_aspect("equal")
     ax.set_facecolor("#c8d6e5")
     ax.axis("off")
@@ -463,9 +473,14 @@ def _draw_lot(
         if not is_front:
             ax.text(nx + 14, ny + 14, node, fontsize=5, color="#34495e", zorder=6)
 
-    ax.annotate("", xy=(150, 28), xytext=(150, -90),
+    # ENTER arrow points horizontally into the entrance node at (150, 600).
+    # Entrance sits between A row (y=1050) and B row (y=150), so both rows
+    # are reached symmetrically.
+    from .parking_env import ENTRY_POINT as _EP
+    _ex, _ey = _EP
+    ax.annotate("", xy=(_ex, _ey), xytext=(_ex - 120, _ey),
                 arrowprops=dict(arrowstyle="-|>", color="#e74c3c", lw=2.2))
-    ax.text(150, -95, "ENTER", ha="center", va="top",
+    ax.text(_ex - 125, _ey, "ENTER", ha="right", va="center",
             fontsize=7, color="#e74c3c", fontweight="bold")
 
 
