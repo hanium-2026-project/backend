@@ -420,9 +420,9 @@ def _draw_lot(
         SLOT_COORDINATES, SLOT_NAMES, SLOT_ROUTES, BOTTLENECK_NODES,
     )
 
-    # Extend left margin so the ENTER arrow (≈ x=30) is fully visible.
+    # ENTER arrow extends below entrance (y=−20), EXIT arrow above exit (y=1290).
     ax.set_xlim(-30, 1320)
-    ax.set_ylim(-50, 1200)
+    ax.set_ylim(-50, 1320)
     ax.set_aspect("equal")
     ax.set_facecolor("#c8d6e5")
     ax.axis("off")
@@ -473,15 +473,21 @@ def _draw_lot(
         if not is_front:
             ax.text(nx + 14, ny + 14, node, fontsize=5, color="#34495e", zorder=6)
 
-    # ENTER arrow points horizontally into the entrance node at (150, 600).
-    # Entrance sits between A row (y=1050) and B row (y=150), so both rows
-    # are reached symmetrically.
-    from .parking_env import ENTRY_POINT as _EP
-    _ex, _ey = _EP
-    ax.annotate("", xy=(_ex, _ey), xytext=(_ex - 120, _ey),
+    # Physical entrance (bottom-left) and exit (top-left) are distinct nodes.
+    # ENTER arrow points UP into entrance; EXIT arrow points UP out of exit.
+    from .parking_env import NODE_COORDINATES as _NC
+    _entry  = _NC.get("entrance", (150, 100))
+    _exitp  = _NC.get("exit",     (150, 1200))
+    # ENTER arrow (vehicle comes UP from below into the lot)
+    ax.annotate("", xy=_entry, xytext=(_entry[0], _entry[1] - 120),
                 arrowprops=dict(arrowstyle="-|>", color="#e74c3c", lw=2.2))
-    ax.text(_ex - 125, _ey, "ENTER", ha="right", va="center",
+    ax.text(_entry[0], _entry[1] - 125, "ENTER", ha="center", va="top",
             fontsize=7, color="#e74c3c", fontweight="bold")
+    # EXIT arrow (vehicle leaves UP out of the lot)
+    ax.annotate("", xy=(_exitp[0], _exitp[1] + 80), xytext=_exitp,
+                arrowprops=dict(arrowstyle="-|>", color="#27ae60", lw=2.2))
+    ax.text(_exitp[0], _exitp[1] + 85, "EXIT", ha="center", va="bottom",
+            fontsize=7, color="#27ae60", fontweight="bold")
 
 
 def create_traffic_animation(
