@@ -52,7 +52,7 @@ DEFAULT_TIMESTEPS: int   = 300_000
 DEFAULT_N_ENVS: int      = 4
 N_EVAL_EPISODES: int     = 100
 
-POLICY_TYPES = ["random", "heuristic", "ppo"]
+POLICY_TYPES = ["random", "heuristic", "heuristic_v2", "heuristic_v3", "heuristic_v4", "ppo"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -280,6 +280,18 @@ def _run_episode(
             from .inference import heuristic_policy
             action = heuristic_policy(masks)
 
+        elif policy_type == "heuristic_v2":
+            from .inference import heuristic_policy_v2
+            action = heuristic_policy_v2(masks, env)
+
+        elif policy_type == "heuristic_v3":
+            from .inference import heuristic_policy_v3
+            action = heuristic_policy_v3(masks, env)
+
+        elif policy_type == "heuristic_v4":
+            from .inference import heuristic_policy_v4
+            action = heuristic_policy_v4(masks, env)
+
         else:  # ppo
             if model is None:
                 raise ValueError("model required for ppo policy")
@@ -422,9 +434,9 @@ def evaluate_all(
     n_episodes: int  = N_EVAL_EPISODES,
     env_kwargs: dict | None = None,
 ) -> dict[str, dict]:
-    """Compare Random, Heuristic, PPO over n_episodes each."""
+    """Compare Random, Heuristic V1-V4, and PPO over n_episodes each."""
     ppo_model: Any | None = None
-    active = ["random", "heuristic"]
+    active = ["random", "heuristic", "heuristic_v2", "heuristic_v3", "heuristic_v4"]
 
     try:
         from sb3_contrib import MaskablePPO

@@ -99,50 +99,121 @@ def load_policy(model_path: str = "models/sb3_parking_policy.zip") -> Any | None
 
 # ─── Heuristic Fallback ───────────────────────────────────────────────────────
 
+def _valid_slots(action_masks: np.ndarray, n_slots: int) -> list[int]:
+    """Indices of slot actions (0..n_slots-1) currently allowed by the mask."""
+    return [i for i in range(n_slots) if i < len(action_masks) and action_masks[i]]
+
+
+def _wait_or_dead(action_masks: np.ndarray, wait_action: int) -> int:
+    """Return WAIT if it is still valid; otherwise -1 (full deadlock)."""
+    if wait_action < len(action_masks) and action_masks[wait_action]:
+        return wait_action
+    return -1
+
+
+# ─── V1: Nearest-Greedy Baseline ──────────────────────────────────────────────
+
 def heuristic_policy(action_masks: np.ndarray) -> int:
-    """Distance-based greedy policy: nearest slot, WAIT only when forced.
+    """V1 baseline: greedy nearest slot (Euclidean from ENTRY_POINT).
 
-    Strategy
-    --------
-    1. Rank slot indices 0-7 by Euclidean distance from ENTRY_POINT.
-    2. Return the nearest valid slot.
-    3. If no slots are valid but WAIT (index 8) is available → return WAIT.
-    4. If nothing is valid → return -1.
-
-    The heuristic never voluntarily waits — it is maximally aggressive.
-    It only chooses WAIT when all slot masks are False and WAIT is the sole
-    remaining valid action.  This creates a strong "always-assign" baseline
-    against which PPO's timing policy can be measured.
-
-    Parameters
-    ----------
-    action_masks : Boolean array shape=(9,) from ParkingRoutingEnv.action_masks().
-                   Index 8 is the WAIT action (Discrete(9) env).
-
-    Returns
-    -------
-    int — Slot index 0-7, WAIT_ACTION (8), or -1 if nothing is available.
+    Uses only `action_masks` (mask filters out conflicting/taken slots).
+    Never voluntarily WAITs — only chooses WAIT when all slots are masked.
+    Kept under the original name for backwards compatibility.
     """
     from .parking_env import ENTRY_POINT, SLOT_COORDINATES, SLOT_NAMES, WAIT_ACTION
 
-    # Consider only slot indices 0-7 for distance ranking
-    valid_slots = [
-        i for i in range(len(SLOT_NAMES))
-        if i < len(action_masks) and action_masks[i]
-    ]
+    valid = _valid_slots(action_masks, len(SLOT_NAMES))
+    if not valid:
+        return _wait_or_dead(action_masks, WAIT_ACTION)
 
-    if valid_slots:
-        ex, ey = ENTRY_POINT
-        return min(
-            valid_slots,
-            key=lambda i: math.hypot(
-                SLOT_COORDINATES[SLOT_NAMES[i]][0] - ex,
-                SLOT_COORDINATES[SLOT_NAMES[i]][1] - ey,
-            ),
-        )
+    ex, ey = ENTRY_POINT
+    return min(valid, key=lambda i: math.hypot(
+        SLOT_COORDINATES[SLOT_NAMES[i]][0] - ex,
+        SLOT_COORDINATES[SLOT_NAMES[i]][1] - ey,
+    ))
 
-    # No slot available — use WAIT if still valid
-    if WAIT_ACTION < len(action_masks) and action_masks[WAIT_ACTION]:
+
+# ─── V2 / V3 / V4: Stronger Rule-Based Baselines ─────────────────────────────
+#
+# These take the live ParkingRoutingEnv so they can read the reservation table
+# (something V1 cannot do).  They model what a well-designed dispatching rule
+# would look like and form a fairer benchmark for PPO.
+
+def _bottleneck_load(env: Any, route: list[str]) -> int:
+    """Number of reservations sitting on bottleneck nodes along *route*."""
+    from .parking_env import BOTTLENECK_NODES
+    return sum(
+        len(env._reservations.get(n, []))
+        for n in route if n in BOTTLENECK_NODES
+    )
+
+
+def heuristic_policy_v2(action_masks: np.ndarray, env: Any) -> int:
+    """V2 — Congestion-Aware Nearest.
+
+    score(slot) = (dist / MAX_DISTANCE) + 0.5 · (bottleneck_load / 10)
+    Picks the slot with the lowest score.  Same WAIT policy as V1.
+    """
+    from .parking_env import (
+        ENTRY_POINT, MAX_DISTANCE, SLOT_COORDINATES, SLOT_NAMES,
+        SLOT_ROUTES, WAIT_ACTION,
+    )
+
+    valid = _valid_slots(action_masks, len(SLOT_NAMES))
+    if not valid:
+        return _wait_or_dead(action_masks, WAIT_ACTION)
+
+    ex, ey = ENTRY_POINT
+    def score(i: int) -> float:
+        name = SLOT_NAMES[i]
+        sx, sy = SLOT_COORDINATES[name]
+        dist_norm = math.hypot(sx - ex, sy - ey) / MAX_DISTANCE
+        cong_norm = min(_bottleneck_load(env, SLOT_ROUTES[name]) / 10.0, 1.0)
+        return dist_norm + 0.5 * cong_norm
+    return min(valid, key=score)
+
+
+def heuristic_policy_v3(action_masks: np.ndarray, env: Any) -> int:
+    """V3 — Proactive WAIT.
+
+    Same scoring as V2, but voluntarily WAITs when the central lane is
+    critically loaded (junction + lane_pt_4 reservations ≥ 4) AND the agent
+    has not just chained 3+ consecutive WAITs.
+    """
+    from .parking_env import WAIT_ACTION
+
+    # Proactive WAIT trigger
+    junction_load = len(env._reservations.get("junction",  []))
+    lane4_load    = len(env._reservations.get("lane_pt_4", []))
+    can_wait = (
+        WAIT_ACTION < len(action_masks)
+        and action_masks[WAIT_ACTION]
+        and env._consecutive_waits < 3
+    )
+    if can_wait and (junction_load + lane4_load) >= 4:
         return WAIT_ACTION
 
-    return -1  # Full deadlock (should not occur with a properly masked env)
+    return heuristic_policy_v2(action_masks, env)
+
+
+def heuristic_policy_v4(action_masks: np.ndarray, env: Any) -> int:
+    """V4 — Route-Length-Aware.
+
+    Picks slots whose route is short (fewer nodes ⇒ shorter lane occupancy)
+    AND whose nodes are not heavily reserved already.
+
+    score(slot) = (route_len / 7) + 0.3 · (total_route_load / 30)
+    """
+    from .parking_env import SLOT_NAMES, SLOT_ROUTES, WAIT_ACTION
+
+    valid = _valid_slots(action_masks, len(SLOT_NAMES))
+    if not valid:
+        return _wait_or_dead(action_masks, WAIT_ACTION)
+
+    def score(i: int) -> float:
+        route = SLOT_ROUTES[SLOT_NAMES[i]]
+        len_score  = len(route) / 7.0
+        load_total = sum(len(env._reservations.get(n, [])) for n in route)
+        cong_score = min(load_total / 30.0, 1.0)
+        return len_score + 0.3 * cong_score
+    return min(valid, key=score)
