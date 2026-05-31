@@ -361,6 +361,9 @@ class ParkingRoutingEnv(gym.Env):
         # WAIT-action state
         self._consecutive_waits: int = 0   # reset on each slot assignment
         self._wait_count: int = 0          # total WAITs this episode
+        # Flow tracking — counts how many times each slot has been assigned
+        # this episode.  ≥1 means a departure happened and the slot is cycling.
+        self._slot_use_counts: list[int] = [0] * NUM_SLOTS
         # Exiting vehicle log: accumulated per-episode for visualisation.
         # Each entry: {id, slot, slot_idx, route, route_intervals, enter_time}
         self._exiting_log: list[dict[str, Any]] = []
@@ -510,6 +513,10 @@ class ParkingRoutingEnv(gym.Env):
             max_distance=MAX_DISTANCE,
             bottleneck_nodes=BOTTLENECK_NODES,
             reservations=self._reservations,
+            # flow context (v2)
+            slot_use_count=self._slot_use_counts[action],
+            free_slot_count=int(np.sum(self._slot_statuses < STATUS_TAKEN)),
+            num_slots=NUM_SLOTS,
         )
 
         if conflict:
@@ -520,6 +527,8 @@ class ParkingRoutingEnv(gym.Env):
             # incentivise the agent to assign rather than WAIT.
             if self.assignment_bonus != 0.0:
                 reward += self.assignment_bonus
+            # Track slot use count for flow reward (v2)
+            self._slot_use_counts[action] += 1
             # ── commit ────────────────────────────────────────────────────────
             self._vehicle_id_counter += 1
             vid = self._vehicle_id_counter
