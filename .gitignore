@@ -11,6 +11,10 @@ htmlcov/
 
 # YOLO 가중치 및 추론 결과물
 *.pt
+*.mp4
+*.gif
+*.png
 models/
 outputs/
 runs/
+tb_logs/
