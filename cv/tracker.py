@@ -39,7 +39,7 @@ class RCCarTracker:
         self,
         source: int | str = 0,
         detector: YoloVehicleDetector | None = None,
-        weights_path: str = "yolo11n.pt",
+        weights_path: str = "yolo26n.pt",
         confidence_threshold: float = 0.4,
         max_fps: float = 30.0,
     ) -> None:

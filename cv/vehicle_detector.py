@@ -41,9 +41,9 @@ class MockVehicleDetector:
 
 
 class YoloVehicleDetector:
-    """RC카 탐지 및 추적기 (ultralytics YOLO + ByteTrack).
+    """RC카 탐지 및 추적기 (ultralytics YOLO26 + ByteTrack).
 
-    RC카 전용 커스텀 가중치가 없을 경우 기본 COCO 가중치(yolo11n.pt)를 사용하며,
+    RC카 전용 커스텀 가중치가 없을 경우 기본 COCO 가중치(yolo26n.pt)를 사용하며,
     COCO의 'car' 클래스(2번)를 RC카로 취급합니다.
     커스텀 가중치 파일을 지정하면 해당 모델의 전체 클래스를 RC카로 인식합니다.
     """
@@ -53,7 +53,7 @@ class YoloVehicleDetector:
 
     def __init__(
         self,
-        weights_path: str | Path = "yolo11n.pt",
+        weights_path: str | Path = "yolo26n.pt",
         confidence_threshold: float = 0.4,
         tracker: str = "bytetrack.yaml",
         device: str = "",
