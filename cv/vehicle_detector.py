@@ -110,9 +110,14 @@ class YoloVehicleDetector:
                 continue
             for box in boxes:
                 cls_id = int(box.cls[0])
+                #임시 테스트: COCO vehicle class 필터 해제
                 if not self.custom_model and cls_id not in self._COCO_VEHICLE_CLASSES:
                     continue
                 conf = float(box.conf[0])
+                
+                # class_name = result.names.get(cls_id, f"class_{cls_id}")
+                # print(f"[YOLO] class_id={cls_id}, class_name={class_name}, conf={conf:.3f}")
+                
                 x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
                 track_id = int(box.id[0]) if box.id is not None else None
                 label = result.names.get(cls_id, "rc_car") if not self.custom_model else "rc_car"
