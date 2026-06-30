@@ -8,9 +8,13 @@ staticfiles/
 media/
 .coverage
 htmlcov/
-outputs/
+
+# YOLO 가중치 및 추론 결과물
+*.pt
 *.mp4
 *.gif
 *.png
-tb_logs/
 models/
+outputs/
+runs/
+tb_logs/
