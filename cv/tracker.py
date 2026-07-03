@@ -39,15 +39,10 @@ class RCCarTracker:
         self,
         source: int | str = 0,
         detector: YoloVehicleDetector | None = None,
-        weights_path: str = "yolo26n.pt",
-        confidence_threshold: float = 0.4,
         max_fps: float = 30.0,
     ) -> None:
         self._source = source
-        self._detector = detector or YoloVehicleDetector(
-            weights_path=weights_path,
-            confidence_threshold=confidence_threshold,
-        )
+        self._detector = detector or YoloVehicleDetector()
         self._frame_interval = 1.0 / max_fps
         self._running = False
 
