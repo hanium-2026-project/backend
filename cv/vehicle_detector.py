@@ -43,9 +43,16 @@ class MockVehicleDetector:
 class YoloVehicleDetector:
     """RC카 탐지 및 추적기 (ultralytics YOLO26 + ByteTrack).
 
-    RC카 전용 커스텀 가중치가 없을 경우 기본 COCO 가중치(yolo26n.pt)를 사용하며,
-    COCO의 'car' 클래스(2번)를 RC카로 취급합니다.
-    커스텀 가중치 파일을 지정하면 해당 모델의 전체 클래스를 RC카로 인식합니다.
+    가중치 경로와 custom_model 여부는 반드시 외부에서 명시적으로 전달합니다.
+    기본 가중치(yolo26n.pt)는 RC카 전용 가중치가 없을 때 COCO 모델로 동작하는 fallback입니다.
+
+    Args:
+        weights_path: YOLO 가중치 파일 경로. 파인튜닝된 RC카 모델은 실행 시 인자로 전달.
+        confidence_threshold: 탐지 최소 신뢰도.
+        tracker: 추적 알고리즘 설정 파일 (bytetrack.yaml / botsort.yaml).
+        device: 추론 디바이스 ('cpu', '0', '' → 자동).
+        custom_model: True이면 모든 클래스를 rc_car로 처리 (파인튜닝 가중치용).
+                      False이면 COCO 차량 클래스(car/motorcycle/bus/truck)만 필터링.
     """
 
     # COCO 클래스 중 차량 관련 클래스 ID
@@ -58,15 +65,8 @@ class YoloVehicleDetector:
         tracker: str = "bytetrack.yaml",
         device: str = "",
         custom_model: bool = False,
+        imgsz: int = 1280,
     ) -> None:
-        """
-        Args:
-            weights_path: YOLO 가중치 파일 경로. 기본값은 ultralytics 자동 다운로드.
-            confidence_threshold: 탐지 최소 신뢰도.
-            tracker: 추적 알고리즘 설정 파일 (bytetrack.yaml / botsort.yaml).
-            device: 추론 디바이스 ('cpu', '0', '' → 자동).
-            custom_model: True이면 모든 클래스를 RC카로 처리. False이면 COCO 차량 클래스 필터링.
-        """
         try:
             from ultralytics import YOLO
         except ImportError as e:
@@ -77,6 +77,8 @@ class YoloVehicleDetector:
         self.tracker_config = tracker
         self.device = device
         self.custom_model = custom_model
+        # 천장 카메라에서 RC카가 화면 대비 작게 보이므로 기본 추론 해상도를 높게 유지
+        self.imgsz = imgsz
 
         self._model = YOLO(str(self.weights_path))
 
@@ -85,6 +87,7 @@ class YoloVehicleDetector:
         results = self._model.predict(
             source=image,
             conf=self.confidence_threshold,
+            imgsz=self.imgsz,
             device=self.device,
             verbose=False,
         )
@@ -95,6 +98,7 @@ class YoloVehicleDetector:
         results = self._model.track(
             source=image,
             conf=self.confidence_threshold,
+            imgsz=self.imgsz,
             tracker=self.tracker_config,
             device=self.device,
             persist=True,
@@ -110,17 +114,12 @@ class YoloVehicleDetector:
                 continue
             for box in boxes:
                 cls_id = int(box.cls[0])
-                #임시 테스트: COCO vehicle class 필터 해제
                 if not self.custom_model and cls_id not in self._COCO_VEHICLE_CLASSES:
                     continue
                 conf = float(box.conf[0])
-                
-                # class_name = result.names.get(cls_id, f"class_{cls_id}")
-                # print(f"[YOLO] class_id={cls_id}, class_name={class_name}, conf={conf:.3f}")
-                
                 x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
                 track_id = int(box.id[0]) if box.id is not None else None
-                label = result.names.get(cls_id, "rc_car") if not self.custom_model else "rc_car"
+                label = "rc_car" if self.custom_model else result.names.get(cls_id, "vehicle")
                 detections.append(Detection(
                     label=label,
                     confidence=conf,
