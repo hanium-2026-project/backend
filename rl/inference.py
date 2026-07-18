@@ -55,7 +55,7 @@ def select_action(
             action_masks=action_masks,
             deterministic=True,
         )
-        return int(action)
+        return int(np.asarray(action).reshape(-1)[0])
 
     return heuristic_policy(action_masks)
 
