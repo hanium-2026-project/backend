@@ -65,6 +65,7 @@ class YoloVehicleDetector:
         tracker: str = "bytetrack.yaml",
         device: str = "",
         custom_model: bool = False,
+        imgsz: int = 1280,
     ) -> None:
         try:
             from ultralytics import YOLO
@@ -76,6 +77,8 @@ class YoloVehicleDetector:
         self.tracker_config = tracker
         self.device = device
         self.custom_model = custom_model
+        # 천장 카메라에서 RC카가 화면 대비 작게 보이므로 기본 추론 해상도를 높게 유지
+        self.imgsz = imgsz
 
         self._model = YOLO(str(self.weights_path))
 
@@ -84,6 +87,7 @@ class YoloVehicleDetector:
         results = self._model.predict(
             source=image,
             conf=self.confidence_threshold,
+            imgsz=self.imgsz,
             device=self.device,
             verbose=False,
         )
@@ -94,6 +98,7 @@ class YoloVehicleDetector:
         results = self._model.track(
             source=image,
             conf=self.confidence_threshold,
+            imgsz=self.imgsz,
             tracker=self.tracker_config,
             device=self.device,
             persist=True,
