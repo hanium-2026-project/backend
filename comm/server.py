@@ -1,0 +1,308 @@
+"""노트북측 TCP 서버 (§12.1, §26) — ESP32 클라이언트를 수용한다.
+
+역할
+----
+- accept → HELLO 수신 → 판정(HELLO_ACK 초안 기준) → session_id 발급
+- car_id별 활성 세션 관리 (중복 연결 시 기존 session 무효화, §26.5)
+- NDJSON 수신 루프: STATUS(ack 겸용)/HELLO/ARRIVED(하위호환) 분류
+- 차량별 ReliableSender 보유, POSE_UPDATE 스트림(최신값만) 송신 스레드
+- 재접속 시 자동 재개 금지: 세션이 새로 열리면 활성 route를 무효화하고
+  상위(on_resync 콜백)에 재계획을 요청한다 (§21·26.3·26.4)
+"""
+
+from __future__ import annotations
+
+import json
+import secrets
+import socket
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from . import protocol
+from .protocol import TIMING, encode, parse_message
+from .reliability import ReliableSender
+
+
+@dataclass
+class VehicleSession:
+    """활성 차량 세션 1개 (car_id당 최대 1개)."""
+
+    car_id: int
+    session_id: str
+    boot_id: str
+    conn: socket.socket
+    sender: ReliableSender
+    last_status: dict[str, Any] = field(default_factory=dict)
+    last_rx_ms: float = field(default_factory=lambda: time.monotonic() * 1000)
+    pose_seq: int = 0
+    latest_pose: dict[str, Any] | None = None      # 최신값만 (§19)
+    alive: bool = True
+
+
+class VehicleServer:
+    """차량 통신 서버.
+
+    Usage::
+
+        srv = VehicleServer(port=9000, known_car_ids={1, 2})
+        srv.on_status = lambda car_id, st: ...
+        srv.on_ready = lambda car_id: ...          # HELLO_ACK 승인 완료 시
+        srv.on_resync = lambda car_id, hello: ...  # 재접속 → 재계획 필요 통지
+        srv.start()
+        srv.send_waypoint(1, wp.to_wire()); srv.send_go(1, route_id, wp_id)
+    """
+
+    def __init__(self, host: str = "0.0.0.0", port: int = 9000,
+                 known_car_ids: set[int] | None = None) -> None:
+        self.host, self.port = host, port
+        self.known_car_ids = known_car_ids or {1, 2}
+        self.sessions: dict[int, VehicleSession] = {}
+        self._lock = threading.Lock()
+        self._srv_sock: socket.socket | None = None
+        self._running = False
+
+        # 상위 콜백
+        self.on_status: Callable[[int, dict[str, Any]], None] | None = None
+        self.on_ready: Callable[[int], None] | None = None
+        self.on_resync: Callable[[int, dict[str, Any]], None] | None = None
+        self.on_comm_fail: Callable[[int, dict[str, Any]], None] | None = None
+        # HOLD 판정 훅: 카메라 검출 여부 등 외부 조건 (car_id → 사유 문자열 | None)
+        self.hold_check: Callable[[int, dict[str, Any]], str | None] | None = None
+
+    # ─── 라이프사이클 ────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        self._srv_sock = socket.socket()
+        self._srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv_sock.bind((self.host, self.port))
+        self._srv_sock.listen(4)
+        self._running = True
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+        threading.Thread(target=self._tick_loop, daemon=True).start()
+
+    def stop(self) -> None:
+        self._running = False
+        with self._lock:
+            for s in self.sessions.values():
+                s.alive = False
+                try: s.conn.close()
+                except OSError: pass
+            self.sessions.clear()
+        if self._srv_sock is not None:
+            self._srv_sock.close()
+
+    @property
+    def bound_port(self) -> int:
+        return self._srv_sock.getsockname()[1] if self._srv_sock else self.port
+
+    # ─── 송신 API ────────────────────────────────────────────────────────────
+
+    def send_waypoint(self, car_id: int, wire_wp: dict[str, Any]) -> int:
+        s = self._session(car_id)
+        return s.sender.send(protocol.make_waypoint(car_id, s.session_id, 0, wire_wp))
+
+    def send_go(self, car_id: int, route_id: int, waypoint_id: int) -> int:
+        s = self._session(car_id)
+        return s.sender.send(protocol.make_go(car_id, s.session_id, 0, route_id, waypoint_id))
+
+    def send_wait(self, car_id: int, reason: str = "REMOTE_WAIT") -> int:
+        s = self._session(car_id)
+        return s.sender.send(protocol.make_wait(car_id, s.session_id, 0, reason))
+
+    def send_stop(self, car_id: int) -> int:
+        s = self._session(car_id)
+        return s.sender.send(protocol.make_stop(car_id, s.session_id, 0))
+
+    def send_reset(self, car_id: int) -> int:
+        s = self._session(car_id)
+        return s.sender.send(protocol.make_reset(car_id, s.session_id, 0))
+
+    def send_set_mode(self, car_id: int, mode: str) -> int:
+        s = self._session(car_id)
+        return s.sender.send(protocol.make_set_mode(car_id, s.session_id, 0, mode))
+
+    def push_pose(self, car_id: int, x_cm: float, y_cm: float,
+                  heading_deg: float | None, heading_source: str | None,
+                  position_confidence: float = 1.0, heading_confidence: float = 0.0,
+                  measurement_age_ms: int = 0, valid: bool = True) -> None:
+        """POSE 스트림 갱신 — 최신값만 저장, 송신은 tick 루프가 주기 수행."""
+        with self._lock:
+            s = self.sessions.get(car_id)
+            if s is None:
+                return
+            s.pose_seq += 1
+            s.latest_pose = protocol.make_pose_update(
+                car_id, s.session_id, s.pose_seq, x_cm, y_cm, heading_deg,
+                position_confidence, heading_confidence, heading_source,
+                measurement_age_ms, valid,
+            )
+
+    def last_status(self, car_id: int) -> dict[str, Any]:
+        with self._lock:
+            s = self.sessions.get(car_id)
+            return dict(s.last_status) if s else {}
+
+    def _session(self, car_id: int) -> VehicleSession:
+        with self._lock:
+            s = self.sessions.get(car_id)
+        if s is None or not s.alive:
+            raise RuntimeError(f"car {car_id}: no active session")
+        return s
+
+    # ─── accept / HELLO 판정 (§26) ───────────────────────────────────────────
+
+    def _accept_loop(self) -> None:
+        while self._running:
+            try:
+                conn, _ = self._srv_sock.accept()
+            except OSError:
+                break
+            threading.Thread(target=self._handshake, args=(conn,), daemon=True).start()
+
+    def _handshake(self, conn: socket.socket) -> None:
+        conn.settimeout(TIMING["COMM_TIMEOUT"] / 1000.0 * 3)
+        buf = b""
+        try:
+            while b"\n" not in buf:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    conn.close(); return
+                buf += chunk
+            line, rest = buf.split(b"\n", 1)
+            hello = parse_message(line)
+        except (OSError, ValueError):
+            conn.close(); return
+
+        car_id = hello.get("car_id", -1)
+        result, reason = self._judge_hello(hello)
+        session_id = "S" + secrets.token_hex(4).upper() if result == "READY_ALLOWED" else ""
+        try:
+            conn.sendall(encode(protocol.make_hello_ack(car_id, session_id, result, reason)))
+        except OSError:
+            conn.close(); return
+        if result != "READY_ALLOWED":
+            conn.close(); return
+
+        # 기존 세션 무효화 (§26.5) 후 신규 등록
+        with self._lock:
+            old = self.sessions.get(car_id)
+            if old is not None:
+                old.alive = False
+                try: old.conn.close()
+                except OSError: pass
+            sender = ReliableSender(
+                car_id,
+                send_raw=lambda m, c=conn: self._safe_send(c, m),
+                on_fail=lambda m, cid=car_id: self._comm_fail(cid, m),
+            )
+            sess = VehicleSession(car_id, session_id, str(hello.get("boot_id", "")), conn, sender)
+            self.sessions[car_id] = sess
+
+        conn.settimeout(None)
+        # 재접속/재부팅 공통: 자동 재개 금지 → 상위에 재계획 통지 (§21·26.3·26.4)
+        if self.on_resync is not None:
+            self.on_resync(car_id, hello)
+        if self.on_ready is not None:
+            self.on_ready(car_id)
+        self._rx_loop(sess, rest)
+
+    def _judge_hello(self, hello: dict[str, Any]) -> tuple[str, str | None]:
+        """HELLO_ACK 판정 초안 (REJECTED → HOLD → READY_ALLOWED)."""
+        if hello.get("type") != "HELLO":
+            return "REJECTED", "NOT_HELLO"
+        if hello.get("version") != protocol.PROTOCOL_VERSION:
+            return "REJECTED", "VERSION_MISMATCH"                       # R1
+        if hello.get("car_id") not in self.known_car_ids:
+            return "REJECTED", "UNKNOWN_CAR_ID"                         # R2
+        if str(hello.get("error_code", "NONE")) not in ("NONE", ""):
+            return "HOLD", "ERROR_NOT_CLEARED"                          # H1
+        if hello.get("previous_state") == "EMERGENCY_STOP":
+            return "HOLD", "ESTOP_HISTORY"                              # H2
+        if self.hold_check is not None:
+            reason = self.hold_check(int(hello["car_id"]), hello)
+            if reason:
+                return "HOLD", reason                                   # H3/H4 (외부 훅)
+        return "READY_ALLOWED", None
+
+    # ─── 수신 루프 ───────────────────────────────────────────────────────────
+
+    def _rx_loop(self, sess: VehicleSession, initial: bytes = b"") -> None:
+        buf = initial
+        while self._running and sess.alive:
+            try:
+                chunk = sess.conn.recv(4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    msg = parse_message(line)
+                except ValueError:
+                    continue
+                self._dispatch(sess, msg)
+        sess.alive = False
+
+    def _dispatch(self, sess: VehicleSession, msg: dict[str, Any]) -> None:
+        sess.last_rx_ms = time.monotonic() * 1000
+        # 이전 세션의 늦은 메시지 차단 (§13.3)
+        if msg.get("session_id") and msg["session_id"] != sess.session_id:
+            return
+        mtype = msg.get("type")
+        if mtype == "STATUS":
+            # 오래된 status_seq 무시 (§13.6)
+            if msg.get("status_seq", 0) < sess.last_status.get("status_seq", -1):
+                return
+            sess.last_status = msg
+            acked = msg.get("ack_seq", msg.get("last_processed_cmd_seq"))
+            if acked is not None:
+                sess.sender.on_ack(int(acked))
+            if self.on_status is not None:
+                self.on_status(sess.car_id, msg)
+        elif mtype == "ARRIVED":
+            # 하위호환 (§22.4): 판정은 노트북이 하므로 ACK만 응답하고 무시
+            if "event_id" in msg:
+                self._safe_send(sess.conn, protocol.make_event_ack(
+                    sess.car_id, sess.session_id, int(msg["event_id"])))
+        elif mtype == "HEARTBEAT":
+            pass                                    # last_rx_ms 갱신으로 충분 (§18.9)
+
+    # ─── 주기 루프: 재전송 + POSE 스트림 + COMM 감시 ─────────────────────────
+
+    def _tick_loop(self) -> None:
+        last_pose_ms = 0.0
+        while self._running:
+            now_ms = time.monotonic() * 1000
+            with self._lock:
+                sessions = list(self.sessions.values())
+            for s in sessions:
+                if not s.alive:
+                    continue
+                s.sender.tick()
+                if now_ms - s.last_rx_ms > TIMING["COMM_TIMEOUT"]:
+                    self._comm_fail(s.car_id, {"type": "COMM_TIMEOUT"})
+                    s.last_rx_ms = now_ms          # 중복 통지 억제
+            if now_ms - last_pose_ms >= TIMING["POSE_INTERVAL"]:
+                last_pose_ms = now_ms
+                for s in sessions:
+                    if s.alive and s.latest_pose is not None:
+                        self._safe_send(s.conn, s.latest_pose)
+            time.sleep(0.02)
+
+    # ─── 내부 유틸 ───────────────────────────────────────────────────────────
+
+    def _safe_send(self, conn: socket.socket, msg: dict[str, Any]) -> None:
+        try:
+            conn.sendall(encode(msg))
+        except (OSError, ValueError):
+            pass
+
+    def _comm_fail(self, car_id: int, msg: dict[str, Any]) -> None:
+        if self.on_comm_fail is not None:
+            self.on_comm_fail(car_id, msg)
