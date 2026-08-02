@@ -55,6 +55,10 @@ class PipelineConfig:
     # RL 이 WAIT 을 반환했을 때 슬롯 배정을 다시 시도하는 간격 (프레임)
     alloc_retry_frames: int = 10
 
+    # ─── 대시보드 ────────────────────────────────────────────────────────────
+    # 차량 위치를 대시보드로 보내는 최소 간격 (초). 탐지 주기보다 성기게 둔다.
+    dashboard_pose_interval_s: float = 0.2
+
     def homography_pairs(self, frame_width: int, frame_height: int):
         """(src, dst) 대응점 4쌍을 만든다.
 

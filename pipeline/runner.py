@@ -41,6 +41,7 @@ from parking.waypoints import build_waypoints, default_slot_specs
 from rl.bridge import RealtimeAllocator, position_to_node
 
 from .config import PipelineConfig
+from .dashboard import DashboardBridge
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +94,7 @@ class ParkingPipeline:
         self.heading = HeadingEstimator(min_move=self.config.heading_min_move_mm)
         self.collision = CollisionMonitor()
 
+        self.dashboard = DashboardBridge(pose_interval_s=self.config.dashboard_pose_interval_s)
         self._collision_held: set[int] = set()           # 충돌로 정지시킨 차량
         self.views: dict[int, VehicleView] = {}          # track_id → 관측
         self.track_of_car: dict[int, int] = {}           # car_id → track_id
@@ -243,6 +245,8 @@ class ParkingPipeline:
         self.orchestrator.start_mission(car_id, wps, slot_id=slot_id)
         log.info("car %d → slot %s (route %d, %d waypoints)",
                  car_id, slot_id, route_id, len(wps))
+        self.dashboard.push_event("slot_assigned", car_id=car_id, slot=slot_id,
+                                  route_id=route_id)
 
     def _push_to_vehicle(self, view: VehicleView) -> None:
         """도착 판정 + POSE 스트림 갱신."""
@@ -254,6 +258,15 @@ class ParkingPipeline:
             if not view.is_stationary(self.config.stationary_tolerance_mm,
                                       self.config.stationary_window):
                 return
+        mission = self.orchestrator.missions.get(view.car_id)
+        self.dashboard.push_pose(
+            car_id=view.car_id, position_mm=view.position_mm,
+            status="parked" if mission and mission.state is MissionState.DONE else "moving",
+            heading_deg=view.heading_deg, heading_source=view.heading_source,
+            parking_phase=mission.current.phase if mission and mission.current else None,
+            route_id=mission.route_id if mission else None,
+            waypoint_id=mission.current.waypoint_id if mission and mission.current else None,
+        )
         self.orchestrator.update_pose(view.car_id, view.position_mm, view.heading_deg)
         self.server.push_pose(
             view.car_id,
@@ -303,6 +316,9 @@ class ParkingPipeline:
                         event.stop_car_id, event.reason, event.distance_mm)
             self.orchestrator.hold(event.stop_car_id, "COLLISION_RISK")
             self._collision_held.add(event.stop_car_id)
+            self.dashboard.push_event("vehicle_hold", car_id=event.stop_car_id,
+                                      reason=event.reason,
+                                      distance_mm=event.distance_mm)
 
         self._resume_cleared(at_risk)
 
@@ -316,6 +332,7 @@ class ParkingPipeline:
             if m is not None and m.state is MissionState.HELD:
                 log.info("collision cleared: car %d resumes", car_id)
                 self.orchestrator.resume(car_id)
+                self.dashboard.push_event("vehicle_resume", car_id=car_id)
 
     # ─── 콜백 ────────────────────────────────────────────────────────────────
 
@@ -327,6 +344,7 @@ class ParkingPipeline:
         tracked = self.allocator.vehicles.get(track_id) if track_id is not None else None
         if tracked is not None:
             tracked.route = []
+        self.dashboard.push_event("parked", car_id=car_id, slot=slot_id)
 
     def _on_replan_required(self, car_id: int, reason: str) -> None:
         """현재 pose 기준으로 새 route_id 경로를 만들어 재시작한다 (§32)."""
