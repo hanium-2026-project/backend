@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from comm import MissionOrchestrator, MissionState, VehicleServer
+from cv.association import associate
 from cv.heading import HeadingEstimator
 from cv.homography import compute_homography, warp_point
 from cv.tracker import RCCarTracker, TrackState
@@ -145,12 +146,26 @@ class ParkingPipeline:
         if self._homography is None:
             self._init_homography(state)
 
+        # 2클래스 모델이면 전방 쿠션을 차량과 짝지어 heading 정확도를 높인다.
+        # 1클래스 모델에서는 쿠션이 없으므로 pairs 가 비고 기존 동작과 같아진다.
+        prev_headings = {v.track_id: v.heading_deg for v in self.views.values()
+                         if v.heading_deg is not None}
+        pairs, unpaired = associate(state.detections, prev_headings,
+                                    image_heading_of=self._heading_from_pixels)
+
         seen: list[VehicleView] = []
-        for det in state.detections:
+        for pair in pairs:
+            if pair.car.track_id is None:
+                continue
+            view = self._update_view(pair.car, state.frame_index,
+                                     front_px=pair.cushion_center_px)
+            seen.append(view)
+        for det in unpaired:
             if det.track_id is None:
                 continue
-            view = self._update_view(det, state.frame_index)
-            seen.append(view)
+            seen.append(self._update_view(det, state.frame_index))
+
+        for view in seen:
             self._ensure_mission(view, state.frame_index)
             self._push_to_vehicle(view)
 
@@ -166,7 +181,23 @@ class ParkingPipeline:
         self._homography = compute_homography(src, dst)
         log.info("homography ready (frame %dx%d)", w, h)
 
-    def _update_view(self, det, frame_index: int) -> VehicleView:
+    def _heading_from_pixels(self, car_px: tuple[float, float],
+                             front_px: tuple[float, float]) -> float | None:
+        """픽셀 두 점을 맵 좌표로 옮겨 heading 을 구한다 (§6.5).
+
+        heading 은 반드시 실좌표에서 계산해야 한다. 픽셀에서 각도를 재면
+        카메라 투영 왜곡이 그대로 각도 오차가 된다.
+        """
+        if self._homography is None:
+            return None
+        cx, cy = warp_point(car_px, self._homography)
+        fx, fy = warp_point(front_px, self._homography)
+        if math.hypot(fx - cx, fy - cy) < 1e-6:
+            return None
+        return math.degrees(math.atan2(fy - cy, fx - cx)) % 360.0
+
+    def _update_view(self, det, frame_index: int,
+                     front_px: tuple[float, float] | None = None) -> VehicleView:
         x1, y1, x2, y2 = det.bbox
         center_px = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
         mx, my = warp_point(center_px, self._homography)
@@ -183,7 +214,8 @@ class ParkingPipeline:
             view.last_seen_frame = frame_index
             view.recent.append((mx, my))
 
-        hr = self.heading.update(det.track_id, (mx, my))
+        front_mm = warp_point(front_px, self._homography) if front_px else None
+        hr = self.heading.update(det.track_id, (mx, my), front_point=front_mm)
         view.heading_deg, view.heading_source = hr.heading_deg, hr.source
         view.node = position_to_node((mx, my))
         # RL 관측이 실제 차량 진행을 반영해야 한다. 이 갱신이 없으면 정책은

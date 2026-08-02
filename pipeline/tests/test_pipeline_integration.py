@@ -280,5 +280,48 @@ class TestRecovery(PipelineTestBase):
         self.assertGreater(orch.missions[1].route_id, before)
 
 
+class TestTwoClassModel(PipelineTestBase):
+    """2클래스 모델(RC_CAR + FRONT_CUSHION) 도입 시 파이프라인 동작.
+
+    가중치는 아직 없지만 배선은 미리 검증해둔다 — 가중치 교체만으로 동작해야 한다.
+    """
+
+    def feed_with_cushion(self, map_xy, front_offset_mm, track_id=7):
+        """차량과 그 앞 쿠션을 함께 담은 프레임을 넣는다."""
+        from cv.vehicle_detector import LABEL_CUSHION
+        self.frame_no += 1
+        mx, my = map_xy
+        fx, fy = mx + front_offset_mm[0], my + front_offset_mm[1]
+        car_det = detection_at((mx, my), track_id)
+        cu_px = (fx, FRAME - fy)
+        cushion_det = Detection(LABEL_CUSHION, 0.85,
+                                (int(cu_px[0]-15), int(cu_px[1]-15),
+                                 int(cu_px[0]+15), int(cu_px[1]+15)), None)
+        self.pipeline.on_frame(TrackState(
+            frame_index=self.frame_no, timestamp=time.monotonic(),
+            detections=[car_det, cushion_det], fps=30.0, frame_size=(FRAME, FRAME),
+        ))
+        time.sleep(0.12)
+
+    def test_cushion_gives_heading_while_stationary(self):
+        """정지 상태에서도 heading 이 나온다 — 궤적 방식으로는 불가능한 경우."""
+        self.connect(1)
+        for _ in range(3):
+            self.feed_with_cushion((150.0, 100.0), (0.0, 60.0))
+        view = self.pipeline.views[7]
+        self.assertEqual(view.heading_source, "FRONT_CUSHION")
+        self.assertAlmostEqual(view.heading_deg, 90.0, delta=5.0)
+
+    def test_cushion_does_not_break_mission(self):
+        """쿠션이 섞여 들어와도 차량으로 오인되지 않고 주행이 정상 진행된다."""
+        esp = self.connect(1)
+        self.feed_with_cushion((150.0, 100.0), (0.0, 60.0))
+        self.assertIsNotNone(self.pipeline.views[7].slot_id, "슬롯 미배정")
+        # 쿠션이 별도 차량으로 등록되지 않았는지
+        self.assertEqual(len(self.pipeline.views), 1,
+                         f"쿠션이 차량으로 잡힘: {list(self.pipeline.views)}")
+        self.assertEqual(esp.rejects, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

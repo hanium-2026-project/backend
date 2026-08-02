@@ -9,6 +9,11 @@ from typing import Protocol
 import numpy as np
 
 
+# 내부 표준 라벨 — 파이프라인 전역에서 이 값으로만 비교한다
+LABEL_CAR = "rc_car"
+LABEL_CUSHION = "front_cushion"
+
+
 @dataclass(frozen=True)
 class Detection:
     """Normalized object detection result in image coordinates."""
@@ -51,12 +56,21 @@ class YoloVehicleDetector:
         confidence_threshold: 탐지 최소 신뢰도.
         tracker: 추적 알고리즘 설정 파일 (bytetrack.yaml / botsort.yaml).
         device: 추론 디바이스 ('cpu', '0', '' → 자동).
-        custom_model: True이면 모든 클래스를 rc_car로 처리 (파인튜닝 가중치용).
-                      False이면 COCO 차량 클래스(car/motorcycle/bus/truck)만 필터링.
+        custom_model: 파인튜닝 가중치 사용 여부. True 이면 모델이 낸 클래스 이름을
+                      내부 라벨(rc_car / front_cushion)로 정규화하고, 모르는 이름은
+                      차량으로 본다. False 이면 COCO 차량 클래스만 필터링한다.
     """
 
     # COCO 클래스 중 차량 관련 클래스 ID
     _COCO_VEHICLE_CLASSES: frozenset[int] = frozenset({2, 3, 5, 7})  # car, motorcycle, bus, truck
+
+    # 파인튜닝 모델의 클래스 이름 → 내부 라벨. 학습 시 표기(대소문자·구분자)가
+    # 달라도 같은 의미로 받아들인다.
+    _LABEL_ALIASES: dict[str, str] = {
+        "rc_car": LABEL_CAR, "rccar": LABEL_CAR, "car": LABEL_CAR, "vehicle": LABEL_CAR,
+        "front_cushion": LABEL_CUSHION, "frontcushion": LABEL_CUSHION,
+        "cushion": LABEL_CUSHION, "front": LABEL_CUSHION,
+    }
 
     def __init__(
         self,
@@ -119,7 +133,7 @@ class YoloVehicleDetector:
                 conf = float(box.conf[0])
                 x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
                 track_id = int(box.id[0]) if box.id is not None else None
-                label = "rc_car" if self.custom_model else result.names.get(cls_id, "vehicle")
+                label = self._resolve_label(result.names.get(cls_id, ""))
                 detections.append(Detection(
                     label=label,
                     confidence=conf,
@@ -127,3 +141,16 @@ class YoloVehicleDetector:
                     track_id=track_id,
                 ))
         return detections
+
+    def _resolve_label(self, raw_name: str) -> str:
+        """모델 클래스 이름을 내부 라벨로 정규화한다.
+
+        1클래스 모델(rc_car 만 학습)은 모든 탐지가 차량이고, 2클래스 모델은
+        전방 쿠션을 함께 낸다. 알 수 없는 이름은 커스텀 모델에서는 차량으로,
+        COCO 모델에서는 원래 이름을 유지한다.
+        """
+        key = raw_name.strip().lower().replace(" ", "_").replace("-", "_")
+        alias = self._LABEL_ALIASES.get(key)
+        if alias is not None:
+            return alias
+        return LABEL_CAR if self.custom_model else (raw_name or "vehicle")
