@@ -191,4 +191,11 @@ class ProtocolTests(APITestCase):
             "target_spot_id": 3,
         }
         message = VehicleTelemetryMessage.from_dict(payload)
-        self.assertEqual(message.to_dict(), payload)
+        wire = message.to_dict()
+        # 기존 필드는 그대로 보존되어야 한다
+        self.assertEqual({k: wire[k] for k in payload}, payload)
+        # CV 파이프라인이 채우는 확장 필드는 값이 없으면 None 으로 나간다
+        self.assertIsNone(wire["heading_deg"])
+        self.assertIsNone(wire["parking_phase"])
+        # 왕복 후에도 동일한 메시지로 복원된다
+        self.assertEqual(VehicleTelemetryMessage.from_dict(wire), message)

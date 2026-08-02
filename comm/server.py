@@ -266,6 +266,10 @@ class VehicleServer:
         # 이전 세션의 늦은 메시지 차단 (§13.3)
         if msg.get("session_id") and msg["session_id"] != sess.session_id:
             return
+        # 소켓이 속한 차량과 다른 car_id 가 실려 오면 신뢰하지 않는다.
+        # 정상 펌웨어는 자기 CAR_ID 만 보내므로, 불일치는 배선/설정 오류 신호다.
+        if msg.get("car_id") != sess.car_id:
+            return
         mtype = msg.get("type")
         if mtype in ("STATUS", "COMMAND_RESULT"):
             # 오래된 스냅샷은 상태를 되돌리지 않는다. 단, 명령 응답은 여전히 유효할

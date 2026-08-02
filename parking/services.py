@@ -13,6 +13,7 @@ from rest_framework.exceptions import ValidationError
 
 logger = logging.getLogger(__name__)
 
+from .protocol import VehicleTelemetryMessage
 from .models import (
     Camera,
     EntryExit,
@@ -190,6 +191,33 @@ def _broadcast_after_commit(event: str, payload: dict) -> None:
     with no impact on transactional integrity.
     """
     transaction.on_commit(lambda: _broadcast_state(event, payload))
+
+
+def broadcast_vehicle_pose(telemetry: "VehicleTelemetryMessage") -> None:
+    """CV 파이프라인의 실시간 차량 관측을 대시보드로 흘린다.
+
+    `event` 키를 넣지 않는다. 대시보드는 event 가 있을 때 REST 를 다시 조회하는데,
+    pose 는 초당 수 회 들어오므로 event 를 붙이면 불필요한 재조회 폭주가 된다.
+    지도 갱신처럼 스트림이 필요한 화면은 `vehicle.telemetry` 타입을 직접 구독한다.
+    """
+    channel_layer = get_channel_layer()
+    if not channel_layer:
+        return
+    try:
+        async_to_sync(channel_layer.group_send)(
+            "parking_dashboard",
+            {"type": "parking.telemetry", "payload": telemetry.to_dict()},
+        )
+    except Exception as exc:  # pragma: no cover - depends on broker availability
+        logger.warning("pose broadcast failed (car=%s): %s", telemetry.car_id, exc)
+
+
+def broadcast_vehicle_event(event: str, payload: dict) -> None:
+    """상태가 바뀐 시점에만 보내는 이벤트 (대시보드 재조회를 유발한다).
+
+    슬롯 배정·주차 완료·충돌 정지처럼 요약 수치가 실제로 달라지는 순간에만 쓴다.
+    """
+    _broadcast_state(event, payload)
 
 
 @transaction.atomic

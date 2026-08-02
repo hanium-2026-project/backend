@@ -2,8 +2,9 @@
 
 회의 스펙 (SW팀 전달용 차량 인식 및 Waypoint 설계 변경사항):
 - 각도 기준: 오른쪽 0°, 위쪽 90°, 왼쪽 180°, 아래쪽 270° (반시계, 맵 좌표계 +y 위)
-- heading_source: TRAJECTORY(이동 중 궤적) / LAST_VALID(정지 시 마지막 유효값)
-- 후진 시 궤적 heading은 차량 머리 방향과 180° 다를 수 있음 → 2차(FRONT_CUSHION)에서 해결
+- heading_source 우선순위 (§6.6): FRONT_CUSHION > TRAJECTORY > LAST_VALID
+- 궤적 방식은 정지 중에는 방향을 알 수 없고, 후진 시 머리 방향과 180° 반대다.
+  전방 쿠션이 보이면 그 값을 우선 사용한다.
 
 사용법::
 
@@ -53,10 +54,28 @@ class HeadingEstimator:
         self._history: dict[int, deque[tuple[float, float]]] = {}
         self._last_valid: dict[int, float] = {}
 
-    def update(self, track_id: int, position: tuple[float, float]) -> HeadingResult:
-        """새 프레임의 위치를 반영하고 현재 heading 추정을 반환한다."""
+    def update(self, track_id: int, position: tuple[float, float],
+               front_point: tuple[float, float] | None = None) -> HeadingResult:
+        """새 프레임의 위치를 반영하고 현재 heading 추정을 반환한다.
+
+        Args:
+            track_id: 추적 대상 식별자.
+            position: 차량 중심 (맵 좌표).
+            front_point: 전방 쿠션 중심 (맵 좌표). 주어지면 최우선으로 사용한다.
+                         2클래스 모델이 없거나 쿠션이 가려지면 None 을 넘긴다.
+        """
         hist = self._history.setdefault(track_id, deque(maxlen=self.window))
         hist.append(position)
+
+        # 1순위: 전방 쿠션 — 정지 중에도, 후진 중에도 머리 방향을 그대로 준다
+        if front_point is not None:
+            dx = front_point[0] - position[0]
+            dy = front_point[1] - position[1]
+            if math.hypot(dx, dy) >= 1e-6:
+                heading = math.degrees(math.atan2(dy, dx)) % 360.0
+                self._last_valid[track_id] = heading
+                moving = self._is_moving(hist)
+                return HeadingResult(heading, "FRONT_CUSHION", is_moving=moving)
 
         if len(hist) >= 2:
             x0, y0 = hist[0]
@@ -71,6 +90,14 @@ class HeadingEstimator:
         if track_id in self._last_valid:
             return HeadingResult(self._last_valid[track_id], "LAST_VALID", is_moving=False)
         return HeadingResult(None, None, is_moving=False)
+
+    def _is_moving(self, hist: deque[tuple[float, float]]) -> bool:
+        """창 안에서 최소 이동 거리를 넘었는지 (쿠션 heading 사용 시 참고값)."""
+        if len(hist) < 2:
+            return False
+        x0, y0 = hist[0]
+        x1, y1 = hist[-1]
+        return math.hypot(x1 - x0, y1 - y0) >= self.min_move
 
     def remove(self, track_id: int) -> None:
         """추적 종료된 차량의 이력 제거."""

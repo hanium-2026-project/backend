@@ -73,7 +73,11 @@ STATE_DIM: int = (
     NUM_SLOTS + MAX_ACTIVE_VEHICLES * 3 + NUM_BOTTLENECK_FEATURES + 1
 )  # 21  — must not change
 
-SLOT_NAMES: list[str] = ["A1", "A2", "A3", "A4", "B1", "B2", "B3", "B4"]
+# 슬롯 이름은 DB(parking.services.seed_demo_data)와 동일한 규칙을 따른다:
+# 입구에서 가까운 쪽부터 1→4. 액션 인덱스와 물리 좌표의 대응은 학습 당시와
+# 동일하게 유지해야 하므로(정책 재학습 회피), 배열 순서는 먼 쪽부터 나열한다.
+#   index 0 = (1100, ...) 가장 먼 슬롯, index 3 = (425, ...) 가장 가까운 슬롯
+SLOT_NAMES: list[str] = ["A4", "A3", "A2", "A1", "B4", "B3", "B2", "B1"]
 SLOT_INDEX: dict[str, int] = {name: i for i, name in enumerate(SLOT_NAMES)}
 
 # Slot physical positions (mm).  Match the *_front node coordinates exactly.
@@ -88,10 +92,11 @@ SLOT_INDEX: dict[str, int] = {name: i for i, name in enumerate(SLOT_NAMES)}
 #     A2 = B2   (6 nodes / 6.0 s,  x=875)
 #     A1 = B1   (7 nodes / 7.0 s,  x=1100)  ← efficiency reward lowest
 SLOT_COORDINATES: dict[str, tuple[float, float]] = {
-    "A1": (1100.0, 1050.0), "A2": (875.0, 1050.0),
-    "A3": ( 650.0, 1050.0), "A4": (425.0, 1050.0),
-    "B1": (1100.0,  150.0), "B2": (875.0,  150.0),
-    "B3": ( 650.0,  150.0), "B4": (425.0,  150.0),
+    # A행 = 위쪽(출구 방향), B행 = 아래쪽(입구 방향). 번호는 입구에서 가까운 순.
+    "A1": ( 425.0, 1050.0), "A2": ( 650.0, 1050.0),
+    "A3": ( 875.0, 1050.0), "A4": (1100.0, 1050.0),
+    "B1": ( 425.0,  150.0), "B2": ( 650.0,  150.0),
+    "B3": ( 875.0,  150.0), "B4": (1100.0,  150.0),
 }
 # ENTRY_POINT = efficiency-reward reference point.
 # Set to the junction position (where slot-choice differentiation begins,
@@ -135,14 +140,14 @@ MAX_DISTANCE: float = math.hypot(1200.0, 1200.0)
 # bidirectional contention modelled by the Safety Shield (entering and
 # exiting vehicles compete for the central lane points).
 SLOT_ROUTES: dict[str, list[str]] = {
-    "A1": ["entrance", "junction", "lane_pt_4", "lane_pt_3", "lane_pt_2", "lane_pt_1", "A1_front"],
-    "A2": ["entrance", "junction", "lane_pt_4", "lane_pt_3", "lane_pt_2",              "A2_front"],
-    "A3": ["entrance", "junction", "lane_pt_4", "lane_pt_3",                           "A3_front"],
-    "A4": ["entrance", "junction", "lane_pt_4",                                        "A4_front"],
-    "B1": ["entrance", "junction", "lane_pt_4", "lane_pt_3", "lane_pt_2", "lane_pt_1", "B1_front"],
-    "B2": ["entrance", "junction", "lane_pt_4", "lane_pt_3", "lane_pt_2",              "B2_front"],
-    "B3": ["entrance", "junction", "lane_pt_4", "lane_pt_3",                           "B3_front"],
-    "B4": ["entrance", "junction", "lane_pt_4",                                        "B4_front"],
+    "A1": ["entrance", "junction", "lane_pt_4",                                        "A1_front"],
+    "A2": ["entrance", "junction", "lane_pt_4", "lane_pt_3",                           "A2_front"],
+    "A3": ["entrance", "junction", "lane_pt_4", "lane_pt_3", "lane_pt_2",              "A3_front"],
+    "A4": ["entrance", "junction", "lane_pt_4", "lane_pt_3", "lane_pt_2", "lane_pt_1", "A4_front"],
+    "B1": ["entrance", "junction", "lane_pt_4",                                        "B1_front"],
+    "B2": ["entrance", "junction", "lane_pt_4", "lane_pt_3",                           "B2_front"],
+    "B3": ["entrance", "junction", "lane_pt_4", "lane_pt_3", "lane_pt_2",              "B3_front"],
+    "B4": ["entrance", "junction", "lane_pt_4", "lane_pt_3", "lane_pt_2", "lane_pt_1", "B4_front"],
 }
 
 # Bottlenecks: the three highest-traffic nodes (every vehicle's entering AND
@@ -155,14 +160,14 @@ BOTTLENECK_NODES: list[str] = ["junction", "lane_pt_4", "lane_pt_3"]
 # NOT just reversed(SLOT_ROUTES) because the exit endpoint ("exit" node) is
 # physically distinct from the entry endpoint ("entrance" node).
 EXIT_ROUTES: dict[str, list[str]] = {
-    "A1": ["A1_front", "lane_pt_1", "lane_pt_2", "lane_pt_3", "lane_pt_4", "junction", "exit"],
-    "A2": ["A2_front",              "lane_pt_2", "lane_pt_3", "lane_pt_4", "junction", "exit"],
-    "A3": ["A3_front",                           "lane_pt_3", "lane_pt_4", "junction", "exit"],
-    "A4": ["A4_front",                                        "lane_pt_4", "junction", "exit"],
-    "B1": ["B1_front", "lane_pt_1", "lane_pt_2", "lane_pt_3", "lane_pt_4", "junction", "exit"],
-    "B2": ["B2_front",              "lane_pt_2", "lane_pt_3", "lane_pt_4", "junction", "exit"],
-    "B3": ["B3_front",                           "lane_pt_3", "lane_pt_4", "junction", "exit"],
-    "B4": ["B4_front",                                        "lane_pt_4", "junction", "exit"],
+    "A1": ["A1_front",                                        "lane_pt_4", "junction", "exit"],
+    "A2": ["A2_front",                           "lane_pt_3", "lane_pt_4", "junction", "exit"],
+    "A3": ["A3_front",              "lane_pt_2", "lane_pt_3", "lane_pt_4", "junction", "exit"],
+    "A4": ["A4_front", "lane_pt_1", "lane_pt_2", "lane_pt_3", "lane_pt_4", "junction", "exit"],
+    "B1": ["B1_front",                                        "lane_pt_4", "junction", "exit"],
+    "B2": ["B2_front",                           "lane_pt_3", "lane_pt_4", "junction", "exit"],
+    "B3": ["B3_front",              "lane_pt_2", "lane_pt_3", "lane_pt_4", "junction", "exit"],
+    "B4": ["B4_front", "lane_pt_1", "lane_pt_2", "lane_pt_3", "lane_pt_4", "junction", "exit"],
 }
 
 # All graph nodes — must include both entering and exiting waypoints because
@@ -193,15 +198,15 @@ NODE_COORDINATES: dict[str, tuple[float, float]] = {
     "lane_pt_2": ( 875.0,  600.0),
     "lane_pt_1": (1100.0,  600.0),
     # A row (top, y=1050)
-    "A1_front":  (1100.0, 1050.0),
-    "A2_front":  ( 875.0, 1050.0),
-    "A3_front":  ( 650.0, 1050.0),
-    "A4_front":  ( 425.0, 1050.0),
+    "A1_front":  ( 425.0, 1050.0),
+    "A2_front":  ( 650.0, 1050.0),
+    "A3_front":  ( 875.0, 1050.0),
+    "A4_front":  (1100.0, 1050.0),
     # B row (bottom, y=150)
-    "B1_front":  (1100.0,  150.0),
-    "B2_front":  ( 875.0,  150.0),
-    "B3_front":  ( 650.0,  150.0),
-    "B4_front":  ( 425.0,  150.0),
+    "B1_front":  ( 425.0,  150.0),
+    "B2_front":  ( 650.0,  150.0),
+    "B3_front":  ( 875.0,  150.0),
+    "B4_front":  (1100.0,  150.0),
 }
 
 _MAX_ROUTE_LEN: int = max(len(r) for r in SLOT_ROUTES.values())  # 4
