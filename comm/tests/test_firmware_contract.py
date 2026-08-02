@@ -231,3 +231,74 @@ class TestFullMission(ContractTestBase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestCarIdBoundary(unittest.TestCase):
+    """car_id 경계 변환 — wire 는 "CAR_01" 문자열, 내부는 정수.
+
+    한쪽만 통과하는 표기가 있으면 실차에서 조용히 무시되는 메시지가 생기므로,
+    펌웨어의 strcmp 와 같은 엄격도를 유지해야 한다.
+    """
+
+    def test_roundtrip(self):
+        for n in (1, 2, 9, 10, 99, 100):
+            self.assertEqual(protocol.parse_car_id(protocol.wire_car_id(n)), n)
+
+    def test_rejects_non_canonical(self):
+        """펌웨어가 거절하는 표기는 우리도 거절해야 한다."""
+        for bad in ("CAR_001", "CAR_0001", "CAR_1", "CAR_01 ", " CAR_01",
+                    "car_01", "CAR_", "CAR_XX", "garbage", "", None, True, {"a": 1}):
+            with self.assertRaises(ValueError, msg=f"{bad!r} 이 통과함"):
+                protocol.parse_car_id(bad)
+
+    def test_all_builders_convert(self):
+        """모든 송신 빌더가 _base() 를 거쳐 wire 표기로 나가는지."""
+        import inspect
+        import re
+        src = inspect.getsource(protocol)
+        for name in re.findall(r"^def (make_\w+)\(", src, re.M):
+            body = inspect.getsource(getattr(protocol, name))
+            self.assertIn("_base(", body, f"{name} 이 car_id 변환을 건너뜀")
+
+
+class TestMultiVehicleIsolation(ContractTestBase):
+    """2대 동시 운용 시 세션·명령이 섞이지 않는지."""
+
+    def setUp(self):
+        super().setUp()
+        self.e1 = MockFirmware(self.server.bound_port, car_id="CAR_01", boot_id="B1")
+        self.e2 = MockFirmware(self.server.bound_port, car_id="CAR_02", boot_id="B2")
+        wait_until(lambda: self.e1.session_id and self.e2.session_id)
+
+    def tearDown(self):
+        self.e1.close()
+        self.e2.close()
+        super().tearDown()
+
+    def test_sessions_keyed_by_int(self):
+        self.assertEqual(sorted(self.server.sessions), [1, 2])
+        self.assertNotEqual(self.e1.session_id, self.e2.session_id)
+
+    def test_command_targets_one_vehicle(self):
+        self.server.send_wait(2, "COLLISION_RISK", 1, 1)
+        self.assertTrue(wait_until(lambda: self.e2.state == "WAITING"))
+        self.assertEqual(self.e1.state, "READY", "다른 차량이 영향받음")
+        sent = [m["car_id"] for m in self.e2.received if m["type"] == "WAIT"]
+        self.assertEqual(sent, ["CAR_02"])
+
+    def test_unknown_car_id_rejected(self):
+        e9 = MockFirmware(self.server.bound_port, car_id="CAR_09", boot_id="B9")
+        wait_until(lambda: e9.hello_result is not None)
+        self.assertEqual(e9.hello_result, "REJECTED")
+        self.assertNotIn(9, self.server.sessions)
+        e9.close()
+
+    def test_mismatched_car_id_ignored(self):
+        """소켓이 속한 차량과 다른 car_id 가 실려 오면 반영하지 않는다."""
+        before = self.server.last_status(1).get("state")
+        self.e1._send({"version": 1, "type": "STATUS", "car_id": "CAR_02",
+                       "session_id": self.e1.session_id, "status_seq": 999,
+                       "state": "EMERGENCY_STOP", "command_result": "NONE"})
+        time.sleep(0.3)
+        self.assertEqual(self.server.last_status(1).get("state"), before,
+                         "car_id 불일치 메시지가 반영됨")

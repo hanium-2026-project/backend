@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 PROTOCOL_VERSION = 1
@@ -82,17 +83,32 @@ NEGATIVE_RESULTS = TERMINAL_RESULTS - {"ACCEPTED", "ALREADY_STOPPED"}
 POSE_UPDATE_ENABLED = False
 
 
+_CAR_ID_RE = re.compile(r"CAR_(\d{2,})")
+
+
 def wire_car_id(car_id: int) -> str:
     """내부 정수 car_id 를 펌웨어가 비교하는 문자열로 변환한다 (1 → "CAR_01")."""
     return f"CAR_{int(car_id):02d}"
 
 
 def parse_car_id(raw: Any) -> int:
-    """wire 의 "CAR_01" 또는 정수를 내부 정수 car_id 로 되돌린다."""
+    """wire 의 "CAR_01" 또는 정수를 내부 정수 car_id 로 되돌린다.
+
+    펌웨어는 CAR_ID 상수를 strcmp 로 비교하므로 "CAR_001" 이나 뒤 공백은
+    거절한다. 우리도 같은 엄격도를 유지해야 한쪽만 통과하는 상황이 없다.
+    """
+    if isinstance(raw, bool):
+        raise ValueError(f"invalid car_id: {raw!r}")
     if isinstance(raw, int):
         return raw
-    text = str(raw)
-    return int(text[4:]) if text.startswith("CAR_") else int(text)
+    if not isinstance(raw, str) or not _CAR_ID_RE.fullmatch(raw):
+        raise ValueError(f"invalid car_id: {raw!r}")
+    value = int(raw[4:])
+    # 정규 표기와 정확히 일치해야 한다: "CAR_001" 은 펌웨어 strcmp 에서
+    # "CAR_01" 과 다르므로 우리도 받아주면 안 된다.
+    if wire_car_id(value) != raw:
+        raise ValueError(f"non-canonical car_id: {raw!r}")
+    return value
 
 
 # ─── 명령 빌더 (PC → ESP32) ──────────────────────────────────────────────────
