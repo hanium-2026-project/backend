@@ -37,6 +37,7 @@ class VehicleSession:
     last_status: dict[str, Any] = field(default_factory=dict)
     last_rx_ms: float = field(default_factory=lambda: time.monotonic() * 1000)
     pose_seq: int = 0
+    heartbeat_seq: int = 0
     latest_pose: dict[str, Any] | None = None      # 최신값만 (§19)
     alive: bool = True
 
@@ -54,7 +55,7 @@ class VehicleServer:
         srv.send_waypoint(1, wp.to_wire()); srv.send_go(1, route_id, wp_id)
     """
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 9000,
+    def __init__(self, host: str = "0.0.0.0", port: int = 5000,
                  known_car_ids: set[int] | None = None) -> None:
         self.host, self.port = host, port
         self.known_car_ids = known_car_ids or {1, 2}
@@ -68,6 +69,8 @@ class VehicleServer:
         self.on_ready: Callable[[int], None] | None = None
         self.on_resync: Callable[[int, dict[str, Any]], None] | None = None
         self.on_comm_fail: Callable[[int, dict[str, Any]], None] | None = None
+        # 신뢰성 명령이 거절된 경우 (car_id, result, status) — 상위에서 복구 판단
+        self.on_command_rejected: Callable[[int, str, dict[str, Any]], None] | None = None
         # HOLD 판정 훅: 카메라 검출 여부 등 외부 조건 (car_id → 사유 문자열 | None)
         self.hold_check: Callable[[int, dict[str, Any]], str | None] | None = None
 
@@ -107,9 +110,12 @@ class VehicleServer:
         s = self._session(car_id)
         return s.sender.send(protocol.make_go(car_id, s.session_id, 0, route_id, waypoint_id))
 
-    def send_wait(self, car_id: int, reason: str = "REMOTE_WAIT") -> int:
+    def send_wait(self, car_id: int, reason: str = "REMOTE_WAIT",
+                  route_id: int = 0, waypoint_id: int = 0) -> int:
+        """WAIT 송신. 펌웨어가 route_id/waypoint_id/reason 을 모두 요구한다."""
         s = self._session(car_id)
-        return s.sender.send(protocol.make_wait(car_id, s.session_id, 0, reason))
+        return s.sender.send(
+            protocol.make_wait(car_id, s.session_id, 0, route_id, waypoint_id, reason))
 
     def send_stop(self, car_id: int) -> int:
         s = self._session(car_id)
@@ -176,10 +182,15 @@ class VehicleServer:
             conn.close(); return
 
         car_id = hello.get("car_id", -1)
+        boot_id = str(hello.get("boot_id", ""))
         result, reason = self._judge_hello(hello)
         session_id = "S" + secrets.token_hex(4).upper() if result == "READY_ALLOWED" else ""
+        # 새 세션의 명령 seq 시작값 — 이전 세션 seq 와 겹치지 않게 1부터 새로 발급
+        command_seq_start = 1
         try:
-            conn.sendall(encode(protocol.make_hello_ack(car_id, session_id, result, reason)))
+            conn.sendall(encode(protocol.make_hello_ack(
+                car_id, session_id, result, reason,
+                boot_id=boot_id, command_seq_start=command_seq_start)))
         except OSError:
             conn.close(); return
         if result != "READY_ALLOWED":
@@ -197,7 +208,8 @@ class VehicleServer:
                 send_raw=lambda m, c=conn: self._safe_send(c, m),
                 on_fail=lambda m, cid=car_id: self._comm_fail(cid, m),
             )
-            sess = VehicleSession(car_id, session_id, str(hello.get("boot_id", "")), conn, sender)
+            sender.set_seq_start(command_seq_start)
+            sess = VehicleSession(car_id, session_id, boot_id, conn, sender)
             self.sessions[car_id] = sess
 
         conn.settimeout(None)
@@ -255,14 +267,15 @@ class VehicleServer:
         if msg.get("session_id") and msg["session_id"] != sess.session_id:
             return
         mtype = msg.get("type")
-        if mtype == "STATUS":
-            # 오래된 status_seq 무시 (§13.6)
-            if msg.get("status_seq", 0) < sess.last_status.get("status_seq", -1):
+        if mtype in ("STATUS", "COMMAND_RESULT"):
+            # 오래된 스냅샷은 상태를 되돌리지 않는다. 단, 명령 응답은 여전히 유효할
+            # 수 있으므로 ack 판정은 스냅샷 갱신과 분리해서 먼저 수행한다 (§13.6)
+            self._consume_command_result(sess, msg)
+            if mtype == "COMMAND_RESULT":
+                return
+            if msg.get("status_seq", -1) <= sess.last_status.get("status_seq", -1):
                 return
             sess.last_status = msg
-            acked = msg.get("ack_seq", msg.get("last_processed_cmd_seq"))
-            if acked is not None:
-                sess.sender.on_ack(int(acked))
             if self.on_status is not None:
                 self.on_status(sess.car_id, msg)
         elif mtype == "ARRIVED":
@@ -270,13 +283,34 @@ class VehicleServer:
             if "event_id" in msg:
                 self._safe_send(sess.conn, protocol.make_event_ack(
                     sess.car_id, sess.session_id, int(msg["event_id"])))
-        elif mtype == "HEARTBEAT":
-            pass                                    # last_rx_ms 갱신으로 충분 (§18.9)
+
+    def _consume_command_result(self, sess: VehicleSession, msg: dict[str, Any]) -> None:
+        """신뢰성 명령의 최종 응답만 ack 로 인정한다.
+
+        주기 STATUS 는 command_result=NONE 과 함께 last_processed_cmd_seq 를 계속
+        반복하므로, 그것을 승인으로 처리하면 실행되지도 않은 명령이 완료 처리된다.
+        따라서 terminal 결과값이면서 seq 가 일치할 때만 outstanding 을 해제한다.
+        """
+        pending = sess.sender.outstanding
+        if pending is None:
+            return
+        result = str(msg.get("command_result", "NONE"))
+        if result not in protocol.TERMINAL_RESULTS:
+            return
+        seq = pending.get("seq")
+        acked = msg.get("last_processed_cmd_seq")
+        rejected = msg.get("rejected_seq", msg.get("ack_seq"))
+        if acked != seq and rejected != seq:
+            return
+        sess.sender.on_ack(int(seq))
+        if result in protocol.NEGATIVE_RESULTS and self.on_command_rejected is not None:
+            self.on_command_rejected(sess.car_id, result, msg)
 
     # ─── 주기 루프: 재전송 + POSE 스트림 + COMM 감시 ─────────────────────────
 
     def _tick_loop(self) -> None:
         last_pose_ms = 0.0
+        last_hb_ms = 0.0
         while self._running:
             now_ms = time.monotonic() * 1000
             with self._lock:
@@ -288,7 +322,17 @@ class VehicleServer:
                 if now_ms - s.last_rx_ms > TIMING["COMM_TIMEOUT"]:
                     self._comm_fail(s.car_id, {"type": "COMM_TIMEOUT"})
                     s.last_rx_ms = now_ms          # 중복 통지 억제
-            if now_ms - last_pose_ms >= TIMING["POSE_INTERVAL"]:
+            # HEARTBEAT — 노트북이 주기 송신해야 차량이 COMM_TIMEOUT 에 빠지지 않는다
+            if now_ms - last_hb_ms >= TIMING["HEARTBEAT_INTERVAL"]:
+                last_hb_ms = now_ms
+                for s in sessions:
+                    if not s.alive:
+                        continue
+                    s.heartbeat_seq += 1
+                    self._safe_send(s.conn, protocol.make_heartbeat(
+                        s.car_id, s.session_id, s.heartbeat_seq))
+            # POSE_UPDATE — 펌웨어 수신 enum 에 추가되기 전까지는 비활성
+            if protocol.POSE_UPDATE_ENABLED and now_ms - last_pose_ms >= TIMING["POSE_INTERVAL"]:
                 last_pose_ms = now_ms
                 for s in sessions:
                     if s.alive and s.latest_pose is not None:
