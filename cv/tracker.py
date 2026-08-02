@@ -23,6 +23,7 @@ class TrackState:
     timestamp: float
     detections: list[Detection]
     fps: float = 0.0
+    frame_size: tuple[int, int] = (0, 0)      # (width, height) — 캘리브레이션용
 
 
 class RCCarTracker:
@@ -77,11 +78,13 @@ class RCCarTracker:
                 fps = 1.0 / elapsed if elapsed > 0 else 0.0
                 prev_time = now
 
+                h, w = frame.image.shape[:2]
                 state = TrackState(
                     frame_index=frame.frame_index,
                     timestamp=now,
                     detections=detections,
                     fps=fps,
+                    frame_size=(w, h),
                 )
 
                 if on_frame:
