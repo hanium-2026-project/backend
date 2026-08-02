@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import unittest
 
@@ -48,6 +49,11 @@ def detection_at(map_xy: tuple[float, float], track_id: int,
 
 
 class PipelineTestBase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        # 충돌 경고 등 정상 동작 로그가 테스트 출력을 가리지 않게 한다
+        logging.getLogger("pipeline.runner").setLevel(logging.CRITICAL)
+
     def setUp(self) -> None:
         self.config = PipelineConfig(
             server_port=0,
