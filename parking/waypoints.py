@@ -59,10 +59,21 @@ class Waypoint:
     is_final: bool
 
     def to_wire(self) -> dict[str, Any]:
-        """TCP 전송용 dict — 좌표를 회의 스펙 단위(cm)로 변환."""
+        """TCP 전송용 dict — 좌표는 cm 로 변환.
+
+        펌웨어는 target_heading_deg 를 필수 double(0~359.999)로 읽으므로
+        방향 무관 waypoint(heading_required=False)도 null 대신 0.0 을 보낸다.
+        내부 표현은 None 을 유지해 "방향 무관"을 구분한다.
+        """
         d = asdict(self)
         d["x_cm"] = round(self.x / 10.0, 1)
         d["y_cm"] = round(self.y / 10.0, 1)
+        d["target_heading_deg"] = (
+            round(self.target_heading_deg % 360.0, 3)
+            if self.target_heading_deg is not None else 0.0
+        )
+        d.setdefault("motion_direction", "FORWARD")
+        d.setdefault("arrival_mode", "STOP")
         del d["x"], d["y"]
         return d
 
@@ -128,7 +139,7 @@ def build_waypoints(
     approach_y = entry_y - dir_y * (slot.length * 0.9)
 
     wps: list[Waypoint] = []
-    wp_id = 0
+    wp_id = 1          # 펌웨어가 waypoint_id >= 1 을 요구한다 (route_id 도 동일)
 
     # CRUISE — 통로 노드들 (마지막 front 노드는 APPROACH 이후 단계가 대체)
     for node in nodes[:-1]:

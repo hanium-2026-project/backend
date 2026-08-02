@@ -48,6 +48,11 @@ class ReliableSender:
 
     # ─── 송신 ────────────────────────────────────────────────────────────────
 
+    def set_seq_start(self, start: int) -> None:
+        """HELLO_ACK 로 발급한 command_seq_start 에 맞춰 seq 카운터를 초기화한다."""
+        with self._lock:
+            self._seq = max(0, int(start) - 1)
+
     def next_seq(self) -> int:
         with self._lock:
             self._seq += 1

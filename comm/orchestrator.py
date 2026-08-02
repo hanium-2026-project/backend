@@ -67,6 +67,8 @@ class MissionOrchestrator:
         self.on_parked = on_parked
         self.missions: dict[int, Mission] = {}
         self._route_counter = 0
+        # 경로 재생성이 필요할 때 상위에 알린다 (car_id, 사유)
+        self.on_replan_required: Callable[[int, str], None] | None = None
 
     # ─── 미션 시작 / 재생성 ──────────────────────────────────────────────────
 
@@ -85,11 +87,16 @@ class MissionOrchestrator:
         return m
 
     def hold(self, car_id: int, reason: str = "COLLISION_RISK") -> None:
-        """안전 정지 (SafetyEvent 처리). 재개는 resume() 또는 regenerate()."""
+        """안전 정지 (SafetyEvent 처리). 재개는 resume() 또는 regenerate().
+
+        reason 은 protocol.WAIT_REASONS 중 하나여야 한다 (펌웨어 enum).
+        """
         m = self.missions.get(car_id)
         if m is None or m.state in (MissionState.DONE, MissionState.IDLE):
             return
-        self.server.send_wait(car_id, reason)
+        wp = m.current
+        self.server.send_wait(car_id, reason, m.route_id,
+                              wp.waypoint_id if wp else 0)
         m.state = MissionState.HELD
 
     def resume(self, car_id: int) -> None:
@@ -121,10 +128,12 @@ class MissionOrchestrator:
         if m.state is MissionState.DRIVING and self._reached(m.current, position_mm, heading_deg):
             if m.current.is_final:
                 # FINAL: 정지시키고 카메라 재검증 단계로
-                self.server.send_wait(car_id, "FINAL_CHECK")
+                self.server.send_wait(car_id, "FINAL_WAYPOINT_REACHED",
+                                      m.route_id, m.current.waypoint_id)
                 m.state = MissionState.PARKED_CHECK
             else:
-                self.server.send_wait(car_id, "WP_SWITCH")
+                self.server.send_wait(car_id, "WAYPOINT_REACHED",
+                                      m.route_id, m.current.waypoint_id)
                 m.state = MissionState.SWITCHING
 
         elif m.state is MissionState.PARKED_CHECK:
@@ -180,6 +189,32 @@ class MissionOrchestrator:
 
         elif m.state is MissionState.LOADING and state == "MOVING":
             m.state = MissionState.DRIVING    # READY→WAYPOINT→MOVING 경로 (§18.4)
+
+    def on_command_rejected(self, car_id: int, result: str,
+                            status: dict[str, Any]) -> None:
+        """신뢰성 명령이 거절됐을 때의 복구 (server.on_command_rejected 에 연결).
+
+        거절을 무시하면 LOADING/RESUMING 상태에 영구히 머무르므로, 사유별로
+        되돌릴 지점을 정한다. 재계획이 필요한 경우 상위에 통지한다.
+        """
+        m = self.missions.get(car_id)
+        if m is None:
+            return
+        if result in ("STALE_ROUTE", "NEW_ROUTE_REQUIRED", "TARGET_MISMATCH",
+                      "TARGET_NOT_LOADED"):
+            # 차량이 보는 route 와 우리 route 가 어긋남 → 현재 pose 기준 재생성 필요
+            m.state = MissionState.HELD
+            if self.on_replan_required is not None:
+                self.on_replan_required(car_id, result)
+        elif result in ("POSE_REQUIRED", "INVALID_STATE"):
+            # 아직 출발 조건이 아님 → HELD 로 내려두고 조건 충족 후 resume()
+            m.state = MissionState.HELD
+        elif result in ("LOCKED_STATE", "SESSION_MISMATCH", "PROTOCOL_ERROR",
+                        "SEQ_CONFLICT", "STALE_SEQ"):
+            # 사람 개입 또는 재연결이 필요한 상태 — 자동 재개하지 않는다
+            m.state = MissionState.HELD
+            if self.on_replan_required is not None:
+                self.on_replan_required(car_id, result)
 
     def _load_current(self, m: Mission) -> None:
         wp = m.current
