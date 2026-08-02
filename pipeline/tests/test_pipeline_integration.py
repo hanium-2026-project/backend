@@ -20,7 +20,7 @@ from comm import MissionState
 from comm.tests.mock_firmware import MockFirmware
 from cv.tracker import TrackState
 from cv.vehicle_detector import Detection
-from parking.waypoints import default_slot_specs
+from rl.parking_env import SLOT_NAMES
 from pipeline import ParkingPipeline, PipelineConfig
 
 FRAME = 1200
@@ -150,7 +150,8 @@ class TestSingleVehicle(PipelineTestBase):
         self.assertIs(state, MissionState.DONE, f"미완주 (rejects={esp.rejects})")
         self.assertEqual(esp.rejects, [])
 
-        idx = list(default_slot_specs()).index(slot_id)
+        # slot_statuses 는 SLOT_NAMES 순서를 따른다 (SLOT_COORDINATES 순서와 다름)
+        idx = SLOT_NAMES.index(slot_id)
         self.assertEqual(self.pipeline.allocator.slot_statuses[idx], 1.0,
                          "PARKED 후 슬롯이 점유로 갱신되지 않음")
 
