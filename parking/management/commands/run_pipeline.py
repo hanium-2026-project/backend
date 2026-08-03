@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 import os
 
+from pathlib import Path
+
 from django.core.management.base import BaseCommand
 
 from pipeline import ParkingPipeline, PipelineConfig
@@ -32,6 +34,8 @@ class Command(BaseCommand):
         parser.add_argument("--imgsz", type=int, default=1280, help="추론 해상도")
         parser.add_argument("--max-frames", type=int, default=None, help="처리할 최대 프레임")
         parser.add_argument("--show", action="store_true", help="탐지 화면 표시")
+        parser.add_argument("--calibration", default=None,
+                            help="tools/calibrate_camera.py 로 저장한 JSON 경로")
 
     def handle(self, *args, **options) -> None:
         logging.basicConfig(
@@ -41,6 +45,16 @@ class Command(BaseCommand):
         camera: int | str = options["camera"]
         if isinstance(camera, str) and camera.isdigit():
             camera = int(camera)
+
+        homography_src = None
+        lot_w = lot_h = 1200.0
+        if options["calibration"]:
+            import json
+            data = json.loads(Path(options["calibration"]).read_text(encoding="utf-8"))
+            homography_src = [tuple(p) for p in data["homography_src"]]
+            lot_w, lot_h = data["lot_width_mm"], data["lot_height_mm"]
+            self.stdout.write(f"캘리브레이션 로드: {options['calibration']} "
+                              f"({lot_w:.0f}x{lot_h:.0f}mm)")
 
         if not os.getenv("REDIS_URL"):
             self.stdout.write(self.style.WARNING(
@@ -54,6 +68,9 @@ class Command(BaseCommand):
             confidence_threshold=options["conf"],
             imgsz=options["imgsz"],
             server_port=options["port"],
+            homography_src=homography_src,
+            lot_width_mm=lot_w,
+            lot_height_mm=lot_h,
         ))
         pipeline.start()
         self.stdout.write(self.style.SUCCESS(
