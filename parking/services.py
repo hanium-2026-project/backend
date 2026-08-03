@@ -63,16 +63,16 @@ def seed_demo_data() -> None:
     # Origin (0, 0) = 주차장 입구 (bottom-left)
     _PITCH = 225.0    # spot_width(200) + line_width(25)
     _START_X = 425.0  
-    _A_Y = 1050.0     # B_depth(300) + line(25) + aisle(550) + line(25) + half_depth(150)
-    _B_Y = 150.0      # half_depth(150) from bottom
+    _A_Y = 150.0      # half_depth(150) from bottom — 입구 방향 (아래쪽)
+    _B_Y = 1050.0     # B_depth(300) + line(25) + aisle(550) + line(25) + half_depth(150) — 출구 방향 (위쪽)
 
     specs: list[tuple[str, str, float, float]] = [
-        # A열 — 출구 방향 (위쪽)
+        # A열 — 입구 방향 (아래쪽), 실측 라벨 기준
         ("A1", "standard", _START_X,               _A_Y),
         ("A2", "standard", _START_X + _PITCH,       _A_Y),
         ("A3", "standard", _START_X + _PITCH * 2,   _A_Y),
         ("A4", "standard", _START_X + _PITCH * 3,   _A_Y),
-        # B열 — 입구 방향 (아래쪽)
+        # B열 — 출구 방향 (위쪽)
         ("B1", "standard", _START_X,               _B_Y),
         ("B2", "standard", _START_X + _PITCH,       _B_Y),
         ("B3", "standard", _START_X + _PITCH * 2,   _B_Y),
