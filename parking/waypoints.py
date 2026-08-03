@@ -83,15 +83,15 @@ class Waypoint:
 def default_slot_specs() -> dict[str, SlotSpec]:
     """rl.parking_env의 슬롯 좌표로부터 SlotSpec을 생성한다.
 
-    A행(y=1050, 위쪽)은 아래(중앙차로)에서 진입 → entry_side=BOTTOM, 주차 방향 90°(위).
-    B행(y=150, 아래쪽)은 위에서 진입 → entry_side=TOP, 주차 방향 270°(아래).
+    A행(y=150, 아래쪽/입구방향)은 위(중앙차로)에서 진입 → entry_side=TOP, 주차 방향 270°(아래).
+    B행(y=1050, 위쪽/출구방향)은 아래(중앙차로)에서 진입 → entry_side=BOTTOM, 주차 방향 90°(위).
     """
     specs: dict[str, SlotSpec] = {}
     for name, (x, y) in SLOT_COORDINATES.items():
         if name.startswith("A"):
-            specs[name] = SlotSpec(name, x, y, target_heading_deg=90.0, entry_side="BOTTOM")
-        else:
             specs[name] = SlotSpec(name, x, y, target_heading_deg=270.0, entry_side="TOP")
+        else:
+            specs[name] = SlotSpec(name, x, y, target_heading_deg=90.0, entry_side="BOTTOM")
     return specs
 
 
