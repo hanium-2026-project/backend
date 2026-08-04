@@ -46,6 +46,8 @@ class RCCarTracker:
         self._detector = detector or YoloVehicleDetector()
         self._frame_interval = 1.0 / max_fps
         self._running = False
+        # show=True 일 때 화면에 추가로 그릴 것을 상위가 주입한다 (image, state) -> image
+        self.overlay: Callable[[object, TrackState], object] | None = None
 
     def run(
         self,
@@ -94,6 +96,8 @@ class RCCarTracker:
 
                 if show:
                     vis = _draw_detections(frame.image.copy(), state)
+                    if self.overlay is not None:
+                        vis = self.overlay(vis, state)
                     cv2.imshow("RC Car Tracker", vis)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break

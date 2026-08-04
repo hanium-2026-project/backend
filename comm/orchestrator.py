@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from enum import Enum
@@ -20,6 +21,8 @@ from typing import Any, Callable
 from parking.waypoints import Waypoint, is_waypoint_reached
 
 from .server import VehicleServer
+
+log = logging.getLogger(__name__)
 
 
 class MissionState(Enum):
@@ -128,10 +131,14 @@ class MissionOrchestrator:
         if m.state is MissionState.DRIVING and self._reached(m.current, position_mm, heading_deg):
             if m.current.is_final:
                 # FINAL: 정지시키고 카메라 재검증 단계로
+                log.info("car %d: FINAL wp%d 도착 — 정지 확인 중",
+                         car_id, m.current.waypoint_id)
                 self.server.send_wait(car_id, "FINAL_WAYPOINT_REACHED",
                                       m.route_id, m.current.waypoint_id)
                 m.state = MissionState.PARKED_CHECK
             else:
+                log.info("car %d: wp%d(%s) 도착 → 다음 waypoint 로",
+                         car_id, m.current.waypoint_id, m.current.phase)
                 self.server.send_wait(car_id, "WAYPOINT_REACHED",
                                       m.route_id, m.current.waypoint_id)
                 m.state = MissionState.SWITCHING
@@ -218,6 +225,9 @@ class MissionOrchestrator:
 
     def _load_current(self, m: Mission) -> None:
         wp = m.current
+        log.info("car %d: wp%d(%s) 전송 → (%.0f, %.0f)mm%s",
+                 m.car_id, wp.waypoint_id, wp.phase, wp.x, wp.y,
+                 f" heading {wp.target_heading_deg:.0f}°" if wp.heading_required else "")
         wire = wp.to_wire()
         self.server.send_waypoint(m.car_id, wire)
         m.state = MissionState.LOADING
