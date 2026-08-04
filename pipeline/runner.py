@@ -137,7 +137,55 @@ class ParkingPipeline:
             detector=self._detector,
             max_fps=self.config.max_fps,
         )
+        if show:
+            self._tracker.overlay = self._draw_targets
         self._tracker.run(on_frame=self.on_frame, max_frames=max_frames, show=show)
+
+    def _draw_targets(self, image, state: TrackState):
+        """현재 목표 waypoint 를 화면에 표시한다 (show=True 일 때만).
+
+        차를 어디로 옮겨야 하는지 눈으로 보이지 않으면 실차 검증이 어렵다.
+        맵 좌표를 역투영해 목표점·허용 반경·남은 거리를 그린다.
+        """
+        import cv2
+        import numpy as np
+
+        if self._homography is None:
+            return image
+        inv = np.linalg.inv(np.asarray(self._homography, dtype=float))
+
+        def to_px(mm: tuple[float, float]) -> tuple[int, int] | None:
+            v = inv @ np.array([mm[0], mm[1], 1.0])
+            if abs(v[2]) < 1e-9:
+                return None
+            return int(v[0] / v[2]), int(v[1] / v[2])
+
+        y = 60
+        for car_id, m in self.orchestrator.missions.items():
+            wp = m.current
+            if wp is None:
+                continue
+            pt = to_px((wp.x, wp.y))
+            if pt is not None:
+                # 허용 반경도 픽셀로 환산 (x 방향 기준 근사)
+                edge = to_px((wp.x + wp.position_tolerance_cm * 10.0, wp.y))
+                radius = abs(edge[0] - pt[0]) if edge else 20
+                cv2.circle(image, pt, max(radius, 8), (0, 200, 255), 2)
+                cv2.drawMarker(image, pt, (0, 200, 255), cv2.MARKER_CROSS, 18, 2)
+                cv2.putText(image, f"car{car_id} wp{wp.waypoint_id} {wp.phase}",
+                            (pt[0] + 12, pt[1] - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (0, 200, 255), 2)
+
+            track_id = self.track_of_car.get(car_id)
+            view = self.views.get(track_id) if track_id is not None else None
+            dist = ""
+            if view is not None:
+                dist = f"  남은거리 {math.hypot(wp.x - view.position_mm[0], wp.y - view.position_mm[1]):.0f}mm"
+            cv2.putText(image, f"car{car_id} {m.state.name} {m.slot_id or '-'} "
+                               f"wp{wp.waypoint_id}/{len(m.waypoints)}{dist}",
+                        (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+            y += 26
+        return image
 
     # ─── 프레임 처리 (핵심) ──────────────────────────────────────────────────
 
