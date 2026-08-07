@@ -15,6 +15,14 @@ from typing import Any, Callable
 
 from .protocol import PREEMPTIVE_TYPES, TIMING
 
+# 선점 우선순위 (§16): STOP > WAIT > 일반 신뢰성 명령.
+# 숫자가 클수록 우선. 같거나 낮은 우선순위는 진행 중인 명령을 밀어내지 못한다.
+_PRIORITY: dict[str, int] = {"STOP": 2, "WAIT": 1}
+
+
+def _priority(msg_type: str) -> int:
+    return _PRIORITY.get(msg_type, 0)
+
 
 @dataclass
 class _Pending:
@@ -62,17 +70,27 @@ class ReliableSender:
         """신뢰성 명령 송신. 반환값 = 부여된 seq.
 
         일반 명령: outstanding이 있으면 RuntimeError (§16 — 상위에서 순서 제어).
-        WAIT/STOP: outstanding을 폐기하고 즉시 선점 송신 (§17).
+        WAIT/STOP: 더 낮은 우선순위의 명령만 선점한다 (§17).
+
+        STOP 이 응답을 기다리는 중에 WAIT 이 이를 취소해서는 안 된다.
+        비상정지가 일시정지로 뒤집히는 셈이라 안전상 허용할 수 없다.
         """
         msg_type = msg.get("type", "")
         with self._lock:
-            if self._pending is not None:
+            pending = self._pending
+            if pending is not None:
+                pending_type = str(pending.msg.get("type", ""))
                 if msg_type not in PREEMPTIVE_TYPES:
                     raise RuntimeError(
-                        f"outstanding command exists (seq={self._pending.seq}, "
-                        f"type={self._pending.msg.get('type')}); wait for ack"
+                        f"outstanding command exists (seq={pending.seq}, "
+                        f"type={pending_type}); wait for ack"
                     )
-                # 선점: 기존 일반 명령 재전송 중단 (§17.1 '재전송 일시 중단/취소')
+                if _priority(msg_type) <= _priority(pending_type):
+                    raise RuntimeError(
+                        f"{msg_type} cannot preempt pending {pending_type} "
+                        f"(seq={pending.seq}) — 우선순위가 같거나 낮다"
+                    )
+                # 선점: 더 높은 우선순위만 기존 명령의 재전송을 중단시킨다 (§17.1)
                 self._pending = None
 
             self._seq += 1
@@ -91,6 +109,15 @@ class ReliableSender:
                 self._pending = None
                 return True
         return False
+
+    def clear_pending(self) -> None:
+        """진행 중인 명령을 폐기한다 (링크 단절 등 — 재전송해도 의미가 없을 때).
+
+        링크가 끊긴 채 pending 이 남아 있으면 복구 후 새 명령이 전부
+        "outstanding command exists" 로 막힌다.
+        """
+        with self._lock:
+            self._pending = None
 
     @property
     def outstanding(self) -> dict[str, Any] | None:

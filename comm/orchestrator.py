@@ -102,6 +102,22 @@ class MissionOrchestrator:
                               wp.waypoint_id if wp else 0)
         m.state = MissionState.HELD
 
+    def mark_link_lost(self, car_id: int) -> bool:
+        """링크 단절로 미션을 정지 상태로 만든다 (WAIT 를 보내지 않는다).
+
+        hold() 와 달리 명령을 송신하지 않는다. 링크가 끊긴 상황이라 도달하지도
+        않을뿐더러, 차량은 펌웨어 COMM_TIMEOUT 으로 이미 자체 안전정지한다.
+        복구는 resume() 이 아니라 재계획(regenerate)으로만 한다 — 단절 동안
+        차가 얼마나 굴러갔는지 알 수 없으므로 기존 경로를 신뢰할 수 없다.
+
+        반환값: 정지시킬 진행 중 미션이 있었으면 True.
+        """
+        m = self.missions.get(car_id)
+        if m is None or m.state in (MissionState.DONE, MissionState.IDLE):
+            return False
+        m.state = MissionState.HELD
+        return True
+
     def resume(self, car_id: int) -> None:
         """HELD에서 동일 경로 재개 (위험 해소, 경로 유지 시)."""
         m = self.missions.get(car_id)
@@ -115,6 +131,9 @@ class MissionOrchestrator:
         m = self.missions.get(car_id)
         if m is None:
             return
+        # 이전 route 의 미응답 명령은 무효다. 남겨두면 새 WAYPOINT 가
+        # "outstanding command exists" 로 막힌다.
+        self.server.clear_outstanding(car_id)
         m.route_id = new_waypoints[0].route_id
         m.waypoints = list(new_waypoints)
         m.index = 0

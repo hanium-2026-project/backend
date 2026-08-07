@@ -55,7 +55,8 @@ class MockFirmware:
     """단일 차량 ESP32 목. 별도 스레드에서 수신 루프를 돈다."""
 
     def __init__(self, port: int, host: str = "127.0.0.1", boot_id: str = "B0000001",
-                 version: int = VERSION, car_id: str = CAR_ID) -> None:
+                 version: int = VERSION, car_id: str = CAR_ID,
+                 status_interval: float = 0.2) -> None:
         self.boot_id, self.version, self.car_id = boot_id, version, car_id
         self.state = "SYNCING"
         self.mode = "WAYPOINT_AUTO"
@@ -75,11 +76,21 @@ class MockFirmware:
         self.pose_updates = 0
         self.last_heartbeat_at = time.monotonic()
         self.comm_timeout_fired = False
+        # 실물 펌웨어는 약 200ms 주기로 STATUS 를 올린다. 이게 없으면 노트북이
+        # 정상 상황에서도 COMM_TIMEOUT 으로 판정한다. 0 이면 주기 송신을 끈다.
+        self.status_interval = status_interval
+        # HELLO 재전송 주기 — 실물 펌웨어는 READY 가 되기 전까지 HELLO 를 반복한다
+        self.hello_interval = 0.2
+        self.hello_sent = 0
+        self.link_up = True                    # 서버와의 TCP 링크 생존 여부
 
         self.sock = socket.create_connection((host, port))
         self._alive = True
         threading.Thread(target=self._rx_loop, daemon=True).start()
         threading.Thread(target=self._watchdog, daemon=True).start()
+        if status_interval > 0:
+            threading.Thread(target=self._status_loop, daemon=True).start()
+        threading.Thread(target=self._hello_retry_loop, daemon=True).start()
         self._send(self._hello())
 
     # ─── 송신 ────────────────────────────────────────────────────────────────
@@ -91,6 +102,7 @@ class MockFirmware:
             self._alive = False
 
     def _hello(self) -> dict[str, Any]:
+        self.hello_sent += 1
         return {
             "version": self.version, "type": "HELLO", "car_id": self.car_id,
             "boot_id": self.boot_id, "firmware_version": "mock-contract",
@@ -130,7 +142,7 @@ class MockFirmware:
             except OSError:
                 break
             if not chunk:
-                break
+                break                          # 서버가 연결을 닫았다
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
@@ -140,6 +152,7 @@ class MockFirmware:
                     self.rejects.append(("OVERSIZED", line.decode(errors="replace")))
                     continue
                 self._handle(line)
+        self.link_up = False                   # 수신 루프 종료 = 링크 단절
 
     def _handle(self, line: bytes) -> None:
         try:
@@ -219,9 +232,10 @@ class MockFirmware:
         if not self._reliable_pre(seq, f"WAYPOINT|{route_id}|{wp_id}"):
             return
         self.target = {"route_id": int(route_id), "waypoint_id": int(wp_id), "phase": phase}
-        # READY 에서 받으면 즉시 MOVING, WAITING 이면 target 만 교체 (§18.4)
+        # 실물 펌웨어 확인(2026-08-07): WAYPOINT 는 target 을 적재만 하고
+        # READY → WAITING 으로 간다. 실제 출발은 GO 를 받아야 한다.
         if self.state == "READY":
-            self.state = "MOVING"
+            self.state = "WAITING"
         self._reliable_done(seq, "ACCEPTED")
 
     def _on_wait(self, msg: dict[str, Any]) -> None:
@@ -319,6 +333,28 @@ class MockFirmware:
         self._status(result=result, rejected_seq=0 if result == "ACCEPTED" else seq)
 
     # ─── COMM 감시 ───────────────────────────────────────────────────────────
+
+    def _hello_retry_loop(self) -> None:
+        """READY 가 될 때까지 HELLO 를 재전송한다 (HOLD 면 재판정 기회를 준다)."""
+        while self._alive:
+            time.sleep(self.hello_interval)
+            if not self._alive or self.hello_result == "REJECTED":
+                return
+            if self.hello_result != "READY_ALLOWED":
+                try:
+                    self._send(self._hello())
+                except OSError:
+                    return
+
+    def _status_loop(self) -> None:
+        """세션이 열린 뒤 주기 STATUS 송신 (command_result 는 NONE)."""
+        while self._alive:
+            time.sleep(self.status_interval)
+            if self.hello_result == "READY_ALLOWED" and self._alive:
+                try:
+                    self._status()
+                except OSError:
+                    break
 
     def _watchdog(self) -> None:
         while self._alive:
