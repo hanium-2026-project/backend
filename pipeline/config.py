@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from control import VehicleLimits
+
 # 바닥판 실측 (mm) — rl.parking_env / parking.services 와 동일
 LOT_WIDTH_MM = 1200.0
 LOT_HEIGHT_MM = 1200.0
@@ -54,6 +56,14 @@ class PipelineConfig:
     entry_nodes: tuple[str, ...] = ("entrance",)
     # RL 이 WAIT 을 반환했을 때 슬롯 배정을 다시 시도하는 간격 (프레임)
     alloc_retry_frames: int = 10
+
+    # ─── B안 주행 제어 (DIRECT_CONTROL) ──────────────────────────────────────
+    # 노트북이 throttle/steering 을 계산해 내려준다. 실차 안전을 위해 기본은
+    # 끔 — 켜도 ESP32 의 ENABLE_ACTUATOR_OUTPUT 이 0 이면 모터는 돌지 않는다.
+    direct_control: bool = False
+    # 켜기 전에 SET_MODE REMOTE_DIRECT 를 보낼지 (펌웨어가 모드를 요구할 때)
+    direct_control_set_mode: bool = True
+    vehicle_limits: VehicleLimits = field(default_factory=VehicleLimits)
 
     # ─── 대시보드 ────────────────────────────────────────────────────────────
     # 차량 위치를 대시보드로 보내는 최소 간격 (초). 탐지 주기보다 성기게 둔다.

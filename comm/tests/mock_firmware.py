@@ -74,6 +74,9 @@ class MockFirmware:
         self.received: list[dict[str, Any]] = []
         self.heartbeats = 0
         self.pose_updates = 0
+        self.direct_controls = 0
+        self.control_seqs: list[int] = []
+        self.last_direct_control: dict[str, Any] | None = None
         self.last_heartbeat_at = time.monotonic()
         self.comm_timeout_fired = False
         # 실물 펌웨어는 약 200ms 주기로 STATUS 를 올린다. 이게 없으면 노트북이
@@ -307,9 +310,13 @@ class MockFirmware:
 
     def _on_direct(self, msg: dict[str, Any]) -> None:
         _req(msg, "session_id", str)
-        _req(msg, "control_seq", int)
+        seq = _req(msg, "control_seq", int)
         _range("throttle", _req(msg, "throttle", float), -1.0, 1.0)
         _range("steering", _req(msg, "steering", float), -1.0, 1.0)
+        # 스트림이므로 ack 는 없다. 최신값만 유지하고 순서만 확인한다 (§19).
+        self.direct_controls += 1
+        self.control_seqs.append(seq)
+        self.last_direct_control = msg
 
     # ─── 멱등 처리 (§15) ─────────────────────────────────────────────────────
 

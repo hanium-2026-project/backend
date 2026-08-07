@@ -19,6 +19,7 @@ from pathlib import Path
 
 from django.core.management.base import BaseCommand
 
+from control import VehicleLimits
 from pipeline import ParkingPipeline, PipelineConfig
 
 
@@ -36,6 +37,15 @@ class Command(BaseCommand):
         parser.add_argument("--show", action="store_true", help="탐지 화면 표시")
         parser.add_argument("--calibration", default=None,
                             help="tools/calibrate_camera.py 로 저장한 JSON 경로")
+        parser.add_argument("--direct-control", action="store_true",
+                            help="B안 주행 제어: 노트북이 throttle/steering 을 계산해 "
+                                 "DIRECT_CONTROL 로 내려보낸다 (기본 꺼짐)")
+        parser.add_argument("--max-throttle", type=float, default=None,
+                            help="제어값 상한 (실차 튜닝용, 기본 %.2f)"
+                                 % VehicleLimits.max_throttle)
+        parser.add_argument("--steering-sign", type=float, default=None,
+                            choices=[1.0, -1.0],
+                            help="서보 방향이 반대면 -1 (기본 +1 = 좌회전 양수)")
 
     def handle(self, *args, **options) -> None:
         logging.basicConfig(
@@ -62,6 +72,19 @@ class Command(BaseCommand):
                 "(채널 레이어가 프로세스 내부 전용)."
             ))
 
+        limits = VehicleLimits(
+            **{k: v for k, v in (
+                ("max_throttle", options["max_throttle"]),
+                ("steering_sign", options["steering_sign"]),
+            ) if v is not None}
+        )
+        if options["direct_control"]:
+            self.stdout.write(self.style.WARNING(
+                f"B안 주행 제어 켜짐 — throttle 상한 {limits.max_throttle:.2f}, "
+                f"steering_sign {limits.steering_sign:+.0f}. "
+                "ESP32 의 ENABLE_ACTUATOR_OUTPUT 이 0 인지 먼저 확인하세요."
+            ))
+
         pipeline = ParkingPipeline(PipelineConfig(
             camera_source=camera,
             weights_path=options["weights"],
@@ -71,6 +94,8 @@ class Command(BaseCommand):
             homography_src=homography_src,
             lot_width_mm=lot_w,
             lot_height_mm=lot_h,
+            direct_control=options["direct_control"],
+            vehicle_limits=limits,
         ))
         pipeline.start()
         self.stdout.write(self.style.SUCCESS(

@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from comm import MissionOrchestrator, MissionState, VehicleServer
+from control import ControlOutput, Pose, WaypointController
 from cv.association import associate
 from cv.heading import HeadingEstimator
 from cv.homography import compute_homography, warp_point
@@ -98,6 +99,11 @@ class ParkingPipeline:
         self.dashboard = DashboardBridge(pose_interval_s=self.config.dashboard_pose_interval_s)
         self._collision_held: set[int] = set()           # 충돌로 정지시킨 차량
         self._comm_lost: set[int] = set()                # 통신 장애로 정지시킨 차량
+        # B안: 차량별 주행 제어기 (throttle/steering 계산)
+        self.controllers: dict[int, WaypointController] = {}
+        self.last_control: dict[int, ControlOutput] = {}
+        self._mode_set: set[int] = set()                 # SET_MODE 완료 차량
+        self._last_control_mode: dict[int, str] = {}     # 로그 중복 억제
         self.views: dict[int, VehicleView] = {}          # track_id → 관측
         self.track_of_car: dict[int, int] = {}           # car_id → track_id
         self._pending_cars: list[int] = []               # HELLO 순서 대기열
@@ -112,6 +118,7 @@ class ParkingPipeline:
         self.server.on_comm_fail = self._on_comm_fail
         self.server.on_comm_recovered = self._on_comm_recovered
         self.orchestrator.on_replan_required = self._on_replan_required
+        self.server.direct_control_enabled = self.config.direct_control
 
     # ─── 라이프사이클 ────────────────────────────────────────────────────────
 
@@ -188,6 +195,27 @@ class ParkingPipeline:
                                f"wp{wp.waypoint_id}/{len(m.waypoints)}{dist}",
                         (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
             y += 26
+
+            out = self.last_control.get(car_id)
+            if out is not None:
+                # 실차 튜닝 중에는 이 줄만 보면 된다: 어디로 얼마나 틀고 미는지.
+                color = (0, 255, 120) if out.throttle > 0 else (120, 120, 255)
+                cv2.putText(
+                    image,
+                    f"   {out.mode} thr {out.throttle:+.2f} str {out.steering:+.2f} "
+                    f"err {out.heading_error_deg:+.0f}deg"
+                    + (f" [{out.reason}]" if out.reason else ""),
+                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+                y += 24
+                if view is not None and view.heading_deg is not None:
+                    # 조향 방향을 화살표로 — 부호 규약(좌=+)을 눈으로 검증한다
+                    origin = to_px(view.position_mm)
+                    if origin is not None:
+                        ang = math.radians(view.heading_deg
+                                           + out.steering * self.config.vehicle_limits.max_steer_deg)
+                        tip = (int(origin[0] + 70 * math.cos(ang)),
+                               int(origin[1] - 70 * math.sin(ang)))
+                        cv2.arrowedLine(image, origin, tip, color, 2, tipLength=0.3)
         return image
 
     # ─── 프레임 처리 (핵심) ──────────────────────────────────────────────────
@@ -282,6 +310,15 @@ class ParkingPipeline:
             if car_id not in self._pending_cars and car_id not in self.track_of_car:
                 self._pending_cars.append(car_id)
         log.info("car %d ready (awaiting camera match)", car_id)
+        if self.config.direct_control and self.config.direct_control_set_mode \
+                and car_id not in self._mode_set:
+            # B안에서는 ESP32 가 waypoint 를 추종하지 않고 제어값만 실행한다.
+            try:
+                self.server.send_set_mode(car_id, "REMOTE_DIRECT")
+                self._mode_set.add(car_id)
+                log.info("car %d: SET_MODE REMOTE_DIRECT (B안 제어)", car_id)
+            except RuntimeError as exc:
+                log.warning("car %d: SET_MODE 실패 (%s)", car_id, exc)
 
     def _bind_car(self, view: VehicleView) -> int | None:
         """진입 노드에 나타난 미매핑 track 을 대기열 앞쪽 car_id 와 연결한다."""
@@ -322,10 +359,16 @@ class ParkingPipeline:
         if slot_id is None:
             log.info("car %d: no slot available (RL WAIT) — will retry", car_id)
             return
-        view.slot_id = slot_id
         route_id = self.orchestrator.next_route_id()
         wps = build_waypoints(default_slot_specs()[slot_id], route_id=route_id)
-        self.orchestrator.start_mission(car_id, wps, slot_id=slot_id)
+        try:
+            self.orchestrator.start_mission(car_id, wps, slot_id=slot_id)
+        except RuntimeError as exc:
+            # 직전 명령(SET_MODE 등)의 ack 를 아직 못 받았다. 다음 재시도 주기에
+            # 다시 붙는다 — 슬롯은 아직 확정하지 않는다.
+            log.info("car %d: mission start deferred (%s)", car_id, exc)
+            return
+        view.slot_id = slot_id
         log.info("car %d → slot %s (route %d, %d waypoints)",
                  car_id, slot_id, route_id, len(wps))
         self.dashboard.push_event("slot_assigned", car_id=car_id, slot=slot_id,
@@ -361,6 +404,53 @@ class ParkingPipeline:
             heading_confidence=0.9 if view.heading_source == "TRAJECTORY" else 0.5,
             valid=view.heading_deg is not None,
         )
+        if self.config.direct_control:
+            self._update_control(view)
+
+    # ─── B안 주행 제어 ───────────────────────────────────────────────────────
+
+    def _update_control(self, view: VehicleView) -> None:
+        """현재 pose 와 목표 waypoint 로 throttle/steering 을 만들어 스트림에 싣는다.
+
+        구동을 허용하는 건 미션이 DRIVING 인 동안뿐이다. 전환(SWITCHING/
+        LOADING/RESUMING)·정지(HELD)·주차 확인(PARKED_CHECK) 구간에서는
+        0 을 계속 내보낸다 — 마지막 값이 유지되는 스트림이라 명시적으로
+        0 을 실어야 차가 타력 주행하지 않는다.
+        """
+        car_id = view.car_id
+        if car_id is None:
+            return
+        mission = self.orchestrator.missions.get(car_id)
+        target = mission.current if mission is not None else None
+        if target is None:
+            self.server.stop_control(car_id)
+            self.last_control.pop(car_id, None)
+            return
+
+        ctrl = self.controllers.get(car_id)
+        if ctrl is None:
+            ctrl = self.controllers[car_id] = WaypointController(self.config.vehicle_limits)
+
+        allow = (mission.state is MissionState.DRIVING
+                 and car_id not in self._comm_lost
+                 and car_id not in self._collision_held)
+        out = ctrl.compute(
+            # 이 프레임에 실제로 탐지된 차량이므로 위치는 유효하다.
+            # heading 유무는 제어기가 따로 판정한다 (NO_HEADING).
+            Pose(view.position_mm[0], view.position_mm[1], view.heading_deg,
+                 timestamp=time.monotonic(), valid=True),
+            target, allow_drive=allow)
+        self.last_control[car_id] = out
+        self.server.push_control(car_id, out.throttle, out.steering)
+
+        prev = self._last_control_mode.get(car_id)
+        if prev != out.mode:
+            self._last_control_mode[car_id] = out.mode
+            log.info("car %d control %s → %s (dist %.1fcm, err %.0f°, "
+                     "thr %.2f, str %.2f)%s",
+                     car_id, prev or "-", out.mode, out.distance_cm,
+                     out.heading_error_deg, out.throttle, out.steering,
+                     f" [{out.reason}]" if out.reason else "")
 
     # ─── 안전 ────────────────────────────────────────────────────────────────
 
@@ -447,6 +537,9 @@ class ParkingPipeline:
         nodes = [node] if node else None
         wps = build_waypoints(spec, route_id=route_id, route_nodes=nodes)
         log.info("car %d replanning from %s (%s) → route %d", car_id, node, reason, route_id)
+        ctrl = self.controllers.get(car_id)
+        if ctrl is not None:
+            ctrl.reset()          # 경로가 바뀌면 이전 오차 미분항은 무의미하다
         self.orchestrator.regenerate(car_id, wps)
 
     def _on_comm_fail(self, car_id: int, info: dict[str, Any]) -> None:
@@ -480,6 +573,10 @@ class ParkingPipeline:
         self.orchestrator.missions.pop(car_id, None)
         with self._lock:
             self._comm_lost.discard(car_id)      # 새 세션이므로 복구 재계획은 불필요
+            self._mode_set.discard(car_id)       # 새 세션에서 모드를 다시 잡는다
+            self.controllers.pop(car_id, None)
+            self.last_control.pop(car_id, None)
+            self._last_control_mode.pop(car_id, None)
             track_id = self.track_of_car.pop(car_id, None)
             if track_id is not None and track_id in self.views:
                 self.views[track_id].car_id = None
