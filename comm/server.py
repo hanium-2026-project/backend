@@ -39,6 +39,8 @@ class VehicleSession:
     pose_seq: int = 0
     heartbeat_seq: int = 0
     latest_pose: dict[str, Any] | None = None      # 최신값만 (§19)
+    control_seq: int = 0
+    latest_control: dict[str, Any] | None = None   # DIRECT_CONTROL 최신값만
     alive: bool = True
     comm_failed: bool = False                      # 통신 장애 통지 상태 (엣지 판정용)
 
@@ -73,6 +75,8 @@ class VehicleServer:
         self.on_comm_fail: Callable[[int, dict[str, Any]], None] | None = None
         # 장애 이후 수신이 재개되면 1회 호출
         self.on_comm_recovered: Callable[[int], None] | None = None
+        # B안 제어 스트림 송신 여부. 실차 안전을 위해 기본은 꺼둔다.
+        self.direct_control_enabled = False
         # 신뢰성 명령이 거절된 경우 (car_id, result, status) — 상위에서 복구 판단
         self.on_command_rejected: Callable[[int, str, dict[str, Any]], None] | None = None
         # HOLD 판정 훅: 카메라 검출 여부 등 외부 조건 (car_id → 사유 문자열 | None)
@@ -136,6 +140,24 @@ class VehicleServer:
     def send_set_mode(self, car_id: int, mode: str) -> int:
         s = self._session(car_id)
         return s.sender.send(protocol.make_set_mode(car_id, s.session_id, 0, mode))
+
+    def push_control(self, car_id: int, throttle: float, steering: float) -> None:
+        """DIRECT_CONTROL 스트림 갱신 (B안). 실제 송신은 tick 루프가 주기 수행.
+
+        스트림이므로 ack·재전송이 없다. 최신값만 유지하며, 갱신이 끊겨도
+        마지막 값을 계속 보낸다 — 차량은 HEARTBEAT 가 끊기면 자체 안전정지한다.
+        """
+        with self._lock:
+            s = self.sessions.get(car_id)
+            if s is None:
+                return
+            s.control_seq += 1
+            s.latest_control = protocol.make_direct_control(
+                car_id, s.session_id, s.control_seq, throttle, steering)
+
+    def stop_control(self, car_id: int) -> None:
+        """제어 스트림을 0 으로 고정한다 (미션 종료·정지)."""
+        self.push_control(car_id, 0.0, 0.0)
 
     def clear_outstanding(self, car_id: int) -> None:
         """진행 중인 신뢰성 명령을 폐기한다 (재계획 등으로 무효가 됐을 때)."""
@@ -360,6 +382,7 @@ class VehicleServer:
     def _tick_loop(self) -> None:
         last_pose_ms = 0.0
         last_hb_ms = 0.0
+        last_control_ms = 0.0
         while self._running:
             now_ms = time.monotonic() * 1000
             with self._lock:
@@ -381,6 +404,13 @@ class VehicleServer:
                     s.heartbeat_seq += 1
                     self._safe_send(s.conn, protocol.make_heartbeat(
                         s.car_id, s.session_id, s.heartbeat_seq))
+            # DIRECT_CONTROL — B안 제어값 스트림 (§18.2)
+            if self.direct_control_enabled and \
+                    now_ms - last_control_ms >= TIMING["CONTROL_INTERVAL"]:
+                last_control_ms = now_ms
+                for s in sessions:
+                    if s.alive and s.latest_control is not None:
+                        self._safe_send(s.conn, s.latest_control)
             # POSE_UPDATE — 펌웨어 수신 enum 에 추가되기 전까지는 비활성
             if protocol.POSE_UPDATE_ENABLED and now_ms - last_pose_ms >= TIMING["POSE_INTERVAL"]:
                 last_pose_ms = now_ms
