@@ -97,6 +97,7 @@ class ParkingPipeline:
 
         self.dashboard = DashboardBridge(pose_interval_s=self.config.dashboard_pose_interval_s)
         self._collision_held: set[int] = set()           # 충돌로 정지시킨 차량
+        self._comm_lost: set[int] = set()                # 통신 장애로 정지시킨 차량
         self.views: dict[int, VehicleView] = {}          # track_id → 관측
         self.track_of_car: dict[int, int] = {}           # car_id → track_id
         self._pending_cars: list[int] = []               # HELLO 순서 대기열
@@ -108,6 +109,8 @@ class ParkingPipeline:
         self.server.on_ready = self._on_vehicle_ready
         self.server.on_resync = self._on_resync
         self.server.hold_check = self._hold_check
+        self.server.on_comm_fail = self._on_comm_fail
+        self.server.on_comm_recovered = self._on_comm_recovered
         self.orchestrator.on_replan_required = self._on_replan_required
 
     # ─── 라이프사이클 ────────────────────────────────────────────────────────
@@ -388,6 +391,8 @@ class ParkingPipeline:
             keep_m = self.orchestrator.missions.get(event.keep_car_id)
             if stop_m is None or stop_m.state is MissionState.HELD:
                 continue                      # 이미 조치된 차량
+            if event.stop_car_id in self._comm_lost:
+                continue                      # 링크 단절 — 명령이 닿지 않는다
             if keep_m is not None and keep_m.state is MissionState.HELD:
                 # 상대가 이미 멈춰 있다. 여기서 이쪽까지 세우면 두 대 모두
                 # 정지해 교착이 된다 — 통과 우선순위를 받은 차를 보낸다.
@@ -407,6 +412,8 @@ class ParkingPipeline:
         for car_id in list(self._collision_held):
             if car_id in at_risk:
                 continue
+            if car_id in self._comm_lost:
+                continue      # 링크가 죽어 있다. 복구 시 재계획으로 풀린다
             self._collision_held.discard(car_id)
             m = self.orchestrator.missions.get(car_id)
             if m is not None and m.state is MissionState.HELD:
@@ -442,12 +449,37 @@ class ParkingPipeline:
         log.info("car %d replanning from %s (%s) → route %d", car_id, node, reason, route_id)
         self.orchestrator.regenerate(car_id, wps)
 
+    def _on_comm_fail(self, car_id: int, info: dict[str, Any]) -> None:
+        """통신 장애 — 미션을 정지 상태로 두고 복구를 기다린다.
+
+        서버가 장애 시작 엣지에서만 부르므로 여기서 다시 debounce 하지 않는다.
+        차량 자체는 펌웨어 COMM_TIMEOUT 으로 안전정지하므로 명령을 보내지 않는다.
+        """
+        kind = info.get("type", "COMM_FAIL")
+        with self._lock:
+            self._comm_lost.add(car_id)
+        held = self.orchestrator.mark_link_lost(car_id)
+        log.warning("car %d comm fail (%s) — mission %s",
+                    car_id, kind, "held" if held else "none active")
+        self.dashboard.push_event("comm_fail", car_id=car_id, reason=kind)
+
+    def _on_comm_recovered(self, car_id: int) -> None:
+        """통신 복구 — 단절 중 위치를 신뢰할 수 없으므로 현재 pose 로 재계획한다."""
+        with self._lock:
+            if car_id not in self._comm_lost:
+                return
+            self._comm_lost.discard(car_id)
+        log.info("car %d comm recovered — replanning from current pose", car_id)
+        self.dashboard.push_event("comm_recovered", car_id=car_id)
+        self._on_replan_required(car_id, "COMM_RECOVERED")
+
     def _on_resync(self, car_id: int, hello: dict[str, Any]) -> None:
         """재접속·재부팅 후에는 기존 경로를 폐기하고 재계획한다 (§21·26)."""
         log.info("car %d resync (boot_id=%s) — discarding route",
                  car_id, hello.get("boot_id"))
         self.orchestrator.missions.pop(car_id, None)
         with self._lock:
+            self._comm_lost.discard(car_id)      # 새 세션이므로 복구 재계획은 불필요
             track_id = self.track_of_car.pop(car_id, None)
             if track_id is not None and track_id in self.views:
                 self.views[track_id].car_id = None

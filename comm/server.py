@@ -40,6 +40,7 @@ class VehicleSession:
     heartbeat_seq: int = 0
     latest_pose: dict[str, Any] | None = None      # 최신값만 (§19)
     alive: bool = True
+    comm_failed: bool = False                      # 통신 장애 통지 상태 (엣지 판정용)
 
 
 class VehicleServer:
@@ -68,11 +69,18 @@ class VehicleServer:
         self.on_status: Callable[[int, dict[str, Any]], None] | None = None
         self.on_ready: Callable[[int], None] | None = None
         self.on_resync: Callable[[int, dict[str, Any]], None] | None = None
+        # 통신 장애 통지 — 장애 "시작" 시 1회만 호출된다 (같은 장애 중 반복 없음)
         self.on_comm_fail: Callable[[int, dict[str, Any]], None] | None = None
+        # 장애 이후 수신이 재개되면 1회 호출
+        self.on_comm_recovered: Callable[[int], None] | None = None
         # 신뢰성 명령이 거절된 경우 (car_id, result, status) — 상위에서 복구 판단
         self.on_command_rejected: Callable[[int, str, dict[str, Any]], None] | None = None
         # HOLD 판정 훅: 카메라 검출 여부 등 외부 조건 (car_id → 사유 문자열 | None)
         self.hold_check: Callable[[int, dict[str, Any]], str | None] | None = None
+        # HOLD 로 판정될 때마다 호출 (car_id, 사유) — 상위에서 원인 해소를 유도
+        self.on_hold: Callable[[int, str], None] | None = None
+        # HOLD 가 이만큼 반복되면 연결을 정리한다 (무한 재시도 방지)
+        self.max_hold_retries = 20
 
     # ─── 라이프사이클 ────────────────────────────────────────────────────────
 
@@ -129,6 +137,13 @@ class VehicleServer:
         s = self._session(car_id)
         return s.sender.send(protocol.make_set_mode(car_id, s.session_id, 0, mode))
 
+    def clear_outstanding(self, car_id: int) -> None:
+        """진행 중인 신뢰성 명령을 폐기한다 (재계획 등으로 무효가 됐을 때)."""
+        with self._lock:
+            sess = self.sessions.get(car_id)
+        if sess is not None:
+            sess.sender.clear_pending()
+
     def push_pose(self, car_id: int, x_cm: float, y_cm: float,
                   heading_deg: float | None, heading_source: str | None,
                   position_confidence: float = 1.0, heading_confidence: float = 0.0,
@@ -168,33 +183,62 @@ class VehicleServer:
             threading.Thread(target=self._handshake, args=(conn,), daemon=True).start()
 
     def _handshake(self, conn: socket.socket) -> None:
+        """HELLO 를 받아 판정하고 세션을 연다.
+
+        HOLD 는 "조건이 해소되면 다시 판정" 이라는 뜻이므로 연결을 끊지 않는다
+        (§26.2). 차량은 HELLO_ACK 를 못 받거나 HOLD 를 받으면 HELLO 를 재전송하므로,
+        여기서 다음 HELLO 를 기다렸다가 재판정한다. REJECTED 만 연결을 닫는다.
+        """
         conn.settimeout(TIMING["COMM_TIMEOUT"] / 1000.0 * 3)
         buf = b""
-        try:
-            while b"\n" not in buf:
-                chunk = conn.recv(1024)
-                if not chunk:
-                    conn.close(); return
-                buf += chunk
-            line, rest = buf.split(b"\n", 1)
-            hello = parse_message(line)
-        except (OSError, ValueError):
-            conn.close(); return
+        rest = b""
+        hold_count = 0
 
-        car_id = hello.get("car_id", -1)
-        boot_id = str(hello.get("boot_id", ""))
-        result, reason = self._judge_hello(hello)
-        session_id = "S" + secrets.token_hex(4).upper() if result == "READY_ALLOWED" else ""
-        # 새 세션의 명령 seq 시작값 — 이전 세션 seq 와 겹치지 않게 1부터 새로 발급
-        command_seq_start = 1
-        try:
-            conn.sendall(encode(protocol.make_hello_ack(
-                car_id, session_id, result, reason,
-                boot_id=boot_id, command_seq_start=command_seq_start)))
-        except OSError:
-            conn.close(); return
-        if result != "READY_ALLOWED":
-            conn.close(); return
+        while True:
+            try:
+                while b"\n" not in buf:
+                    chunk = conn.recv(1024)
+                    if not chunk:
+                        conn.close(); return
+                    buf += chunk
+                line, rest = buf.split(b"\n", 1)
+                buf = rest
+                hello = parse_message(line)
+            except (OSError, ValueError):
+                conn.close(); return
+
+            if hello.get("type") != "HELLO":
+                continue                     # HELLO 가 올 때까지 다른 메시지는 흘려보낸다
+
+            car_id = hello.get("car_id", -1)
+            boot_id = str(hello.get("boot_id", ""))
+            result, reason = self._judge_hello(hello)
+            session_id = ("S" + secrets.token_hex(4).upper()
+                          if result == "READY_ALLOWED" else "")
+            # 새 세션의 명령 seq 시작값 — 이전 세션 seq 와 겹치지 않게 1부터 새로 발급
+            command_seq_start = 1
+            try:
+                conn.sendall(encode(protocol.make_hello_ack(
+                    car_id, session_id, result, reason,
+                    boot_id=boot_id, command_seq_start=command_seq_start)))
+            except OSError:
+                conn.close(); return
+
+            if result == "REJECTED":
+                conn.close(); return
+            if result == "HOLD":
+                hold_count += 1
+                if self.on_hold is not None:
+                    self.on_hold(car_id, reason or "HOLD")
+                if hold_count >= self.max_hold_retries:
+                    log_reason = reason or "HOLD"
+                    self._safe_close(conn)
+                    if self.on_comm_fail is not None:
+                        self.on_comm_fail(car_id, {"type": "HOLD_EXHAUSTED",
+                                                   "reason": log_reason})
+                    return
+                continue                     # 다음 HELLO 를 기다려 재판정
+            break                            # READY_ALLOWED
 
         # 기존 세션 무효화 (§26.5) 후 신규 등록
         with self._lock:
@@ -263,6 +307,7 @@ class VehicleServer:
 
     def _dispatch(self, sess: VehicleSession, msg: dict[str, Any]) -> None:
         sess.last_rx_ms = time.monotonic() * 1000
+        self._comm_recovered(sess)
         # 이전 세션의 늦은 메시지 차단 (§13.3)
         if msg.get("session_id") and msg["session_id"] != sess.session_id:
             return
@@ -324,8 +369,9 @@ class VehicleServer:
                     continue
                 s.sender.tick()
                 if now_ms - s.last_rx_ms > TIMING["COMM_TIMEOUT"]:
+                    # 장애가 지속되는 동안 매 주기 통지하지 않는다 — 상위 미션 로직이
+                    # 같은 장애로 반복 트리거되면 복구 처리가 계속 리셋된다.
                     self._comm_fail(s.car_id, {"type": "COMM_TIMEOUT"})
-                    s.last_rx_ms = now_ms          # 중복 통지 억제
             # HEARTBEAT — 노트북이 주기 송신해야 차량이 COMM_TIMEOUT 에 빠지지 않는다
             if now_ms - last_hb_ms >= TIMING["HEARTBEAT_INTERVAL"]:
                 last_hb_ms = now_ms
@@ -345,6 +391,13 @@ class VehicleServer:
 
     # ─── 내부 유틸 ───────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _safe_close(conn: socket.socket) -> None:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
     def _safe_send(self, conn: socket.socket, msg: dict[str, Any]) -> None:
         try:
             conn.sendall(encode(msg))
@@ -352,5 +405,23 @@ class VehicleServer:
             pass
 
     def _comm_fail(self, car_id: int, msg: dict[str, Any]) -> None:
+        """장애 시작 엣지에서만 상위에 통지한다."""
+        with self._lock:
+            sess = self.sessions.get(car_id)
+            if sess is not None:
+                if sess.comm_failed:
+                    return                     # 이미 통지된 장애 — debounce
+                sess.comm_failed = True
+                # 끊긴 링크에 재전송해도 소용없다. pending 을 비워 복구 후
+                # 새 명령이 막히지 않게 한다.
+                sess.sender.clear_pending()
         if self.on_comm_fail is not None:
             self.on_comm_fail(car_id, msg)
+
+    def _comm_recovered(self, sess: VehicleSession) -> None:
+        """수신이 재개되면 장애 상태를 푼다 (엣지에서 1회 통지)."""
+        if not sess.comm_failed:
+            return
+        sess.comm_failed = False
+        if self.on_comm_recovered is not None:
+            self.on_comm_recovered(sess.car_id)
