@@ -37,6 +37,11 @@ class Command(BaseCommand):
         parser.add_argument("--show", action="store_true", help="탐지 화면 표시")
         parser.add_argument("--calibration", default=None,
                             help="tools/calibrate_camera.py 로 저장한 JSON 경로")
+        parser.add_argument("--control-mode", choices=["waypoint-auto", "auto-host"],
+                            default="waypoint-auto",
+                            help="auto-host: WAYPOINT/GO 없이 host 내부 waypoint + "
+                                 "DIRECT_CONTROL 만 사용 (현재 1대 전용). "
+                                 "지정 시 --direct-control 은 자동으로 켜진다")
         parser.add_argument("--direct-control", action="store_true",
                             help="B안 주행 제어: 노트북이 throttle/steering 을 계산해 "
                                  "DIRECT_CONTROL 로 내려보낸다 (기본 꺼짐)")
@@ -78,7 +83,14 @@ class Command(BaseCommand):
                 ("steering_sign", options["steering_sign"]),
             ) if v is not None}
         )
-        if options["direct_control"]:
+        auto_host = options["control_mode"] == "auto-host"
+        direct_control = options["direct_control"] or auto_host
+        if auto_host:
+            self.stdout.write(self.style.WARNING(
+                "AUTO_HOST 모드 — WAYPOINT/GO 를 보내지 않습니다. "
+                "충돌 회피는 비활성이므로 차량 1대로만 운용하세요."
+            ))
+        if direct_control:
             self.stdout.write(self.style.WARNING(
                 f"B안 주행 제어 켜짐 — throttle 상한 {limits.max_throttle:.2f}, "
                 f"steering_sign {limits.steering_sign:+.0f}. "
@@ -94,7 +106,8 @@ class Command(BaseCommand):
             homography_src=homography_src,
             lot_width_mm=lot_w,
             lot_height_mm=lot_h,
-            direct_control=options["direct_control"],
+            control_mode=options["control_mode"],
+            direct_control=direct_control,
             vehicle_limits=limits,
         ))
         pipeline.start()

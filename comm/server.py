@@ -41,6 +41,7 @@ class VehicleSession:
     latest_pose: dict[str, Any] | None = None      # 최신값만 (§19)
     control_seq: int = 0
     latest_control: dict[str, Any] | None = None   # DIRECT_CONTROL 최신값만
+    latest_control_at: float = 0.0                 # 갱신 시각 (ms) — 신선도 판정용
     alive: bool = True
     comm_failed: bool = False                      # 통신 장애 통지 상태 (엣지 판정용)
 
@@ -77,8 +78,15 @@ class VehicleServer:
         self.on_comm_recovered: Callable[[int], None] | None = None
         # B안 제어 스트림 송신 여부. 실차 안전을 위해 기본은 꺼둔다.
         self.direct_control_enabled = False
+        # 제어값이 이 시간 넘게 갱신되지 않으면 0 을 대신 보낸다.
+        # 갱신이 끊겼는데 마지막 값을 계속 재전송하면 차가 그대로 달린다 —
+        # 게다가 스트림이 계속 도착하므로 펌웨어의 500ms DIRECT 타임아웃도 안 걸린다.
+        self.control_stale_ms = 300.0
         # 신뢰성 명령이 거절된 경우 (car_id, result, status) — 상위에서 복구 판단
         self.on_command_rejected: Callable[[int, str, dict[str, Any]], None] | None = None
+        # terminal 결과 전체 (car_id, seq, result, status). 거절뿐 아니라 ACCEPTED 도 통지한다 —
+        # REMOTE_DIRECT 전환이 실제로 수락됐는지 확인해야 제어값을 내보낼 수 있다.
+        self.on_command_result: Callable[[int, int, str, dict[str, Any]], None] | None = None
         # HOLD 판정 훅: 카메라 검출 여부 등 외부 조건 (car_id → 사유 문자열 | None)
         self.hold_check: Callable[[int, dict[str, Any]], str | None] | None = None
         # HOLD 로 판정될 때마다 호출 (car_id, 사유) — 상위에서 원인 해소를 유도
@@ -154,6 +162,7 @@ class VehicleServer:
             s.control_seq += 1
             s.latest_control = protocol.make_direct_control(
                 car_id, s.session_id, s.control_seq, throttle, steering)
+            s.latest_control_at = time.monotonic() * 1000
 
     def stop_control(self, car_id: int) -> None:
         """제어 스트림을 0 으로 고정한다 (미션 종료·정지)."""
@@ -374,6 +383,8 @@ class VehicleServer:
         if acked != seq and rejected != seq:
             return
         sess.sender.on_ack(int(seq))
+        if self.on_command_result is not None:
+            self.on_command_result(sess.car_id, int(seq), result, msg)
         if result in protocol.NEGATIVE_RESULTS and self.on_command_rejected is not None:
             self.on_command_rejected(sess.car_id, result, msg)
 
@@ -409,8 +420,14 @@ class VehicleServer:
                     now_ms - last_control_ms >= TIMING["CONTROL_INTERVAL"]:
                 last_control_ms = now_ms
                 for s in sessions:
-                    if s.alive and s.latest_control is not None:
-                        self._safe_send(s.conn, s.latest_control)
+                    if not s.alive or s.latest_control is None:
+                        continue
+                    if now_ms - s.latest_control_at > self.control_stale_ms:
+                        s.control_seq += 1
+                        s.latest_control = protocol.make_direct_control(
+                            s.car_id, s.session_id, s.control_seq, 0.0, 0.0)
+                        s.latest_control_at = now_ms
+                    self._safe_send(s.conn, s.latest_control)
             # POSE_UPDATE — 펌웨어 수신 enum 에 추가되기 전까지는 비활성
             if protocol.POSE_UPDATE_ENABLED and now_ms - last_pose_ms >= TIMING["POSE_INTERVAL"]:
                 last_pose_ms = now_ms
