@@ -154,3 +154,57 @@ iPhone 핫스팟에서 STATUS 지연이 크다는 것 확인했습니다. **시�
 4. `WAIT` 의 `route_id=0` 허용 여부
 
 B안으로 가면서 **`POSE_UPDATE` 수신 구현은 급하지 않게 됐습니다.** 1차 데모 이후 고도화 대상으로 미뤄도 됩니다.
+
+---
+
+# 부록: 실물 ESP32 검증 결과 (2026-08-10 새벽, SW팀 단독 확인)
+
+USB 연결 상태에서 `ENABLE_ACTUATOR_OUTPUT` 0 → 1 로 올려가며 확인했습니다.
+**3절의 질문 3개와 5절 실측 항목 일부가 여기서 닫혔습니다.**
+
+## 확정된 것
+
+| 항목 | 결과 |
+|---|---|
+| `SET_MODE REMOTE_DIRECT` | **ACCEPTED** (READY 상태에서만 수락) |
+| `DIRECT_CONTROL` → 액추에이터 | **동작함** (`vehicle_control.c` → `actuator_apply_direct`) |
+| **조향 부호** | **음수 = 좌회전 — 실물 앞바퀴로 확인 완료** |
+| `REMOTE_DIRECT` 에서 `WAYPOINT` | **INVALID_STATE 로 거절** |
+| 제어 스트림 단절 | **500ms 후 safeStop, MOVING → WAITING** |
+| `MAX_COORDINATE_CM` 등 | `app_config.example.h` 에서 확인 (500.0 / route·waypoint id 각 100만) |
+
+### 조향 스윕 실측 (서보 각도)
+
+| wire steering | servo | 실제 방향 |
+|---|---|---|
+| -1.0 | 50.0° | 좌 최대 ✓ |
+| -0.5 | 68.0° | 좌 |
+| 0.0 | 86.0° | 중립 |
+| +0.5 | 104.0° | 우 |
+| +1.0 | 122.0° | 우 최대 |
+
+### 참고 실측
+- `throttle 0.3` → PWM **19/255** (직진 프로파일)
+
+## 이것이 SW 설계에 미친 영향
+
+**`WAYPOINT_AUTO` 와 `REMOTE_DIRECT` 는 상호 배타적입니다.** WAYPOINT 는
+`CONTROL_MODE_WAYPOINT_AUTO` 에서만, DIRECT_CONTROL 은 `CONTROL_MODE_REMOTE_DIRECT`
+에서만 처리됩니다. 따라서 "WAYPOINT/GO 로 상태를 몰면서 그 위에 제어값을 얹는"
+구조는 실물에서 불가능하며, **`--control-mode auto-host` (host 내부 waypoint +
+DIRECT_CONTROL 만 사용)가 유일한 경로**입니다.
+
+## 아직 실측이 필요한 것 (현장에서만 가능)
+
+1. **최소 구동값** — 실제로 바퀴가 도는 최소 throttle
+2. **정지 거리** — 목표 속도에서 정지 명령 후 실제로 더 가는 거리
+3. **최대 조향 바퀴각** — 서보 50~122° 가 실제 바퀴 몇 도인지
+
+## 네트워크 재확인
+
+아이폰 핫스팟으로 연동 시험 중 약 10초 만에 `COMM_TIMEOUT` 1회 발생 후 자동
+재접속했습니다. 지적하신 아이폰 핫스팟 문제가 재현됩니다. **시연은 윈도우
+모바일 핫스팟 또는 전용 AP로 갑니다.**
+
+추가로, 아이폰 핫스팟은 macOS 클라이언트에 IPv6 전용 주소를 주는 반면 ESP32 는
+IPv4(172.20.10.x)를 받아 서로 통신이 안 됩니다. 현장에서 이 조합은 피해 주세요.
