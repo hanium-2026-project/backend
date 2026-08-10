@@ -114,6 +114,7 @@ class ParkingPipeline:
         self._auto_host_slot: dict[int, str] = {}        # car_id → 배정 슬롯
         # 수동 WASD ↔ 자동 전환 mux (하드웨어팀 통합본). auto-host 모드에서만 쓴다.
         self.hybrid_controls: dict[int, HybridControlMux] = {}
+        self._manual_shell_starting: set[int] = set()
         self.views: dict[int, VehicleView] = {}          # track_id → 관측
         self.track_of_car: dict[int, int] = {}           # car_id → track_id
         self._pending_cars: list[int] = []               # HELLO 순서 대기열
@@ -339,6 +340,18 @@ class ParkingPipeline:
             if car_id not in self._pending_cars and car_id not in self.track_of_car:
                 self._pending_cars.append(car_id)
         log.info("car %d ready (awaiting camera match)", car_id)
+        if self.auto_host_mode:
+            # 카메라·슬롯배정을 기다리지 않고 먼저 수동 조작을 열어둔다.
+            # 이게 없으면 카메라를 안 쓰는 실행(GUI)에서 mux 가 영영 안 생겨
+            # hybrid_mode() 가 UNAVAILABLE 에 머문다.
+            with self._lock:
+                start = (car_id not in self.auto_hosts
+                         and car_id not in self._manual_shell_starting)
+                if start:
+                    self._manual_shell_starting.add(car_id)
+            if start:
+                threading.Thread(target=self._start_manual_shell, args=(car_id,),
+                                 name=f"manual-shell-{car_id}", daemon=True).start()
         # AUTO_HOST 에서는 RemoteDirectSession 이 ACCEPTED 를 확인하며 협상한다.
         # 여기서 또 보내면 seq 두 개가 뜨고 ACCEPTED 매칭이 어긋난다.
         if self.config.direct_control and self.config.direct_control_set_mode \
@@ -454,9 +467,45 @@ class ParkingPipeline:
     def auto_host_mode(self) -> bool:
         return self.config.control_mode == "auto-host"
 
+    def _start_manual_shell(self, car_id: int) -> None:
+        """READY 직후 세션만 열고 수동(WASD) 조작을 가능하게 한다."""
+        runner = AutoHostRunner(self.server, car_id, [],
+                                period_s=self.config.auto_host_period_s)
+        runner.on_status_change = self._on_auto_host_status
+        mux = None
+        try:
+            runner.arm_session(wait_s=self.config.auto_host_handshake_s)
+            mux = HybridControlMux(runner)
+            mux.switch_to_manual()
+            with self._lock:
+                self.auto_hosts[car_id] = runner
+                self.hybrid_controls[car_id] = mux
+            log.info("car %d: 수동 셸 준비됨 (MANUAL_WASD)", car_id)
+        except Exception as exc:                    # noqa: BLE001
+            if mux is not None:
+                mux.stop()
+            runner.stop()
+            log.warning("car %d: 수동 셸 준비 실패 (%s)", car_id, exc)
+        finally:
+            with self._lock:
+                self._manual_shell_starting.discard(car_id)
+
     def _start_auto_host(self, car_id: int, slot_id: str,
                          waypoints: list[Any]) -> bool:
-        """AUTO_HOST 러너를 띄운다. handshake 실패면 False (다음 주기에 재시도)."""
+        """AUTO_HOST 주행을 건다. 수동 셸이 이미 있으면 경로만 갈아끼운다."""
+        runner = self.auto_hosts.get(car_id)
+        mux = self.hybrid_controls.get(car_id)
+        if runner is not None:
+            runner.load_route(waypoints)
+            if mux is not None:
+                # AUTO_PENDING → 새 카메라 pose 를 받은 뒤에 주행이 재개된다
+                mux.switch_to_auto()
+            else:
+                self.hybrid_controls[car_id] = HybridControlMux(runner)
+            self._auto_host_slot[car_id] = slot_id
+            self.dashboard.push_event("auto_host_armed", car_id=car_id, slot=slot_id)
+            return True
+
         runner = AutoHostRunner(self.server, car_id, waypoints,
                                 period_s=self.config.auto_host_period_s)
         runner.on_status_change = self._on_auto_host_status
@@ -735,6 +784,7 @@ class ParkingPipeline:
         with self._lock:
             self._comm_lost.discard(car_id)      # 새 세션이므로 복구 재계획은 불필요
             self._mode_set.discard(car_id)       # 새 세션에서 모드를 다시 잡는다
+            self._manual_shell_starting.discard(car_id)
             runner = self.auto_hosts.pop(car_id, None)
             mux = self.hybrid_controls.pop(car_id, None)
             self._auto_host_slot.pop(car_id, None)

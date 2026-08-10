@@ -33,17 +33,17 @@ class FirmwareConstants:
 
     # --- servo 각도 (degree). servo 명령각 != 실제 조향 바퀴각 (미보정) ---
     servo_center_deg: float = 86.0
-    servo_left_strong_deg: float = 50.0
-    servo_left_weak_deg: float = 68.0
-    servo_right_weak_deg: float = 104.0
-    servo_right_strong_deg: float = 122.0
+    servo_left_strong_deg: float = 46.0
+    servo_left_weak_deg: float = 66.0
+    servo_right_weak_deg: float = 106.0
+    servo_right_strong_deg: float = 126.0
 
     # --- 모터 PWM duty (throttle_to_duty 의 steering 의존 스케줄) ---
-    pwm_forward_min: int = 15
-    pwm_forward_default: int = 27
-    pwm_turn_min: int = 35
-    pwm_turn_default: int = 45
-    pwm_strong_turn_default: int = 55
+    pwm_forward_min: int = 12
+    pwm_forward_default: int = 22
+    pwm_turn_min: int = 32
+    pwm_turn_default: int = 40
+    pwm_strong_turn_default: int = 50
     motor_pwm_max_duty: int = 255
     motor_deadband_throttle: float = 0.02
 

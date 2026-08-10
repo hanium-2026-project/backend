@@ -18,6 +18,7 @@ from control.wasd_logic import (
 
 
 class HybridControlWindow:
+    RELEASE_DEBOUNCE_MS = 60      # 자동반복 릴리스 무시 창
     def __init__(self, root: tk.Tk, pipeline, car_id: int = 1) -> None:
         self.root = root
         self.pipeline = pipeline
@@ -25,6 +26,10 @@ class HybridControlWindow:
 
         self.pressed: set[str] = set()
         self.current_steering = 0.0
+        # macOS Tk 는 키를 누르고 있으면 KeyPress/KeyRelease 를 반복 발생시킨다.
+        # 릴리스를 그대로 믿으면 조향 누적이 매번 0 으로 리셋돼 10% 에서 멈춘다.
+        # 릴리스를 잠깐 미뤄두고, 그 사이 같은 키의 프레스가 오면 취소한다.
+        self._release_jobs: dict[str, str] = {}
         self.last_sent = (None, None)
 
         root.title("Hanium RC Car - MANUAL WASD / AUTO HOST")
@@ -140,10 +145,18 @@ class HybridControlWindow:
             self._stop()
             return
 
+        if key == "c":                       # 조향 중앙 복귀
+            self.current_steering = 0.0
+            self._apply_keys()
+            return
         if key not in {"w", "a", "s", "d", "shift_l", "shift_r"}:
             return
         if key in self.pressed:
             return
+
+        job = self._release_jobs.pop(key, None)
+        if job is not None:
+            self.root.after_cancel(job)     # 자동반복이었다 → 릴리스 취소
 
         self.pressed.add(key)
         if key in {"a", "d"}:
@@ -156,21 +169,34 @@ class HybridControlWindow:
         key = self._norm(str(event.keysym))
         if key not in self.pressed:
             return
+        # 진짜 뗀 것인지 자동반복인지 구분되지 않으므로 짧게 유예한다.
+        job = self._release_jobs.pop(key, None)
+        if job is not None:
+            self.root.after_cancel(job)
+        self._release_jobs[key] = self.root.after(
+            self.RELEASE_DEBOUNCE_MS, lambda k=key: self._commit_release(k))
 
+    def _commit_release(self, key: str) -> None:
+        """키를 뗀 것으로 확정. 조향은 **초기화하지 않는다**(래치).
+
+        macOS 는 자동반복을 마지막에 누른 키에만 적용한다. D 를 누른 채 W 를
+        누르면 D 의 반복이 끊기고 릴리스가 확정돼 조향이 0 으로 돌아갔다.
+        릴리스로 중앙 복귀시키는 방식은 이 환경에서 신뢰할 수 없어, 조향은
+        A/D 로 올린 값을 유지하고 C(또는 정지)로만 중앙으로 되돌린다.
+        """
+        self._release_jobs.pop(key, None)
         self.pressed.discard(key)
-        if key in {"a", "d"}:
-            if steering_direction(self.pressed) == 0:
-                self.current_steering = 0.0
-            else:
-                self.current_steering = advance_steering(0.0, self.pressed)
         self._apply_keys()
 
     def _steering_tick(self) -> None:
+        # A/D 를 누르고 있는 동안만 값을 올리고, 떼면 **그 값을 유지**한다(래치).
+        # 0 으로 되돌리면 안 된다 — macOS 는 W 를 누르는 순간 D 의 자동반복을
+        # 끊어 pressed 에서 빠지므로, 여기서 리셋하면 D 100% 가 풀린다.
         direction = steering_direction(self.pressed)
         next_value = (
             advance_steering(self.current_steering, self.pressed)
             if direction != 0
-            else 0.0
+            else self.current_steering
         )
         if next_value != self.current_steering:
             self.current_steering = next_value

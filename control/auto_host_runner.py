@@ -84,6 +84,26 @@ class AutoHostRunner:
             f"car {self.car_id}: REMOTE_DIRECT 협상 실패 "
             f"({self.session._rejected_reason or 'ACCEPTED 미도착'})")
 
+    def arm_session(self, *, wait_s: float = 2.0) -> None:
+        """REMOTE_DIRECT 협상만 하고 자동 주행은 시작하지 않는다.
+
+        카메라 없이 수동(WASD)만 쓸 때 필요하다. 세션·모드는 열어두되
+        auto 스케줄러는 띄우지 않아, 이어서 mux 가 MANUAL 권한을 가져간다.
+        """
+        self._wait_first_status(wait_s)
+        self._clear_estop(wait_s)
+        ok = self._handshake_once(wait_s)
+        if not ok:
+            self._reset_and_wait(wait_s)
+            self._rearm_session_state()
+            ok = self._handshake_once(wait_s)
+        if not ok:
+            raise ModeHandshakeError(
+                f"car {self.car_id}: REMOTE_DIRECT 협상 실패 "
+                f"({self.session._rejected_reason or 'ACCEPTED 미도착'})")
+        self.session._enable_direct_stream()
+        log.info("car %d: REMOTE_DIRECT 세션 확보 (자동 주행은 미시작)", self.car_id)
+
     # ─── 협상 세부 ───────────────────────────────────────────────────────────
 
     def _handshake_once(self, wait_s: float) -> bool:

@@ -50,6 +50,7 @@ from cv.homography import compute_homography, warp_point          # noqa: E402
 from cv.tracker import RCCarTracker, TrackState                   # noqa: E402
 from cv.vehicle_detector import YoloVehicleDetector               # noqa: E402
 from parking.waypoints import Waypoint                            # noqa: E402
+from tools.drive_logger import DriveLogger                        # noqa: E402
 
 log = logging.getLogger("single_wp")
 
@@ -96,6 +97,19 @@ class SingleWaypointTest:
         self.server.direct_control_enabled = True
         self.server.start()
         print(f"차량 서버 :{self.server.bound_port} — ESP32 접속 대기")
+
+        self.logger: DriveLogger | None = None
+        if args.log:
+            self.logger = DriveLogger(
+                args.log, self.server, car_id=args.car,
+                pose_provider=lambda: (
+                    (self.pose_mm[0], self.pose_mm[1],
+                     self.heading_deg, self.heading_source or "")
+                    if self.pose_mm else None),
+                target_provider=lambda: self.target_mm,
+            )
+            self.logger.start()
+            print(f"주행 로그: {args.log}")
 
     # ─── 통신 ────────────────────────────────────────────────────────────────
 
@@ -393,6 +407,9 @@ class SingleWaypointTest:
             tracker.run(on_frame=frame_cb, show=True)
         finally:
             self.stop_drive()
+            if self.logger is not None:
+                self.logger.stop()
+                print(f"로그 {self.logger.rows}행 기록: {self.args.log}")
             self.server.stop()
             print("종료")
 
@@ -421,6 +438,8 @@ def main() -> None:
     p.add_argument("--max-throttle", type=float, default=0.25)
     p.add_argument("--steering-sign", type=float, default=-1.0, choices=[1.0, -1.0])
     p.add_argument("--heading-min-move", type=float, default=30.0)
+    p.add_argument("--log", default=None,
+                   help="주행 로그 CSV 경로 (예: logs/run1.csv)")
     p.add_argument("--steer-kp", type=float, default=1.6,
                    help="조향 비례 게인 (크면 급하게 꺾는다)")
     p.add_argument("--steer-normalize", type=float, default=30.0,
