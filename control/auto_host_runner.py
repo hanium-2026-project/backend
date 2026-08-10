@@ -16,8 +16,10 @@ AUTO_HOST 동안 ESP32 로 WAYPOINT/GO 를 보내지 않는다. 목표 waypoint 
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Callable, Sequence
 
+from controller.config import ControllerConfig
 from host_control import HostController, HostWaypointMission
 from host_control.mission import MissionStatus
 from integration.backend_adapter import VehicleServerDirectSender, waypoints_from_backend
@@ -33,13 +35,16 @@ class AutoHostRunner:
     """차량 1대의 AUTO_HOST 주행 (제어 소유권은 여기 하나뿐)."""
 
     def __init__(self, server: Any, car_id: int, backend_waypoints: Sequence[Any],
-                 *, period_s: float = 0.100) -> None:
+                 *, period_s: float = 0.100,
+                 config: ControllerConfig | None = None) -> None:
         if not isinstance(car_id, int):
             raise TypeError("car_id 는 int (wire 의 'CAR_01' 은 서버 내부 표현)")
         self.car_id = car_id
         self._server = server
         self.mission = HostWaypointMission(waypoints_from_backend(backend_waypoints))
+        self.config = config or ControllerConfig()
         self.host = HostController(
+            config=self.config,          # 안 넘기면 zip 기본값(max_throttle 0.40)이 쓰인다
             mission=self.mission,
             sender=VehicleServerDirectSender(server, car_id),
         )
@@ -54,20 +59,84 @@ class AutoHostRunner:
     # ─── 라이프사이클 ────────────────────────────────────────────────────────
 
     def start(self, *, wait_s: float = 2.0) -> None:
-        """SET_MODE REMOTE_DIRECT → ACCEPTED 확인 → arm → 100ms 제어 루프.
+        """(STATUS 대기 → 필요 시 RESET) → SET_MODE → ACCEPTED → arm → 제어 루프.
 
         ACCEPTED 전에는 arm 하지 않는다. 차량이 아직 REMOTE_DIRECT 가 아닌데
         제어값을 보내면 무시되거나 엉뚱한 모드에서 실행될 수 있다.
+
+        SET_MODE 는 READY 에서만 수락되는데, 차량은 통신이 한 번만 끊겨도
+        EMERGENCY_STOP 으로 간다. 그래서 거절되면 RESET 후 한 번 더 시도한다.
         """
+        self._wait_first_status(wait_s)
+        self._clear_estop(wait_s)
+        if self._handshake_once(wait_s):
+            self._begin_loop()
+            return
+
+        reason = self.session._rejected_reason or "TIMEOUT"
+        log.warning("car %d: SET_MODE 거절(%s) — RESET 후 재시도", self.car_id, reason)
+        self._reset_and_wait(wait_s)
+        self._rearm_session_state()
+        if self._handshake_once(wait_s):
+            self._begin_loop()
+            return
+        raise ModeHandshakeError(
+            f"car {self.car_id}: REMOTE_DIRECT 협상 실패 "
+            f"({self.session._rejected_reason or 'ACCEPTED 미도착'})")
+
+    # ─── 협상 세부 ───────────────────────────────────────────────────────────
+
+    def _handshake_once(self, wait_s: float) -> bool:
         self.session.begin_handshake()
         if not self.session.wait_accepted(wait_s):
-            raise ModeHandshakeError(
-                f"car {self.car_id}: REMOTE_DIRECT ACCEPTED 미도착 → FAULTED")
+            return False
+        return self.session._rejected_reason is None
+
+    def _begin_loop(self) -> None:
         self.session._enable_direct_stream()
+        if self.host.authority.is_faulted:
+            self.host.authority.clear_fault()
         self.host.arm_auto()
         self.scheduler.start()
         log.info("car %d: AUTO_HOST 시작 (waypoint %d개, %.0fms 주기)",
                  self.car_id, self.mission.total, self.scheduler.period_s * 1000)
+
+    def _rearm_session_state(self) -> None:
+        """거절 이후 협상을 처음부터 다시 하기 위한 상태 초기화.
+
+        패키지가 재협상용 공개 API 를 주지 않아 내부 상태를 직접 되돌린다.
+        """
+        self.session._rejected_reason = None
+        self.session._accepted.clear()
+        self.session._set_mode_seq = None
+        if self.host.authority.is_faulted:
+            self.host.authority.clear_fault()
+
+    def _wait_first_status(self, wait_s: float) -> None:
+        """STATUS 를 한 번은 받아야 차량 상태를 알 수 있다.
+
+        접속 직후에는 last_status 가 비어 있어 EMERGENCY_STOP 을 놓친다.
+        """
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            if self._server.last_status(self.car_id).get("state"):
+                return
+            time.sleep(0.05)
+
+    def _reset_and_wait(self, wait_s: float) -> None:
+        try:
+            self._server.clear_outstanding(self.car_id)
+            self._server.send_reset(self.car_id)
+        except RuntimeError as exc:
+            log.warning("car %d: RESET 송신 실패 (%s)", self.car_id, exc)
+            return
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            if str(self._server.last_status(self.car_id).get("state", "")) == "READY":
+                log.info("car %d: READY 복귀", self.car_id)
+                return
+            time.sleep(0.05)
+        log.warning("car %d: RESET 후에도 READY 가 아님", self.car_id)
 
     def stop(self, *, disable_global_direct: bool = False) -> None:
         self.host.stop()
@@ -79,8 +148,28 @@ class AutoHostRunner:
             self._server.direct_control_enabled = False
 
     def re_arm(self, *, wait_s: float = 2.0) -> None:
-        """FAULTED 이후 명시적 재출발. 자동 복귀는 하지 않는다."""
+        """FAULTED 이후 명시적 재출발. 자동 복귀는 하지 않는다.
+
+        stop() 은 제어 루프(ControlScheduler)까지 멈추는데 패키지의
+        re_arm_auto() 는 권한만 되살린다. 스케줄러를 같이 켜지 않으면
+        "무장됨" 이라고 나오면서 DIRECT_CONTROL 이 한 발도 안 나간다.
+        """
         self.session.re_arm_auto(wait_s=wait_s)
+        self.scheduler.start()          # 멈춰 있던 100ms 루프 재개
+        log.info("car %d: AUTO_HOST 재무장 (제어 루프 재시작)", self.car_id)
+
+    def _clear_estop(self, wait_s: float) -> None:
+        """EMERGENCY_STOP/ERROR 이면 RESET 을 보내 READY 로 되돌린다.
+
+        SET_MODE 는 READY 에서만 수락된다 (실물 확인). 통신이 한 번만 끊겨도
+        차량은 EMERGENCY_STOP 으로 가므로, 이 단계가 없으면 재접속 후 매번
+        INVALID_STATE 로 막힌다.
+        """
+        state = str(self._server.last_status(self.car_id).get("state", ""))
+        if state not in ("EMERGENCY_STOP", "ERROR"):
+            return
+        log.info("car %d: %s 상태 — RESET 먼저", self.car_id, state)
+        self._reset_and_wait(wait_s)
 
     # ─── 파이프라인 연동 ─────────────────────────────────────────────────────
 

@@ -34,6 +34,7 @@ from typing import Any
 from comm import MissionOrchestrator, MissionState, VehicleServer
 from control import ControlOutput, Pose, WaypointController
 from control.auto_host_runner import AutoHostRunner, MissionStatus, ModeHandshakeError
+from control.hybrid_control import HybridControlMux
 from cv.association import associate
 from cv.heading import HeadingEstimator
 from cv.homography import compute_homography, warp_point
@@ -111,6 +112,8 @@ class ParkingPipeline:
         # AUTO_HOST 모드: 차량별 제어 소유자 (waypoint-auto 에서는 비어 있다)
         self.auto_hosts: dict[int, AutoHostRunner] = {}
         self._auto_host_slot: dict[int, str] = {}        # car_id → 배정 슬롯
+        # 수동 WASD ↔ 자동 전환 mux (하드웨어팀 통합본). auto-host 모드에서만 쓴다.
+        self.hybrid_controls: dict[int, HybridControlMux] = {}
         self.views: dict[int, VehicleView] = {}          # track_id → 관측
         self.track_of_car: dict[int, int] = {}           # car_id → track_id
         self._pending_cars: list[int] = []               # HELLO 순서 대기열
@@ -138,6 +141,12 @@ class ParkingPipeline:
     def stop(self) -> None:
         # 제어 루프를 먼저 세운다. 서버보다 나중에 멈추면 그 사이에 마지막
         # 제어값이 한 번 더 나갈 수 있다.
+        for mux in list(self.hybrid_controls.values()):
+            try:
+                mux.stop()
+            except Exception:                      # noqa: BLE001
+                pass
+        self.hybrid_controls.clear()
         for runner in list(self.auto_hosts.values()):
             runner.stop()
         self.auto_hosts.clear()
@@ -458,16 +467,60 @@ class ParkingPipeline:
             runner.stop()
             return False
         self.auto_hosts[car_id] = runner
+        self.hybrid_controls[car_id] = HybridControlMux(runner)
         self._auto_host_slot[car_id] = slot_id
         self.dashboard.push_event("auto_host_armed", car_id=car_id, slot=slot_id)
         return True
+
+    # ─── 수동/자동 전환 API (hybrid_gui.py 가 호출) ──────────────────────────
+
+    def hybrid_available(self, car_id: int) -> bool:
+        return car_id in self.hybrid_controls
+
+    def hybrid_mode(self, car_id: int) -> str:
+        mux = self.hybrid_controls.get(car_id)
+        return mux.mode if mux is not None else "UNAVAILABLE"
+
+    def switch_to_manual(self, car_id: int) -> None:
+        mux = self._require_mux(car_id)
+        mux.switch_to_manual()
+
+    def switch_to_auto(self, car_id: int) -> None:
+        """AUTO_PENDING 으로 두고, 새 카메라 pose 가 오면 그때 주행을 재개한다."""
+        mux = self._require_mux(car_id)
+        mux.switch_to_auto()
+
+    def set_manual_drive(self, car_id: int, throttle: float, steering: float) -> None:
+        mux = self.hybrid_controls.get(car_id)
+        if mux is not None:
+            mux.set_manual_wire(throttle, steering)
+
+    def manual_stop(self, car_id: int) -> None:
+        """즉시 정지. AUTO 가 100ms 뒤에 덮어쓰지 않도록 MANUAL 로 내린다."""
+        mux = self._require_mux(car_id)
+        if mux.mode != "MANUAL_WASD":
+            mux.switch_to_manual()
+        mux.set_manual_wire(0.0, 0.0)
+        self.server.stop_control(car_id)
+
+    def _require_mux(self, car_id: int) -> HybridControlMux:
+        mux = self.hybrid_controls.get(car_id)
+        if mux is None:
+            raise RuntimeError(
+                f"car {car_id}: 아직 AUTO_HOST 세션이 없습니다 "
+                "(차량 접속·슬롯 배정 후에 사용 가능)")
+        return mux
 
     def _feed_auto_host(self, view: VehicleView) -> None:
         """카메라 관측만 넘긴다. 제어 계산·송신은 러너의 100ms 루프가 한다."""
         runner = self.auto_hosts.get(view.car_id)
         if runner is None:
             return
-        runner.on_camera_pose(view.position_mm[0], view.position_mm[1],
+        # mux 가 있으면 그쪽으로 넣는다 — MANUAL 중에도 pose 는 최신으로 유지하되
+        # 구동은 하지 않고, AUTO_PENDING 이면 새 pose 를 받은 뒤에만 자동 재개한다.
+        mux = self.hybrid_controls.get(view.car_id)
+        target = mux if mux is not None else runner
+        target.on_camera_pose(view.position_mm[0], view.position_mm[1],
                               view.heading_deg, view.last_obs_time)
 
     def _on_auto_host_status(self, car_id: int, prev: MissionStatus,
@@ -683,6 +736,7 @@ class ParkingPipeline:
             self._comm_lost.discard(car_id)      # 새 세션이므로 복구 재계획은 불필요
             self._mode_set.discard(car_id)       # 새 세션에서 모드를 다시 잡는다
             runner = self.auto_hosts.pop(car_id, None)
+            mux = self.hybrid_controls.pop(car_id, None)
             self._auto_host_slot.pop(car_id, None)
             self.controllers.pop(car_id, None)
             self.last_control.pop(car_id, None)
@@ -691,6 +745,11 @@ class ParkingPipeline:
             if track_id is not None and track_id in self.views:
                 self.views[track_id].car_id = None
                 self.views[track_id].slot_id = None
+        if mux is not None:
+            try:
+                mux.stop()
+            except Exception:                      # noqa: BLE001
+                pass
         if runner is not None:
             # 세션이 바뀌었으므로 REMOTE_DIRECT 협상부터 다시 해야 한다.
             runner.stop()
