@@ -136,8 +136,19 @@ class RemoteDirectSession:
                 self.host.fault(f"SET_MODE_{result}")
                 self._accepted.set()  # 대기 해제(거절로)
 
-    def _on_command_rejected(self, car_id: int, result: str, _status: dict) -> None:
-        if car_id != self._car_id:
+    def _on_command_rejected(self, car_id: int, result: str, status: dict) -> None:
+        """SET_MODE 거절만 처리한다.
+
+        backend 결선 시 수정(2026-08-10): 원본은 이 차량의 **모든** 명령 거절에
+        대해 host 를 FAULTED 로 만들었다. RESET 같은 다른 명령이 거절돼도
+        주행 권한이 잠겨 복구가 불가능해진다. 우리 서버는 negative 결과에 대해
+        on_command_result 와 on_command_rejected 를 **둘 다** 부르므로 이중
+        fault 도 났다. seq 가 이번 SET_MODE 의 것일 때만 반응한다.
+        """
+        if car_id != self._car_id or self._set_mode_seq is None:
+            return
+        rejected = status.get("rejected_seq", status.get("ack_seq"))
+        if rejected is not None and rejected != self._set_mode_seq:
             return
         self._rejected_reason = result
         self.host.fault(f"SET_MODE_{result}")

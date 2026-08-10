@@ -80,6 +80,14 @@ class ControllerConfig:
     # 이 값은 provisional 이 아니라 firmware 로 고정된 값이다.
     wire_steering_sign: float = -1.0
 
+    # wire steering 절댓값 상한 (1.0 = 제한 없음).
+    # 펌웨어 throttle_to_duty 는 |steering|>0.5 구간에서 duty 를 강회전 기본값
+    # (55)으로 끌어올리고 throttle 을 무시한다. 최대로 꺾으면 바퀴각은 18도
+    # 더 먹지만 속도가 45% 빨라져, 저속 RC카에서는 미끄러지며 오히려 선회
+    # 반경이 커진다. 0.5 로 묶으면 duty 가 중간 프로파일에 머물러 속도 제어가
+    # 살아난다. 실차에서 어느 쪽이 반경이 작은지 재보고 정할 값이다.
+    max_wire_steering: float = 1.0
+
     # === throttle (거리/heading 오차 → wire throttle) ==========================
     # ⚠ throttle ↔ 실제 속도(cm/s)는 아직 미보정. 아래는 잠정 정규화 스케줄.
     throttle_per_cm_s: float = 0.030      # PROVISIONAL (cm/s → normalized throttle, 미보정)

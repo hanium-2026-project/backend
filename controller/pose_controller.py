@@ -153,8 +153,9 @@ class PoseWaypointController:
         cfg = self.config
         raw = cfg.steer_kp * err_rad + cfg.steer_kd * derr_rad_s
         norm = raw / math.radians(cfg.steer_normalize_deg)
-        logical = geo.clamp(norm, -1.0, 1.0)
-        wire = geo.clamp(cfg.wire_steering_sign * logical, -1.0, 1.0)
+        limit = max(0.05, min(1.0, cfg.max_wire_steering))
+        logical = geo.clamp(norm, -limit, limit)
+        wire = geo.clamp(cfg.wire_steering_sign * logical, -limit, limit)
         # -0.0 정규화(로그 가독성)
         logical = round(logical, 4) or 0.0
         wire = round(wire, 4) or 0.0

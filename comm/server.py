@@ -93,6 +93,9 @@ class VehicleServer:
         self.on_hold: Callable[[int, str], None] | None = None
         # HOLD 가 이만큼 반복되면 연결을 정리한다 (무한 재시도 방지)
         self.max_hold_retries = 20
+        # 재접속 HELLO 의 previous_state=EMERGENCY_STOP 을 HOLD 로 볼지.
+        # 기본 False — 켜면 복구 불가 고리에 빠진다 (_judge_hello 주석 참고).
+        self.hold_on_estop_history = False
 
     # ─── 라이프사이클 ────────────────────────────────────────────────────────
 
@@ -259,6 +262,10 @@ class VehicleServer:
                 conn.close(); return
             if result == "HOLD":
                 hold_count += 1
+                # HOLD 중에도 링크는 살려둬야 한다. HEARTBEAT 가 끊기면 차량이
+                # 1초 뒤 COMM_TIMEOUT 으로 떨어져 나가 조건을 해소할 기회조차 없다.
+                threading.Thread(target=self._hold_heartbeat, args=(conn, car_id),
+                                 daemon=True).start()
                 if self.on_hold is not None:
                     self.on_hold(car_id, reason or "HOLD")
                 if hold_count >= self.max_hold_retries:
@@ -295,6 +302,21 @@ class VehicleServer:
             self.on_ready(car_id)
         self._rx_loop(sess, rest)
 
+    def _hold_heartbeat(self, conn: socket.socket, car_id: int) -> None:
+        """HOLD 대기 구간 전용 HEARTBEAT. 세션이 열리면 tick 루프가 이어받는다."""
+        seq = 0
+        deadline = time.monotonic() + TIMING["COMM_TIMEOUT"] / 1000.0 * 4
+        while time.monotonic() < deadline:
+            with self._lock:
+                if car_id in self.sessions:
+                    return                      # 세션 생김 → tick 루프가 담당
+            seq += 1
+            try:
+                conn.sendall(encode(protocol.make_heartbeat(car_id, "", seq)))
+            except OSError:
+                return
+            time.sleep(TIMING["HEARTBEAT_INTERVAL"] / 1000.0)
+
     def _judge_hello(self, hello: dict[str, Any]) -> tuple[str, str | None]:
         """HELLO_ACK 판정 초안 (REJECTED → HOLD → READY_ALLOWED)."""
         if hello.get("type") != "HELLO":
@@ -305,7 +327,15 @@ class VehicleServer:
             return "REJECTED", "UNKNOWN_CAR_ID"                         # R2
         if str(hello.get("error_code", "NONE")) not in ("NONE", ""):
             return "HOLD", "ERROR_NOT_CLEARED"                          # H1
-        if hello.get("previous_state") == "EMERGENCY_STOP":
+        if self.hold_on_estop_history and \
+                hello.get("previous_state") == "EMERGENCY_STOP":
+            # 기본 비활성. 실물 확인(2026-08-10): 펌웨어는 통신이 한 번만 끊겨도
+            # EMERGENCY_STOP 으로 가고, 재접속 HELLO 에 previous_state=EMERGENCY_STOP
+            # 을 실어 보낸다. 이걸 HOLD 로 잡으면 세션이 안 열리고 → HEARTBEAT 를
+            # 못 보내고 → 차량이 다시 COMM_TIMEOUT 으로 EMERGENCY_STOP 이 되어
+            # 영원히 빠져나올 수 없다 (EMERGENCY_STOP 해제는 RESET 뿐인데 RESET 을
+            # 보내려면 세션이 있어야 한다). 정지 상태 유지는 펌웨어가 이미 강제하므로
+            # (RESET 전에는 GO/DIRECT_CONTROL 을 받지 않는다) 여기서 막을 필요가 없다.
             return "HOLD", "ESTOP_HISTORY"                              # H2
         if self.hold_check is not None:
             reason = self.hold_check(int(hello["car_id"]), hello)
