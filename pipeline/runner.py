@@ -33,6 +33,8 @@ from typing import Any
 
 from comm import MissionOrchestrator, MissionState, VehicleServer
 from control import ControlOutput, Pose, WaypointController
+from control.auto_host_runner import AutoHostRunner, MissionStatus, ModeHandshakeError
+from control.hybrid_control import HybridControlMux
 from cv.association import associate
 from cv.heading import HeadingEstimator
 from cv.homography import compute_homography, warp_point
@@ -61,6 +63,9 @@ class VehicleView:
     node: str | None = None
     slot_id: str | None = None
     last_seen_frame: int = 0
+    # 관측이 발생한 monotonic 시각. tick 시각을 쓰면 카메라가 멈춰도 pose 가
+    # 신선해 보여서 stale 판정이 무력화된다 — 반드시 프레임 시각을 넣는다.
+    last_obs_time: float = 0.0
     last_alloc_frame: int = -10_000        # 슬롯 배정 재시도 조절용
     recent: deque[tuple[float, float]] = field(default_factory=lambda: deque(maxlen=8))
 
@@ -104,6 +109,12 @@ class ParkingPipeline:
         self.last_control: dict[int, ControlOutput] = {}
         self._mode_set: set[int] = set()                 # SET_MODE 완료 차량
         self._last_control_mode: dict[int, str] = {}     # 로그 중복 억제
+        # AUTO_HOST 모드: 차량별 제어 소유자 (waypoint-auto 에서는 비어 있다)
+        self.auto_hosts: dict[int, AutoHostRunner] = {}
+        self._auto_host_slot: dict[int, str] = {}        # car_id → 배정 슬롯
+        # 수동 WASD ↔ 자동 전환 mux (하드웨어팀 통합본). auto-host 모드에서만 쓴다.
+        self.hybrid_controls: dict[int, HybridControlMux] = {}
+        self._manual_shell_starting: set[int] = set()
         self.views: dict[int, VehicleView] = {}          # track_id → 관측
         self.track_of_car: dict[int, int] = {}           # car_id → track_id
         self._pending_cars: list[int] = []               # HELLO 순서 대기열
@@ -129,6 +140,17 @@ class ParkingPipeline:
                  self.config.server_host, self.server.bound_port)
 
     def stop(self) -> None:
+        # 제어 루프를 먼저 세운다. 서버보다 나중에 멈추면 그 사이에 마지막
+        # 제어값이 한 번 더 나갈 수 있다.
+        for mux in list(self.hybrid_controls.values()):
+            try:
+                mux.stop()
+            except Exception:                      # noqa: BLE001
+                pass
+        self.hybrid_controls.clear()
+        for runner in list(self.auto_hosts.values()):
+            runner.stop()
+        self.auto_hosts.clear()
         if self._tracker is not None:
             self._tracker.stop()
         self.server.stop()
@@ -211,8 +233,10 @@ class ParkingPipeline:
                     # 조향 방향을 화살표로 — 부호 규약(좌=+)을 눈으로 검증한다
                     origin = to_px(view.position_mm)
                     if origin is not None:
+                        # wire 부호(음수=좌)를 화면 방향(반시계 양수)으로 되돌린다
+                        logical = out.steering * self.config.vehicle_limits.steering_sign
                         ang = math.radians(view.heading_deg
-                                           + out.steering * self.config.vehicle_limits.max_steer_deg)
+                                           + logical * self.config.vehicle_limits.max_steer_deg)
                         tip = (int(origin[0] + 70 * math.cos(ang)),
                                int(origin[1] - 70 * math.sin(ang)))
                         cv2.arrowedLine(image, origin, tip, color, 2, tipLength=0.3)
@@ -237,16 +261,20 @@ class ParkingPipeline:
             if pair.car.track_id is None:
                 continue
             view = self._update_view(pair.car, state.frame_index,
-                                     front_px=pair.cushion_center_px)
+                                     front_px=pair.cushion_center_px,
+                                     obs_time=state.timestamp)
             seen.append(view)
         for det in unpaired:
             if det.track_id is None:
                 continue
-            seen.append(self._update_view(det, state.frame_index))
+            seen.append(self._update_view(det, state.frame_index,
+                                          obs_time=state.timestamp))
 
         for view in seen:
             self._ensure_mission(view, state.frame_index)
             self._push_to_vehicle(view)
+            if self.auto_host_mode:
+                self._check_auto_host_parked(view)
 
         self._check_collisions(seen)
         self._forget_stale(state.frame_index)
@@ -276,7 +304,8 @@ class ParkingPipeline:
         return math.degrees(math.atan2(fy - cy, fx - cx)) % 360.0
 
     def _update_view(self, det, frame_index: int,
-                     front_px: tuple[float, float] | None = None) -> VehicleView:
+                     front_px: tuple[float, float] | None = None,
+                     obs_time: float | None = None) -> VehicleView:
         x1, y1, x2, y2 = det.bbox
         center_px = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
         mx, my = warp_point(center_px, self._homography)
@@ -291,6 +320,7 @@ class ParkingPipeline:
             view.position_mm = (mx, my)
             view.confidence = det.confidence
             view.last_seen_frame = frame_index
+            view.last_obs_time = time.monotonic() if obs_time is None else obs_time
             view.recent.append((mx, my))
 
         front_mm = warp_point(front_px, self._homography) if front_px else None
@@ -310,8 +340,22 @@ class ParkingPipeline:
             if car_id not in self._pending_cars and car_id not in self.track_of_car:
                 self._pending_cars.append(car_id)
         log.info("car %d ready (awaiting camera match)", car_id)
+        if self.auto_host_mode:
+            # 카메라·슬롯배정을 기다리지 않고 먼저 수동 조작을 열어둔다.
+            # 이게 없으면 카메라를 안 쓰는 실행(GUI)에서 mux 가 영영 안 생겨
+            # hybrid_mode() 가 UNAVAILABLE 에 머문다.
+            with self._lock:
+                start = (car_id not in self.auto_hosts
+                         and car_id not in self._manual_shell_starting)
+                if start:
+                    self._manual_shell_starting.add(car_id)
+            if start:
+                threading.Thread(target=self._start_manual_shell, args=(car_id,),
+                                 name=f"manual-shell-{car_id}", daemon=True).start()
+        # AUTO_HOST 에서는 RemoteDirectSession 이 ACCEPTED 를 확인하며 협상한다.
+        # 여기서 또 보내면 seq 두 개가 뜨고 ACCEPTED 매칭이 어긋난다.
         if self.config.direct_control and self.config.direct_control_set_mode \
-                and car_id not in self._mode_set:
+                and not self.auto_host_mode and car_id not in self._mode_set:
             # B안에서는 ESP32 가 waypoint 를 추종하지 않고 제어값만 실행한다.
             try:
                 self.server.send_set_mode(car_id, "REMOTE_DIRECT")
@@ -350,6 +394,10 @@ class ParkingPipeline:
             return                       # 아직 접속한 차량이 없음
         if car_id in self.orchestrator.missions:
             return                       # 미션 진행 중
+        if car_id in self._manual_shell_starting:
+            # 수동 셸이 백그라운드로 REMOTE_DIRECT 협상 중이다. 지금 미션을
+            # 시작하면 러너가 두 개 생겨 같은 제어 스트림을 다투게 된다.
+            return                       # 다음 프레임에 재시도
         if frame_index - view.last_alloc_frame < self.config.alloc_retry_frames:
             return                       # 재시도 주기 대기
         view.last_alloc_frame = frame_index
@@ -361,6 +409,11 @@ class ParkingPipeline:
             return
         route_id = self.orchestrator.next_route_id()
         wps = build_waypoints(default_slot_specs()[slot_id], route_id=route_id)
+        if self.auto_host_mode:
+            if not self._start_auto_host(car_id, slot_id, wps):
+                return
+            view.slot_id = slot_id
+            return
         try:
             self.orchestrator.start_mission(car_id, wps, slot_id=slot_id)
         except RuntimeError as exc:
@@ -393,7 +446,10 @@ class ParkingPipeline:
             route_id=mission.route_id if mission else None,
             waypoint_id=mission.current.waypoint_id if mission and mission.current else None,
         )
-        self.orchestrator.update_pose(view.car_id, view.position_mm, view.heading_deg)
+        if self.auto_host_mode:
+            self._feed_auto_host(view)
+        else:
+            self.orchestrator.update_pose(view.car_id, view.position_mm, view.heading_deg)
         self.server.push_pose(
             view.car_id,
             x_cm=view.position_mm[0] / 10.0,
@@ -404,8 +460,166 @@ class ParkingPipeline:
             heading_confidence=0.9 if view.heading_source == "TRAJECTORY" else 0.5,
             valid=view.heading_deg is not None,
         )
-        if self.config.direct_control:
+        # AUTO_HOST 에서는 제어 소유자가 AutoHostRunner 하나뿐이다.
+        # 여기서 push_control 을 또 부르면 두 곳이 같은 스트림을 다투게 된다.
+        if self.config.direct_control and not self.auto_host_mode:
             self._update_control(view)
+
+    # ─── AUTO_HOST (하드웨어팀 패키지 경로) ──────────────────────────────────
+
+    @property
+    def auto_host_mode(self) -> bool:
+        return self.config.control_mode == "auto-host"
+
+    def _start_manual_shell(self, car_id: int) -> None:
+        """READY 직후 세션만 열고 수동(WASD) 조작을 가능하게 한다."""
+        runner = AutoHostRunner(self.server, car_id, [],
+                                period_s=self.config.auto_host_period_s)
+        runner.on_status_change = self._on_auto_host_status
+        mux = None
+        try:
+            runner.arm_session(wait_s=self.config.auto_host_handshake_s)
+            mux = HybridControlMux(runner)
+            mux.switch_to_manual()
+            with self._lock:
+                self.auto_hosts[car_id] = runner
+                self.hybrid_controls[car_id] = mux
+            log.info("car %d: 수동 셸 준비됨 (MANUAL_WASD)", car_id)
+        except Exception as exc:                    # noqa: BLE001
+            if mux is not None:
+                mux.stop()
+            runner.stop()
+            log.warning("car %d: 수동 셸 준비 실패 (%s)", car_id, exc)
+        finally:
+            with self._lock:
+                self._manual_shell_starting.discard(car_id)
+
+    def _start_auto_host(self, car_id: int, slot_id: str,
+                         waypoints: list[Any]) -> bool:
+        """AUTO_HOST 주행을 건다. 수동 셸이 이미 있으면 경로만 갈아끼운다."""
+        runner = self.auto_hosts.get(car_id)
+        mux = self.hybrid_controls.get(car_id)
+        if runner is not None:
+            runner.load_route(waypoints)
+            if mux is not None:
+                # AUTO_PENDING → 새 카메라 pose 를 받은 뒤에 주행이 재개된다
+                mux.switch_to_auto()
+            else:
+                self.hybrid_controls[car_id] = HybridControlMux(runner)
+            self._auto_host_slot[car_id] = slot_id
+            self.dashboard.push_event("auto_host_armed", car_id=car_id, slot=slot_id)
+            return True
+
+        runner = AutoHostRunner(self.server, car_id, waypoints,
+                                period_s=self.config.auto_host_period_s)
+        runner.on_status_change = self._on_auto_host_status
+        try:
+            runner.start(wait_s=self.config.auto_host_handshake_s)
+        except (ModeHandshakeError, RuntimeError) as exc:
+            log.warning("car %d: AUTO_HOST 시작 실패 (%s) — 재시도", car_id, exc)
+            runner.stop()
+            return False
+        self.auto_hosts[car_id] = runner
+        self.hybrid_controls[car_id] = HybridControlMux(runner)
+        self._auto_host_slot[car_id] = slot_id
+        self.dashboard.push_event("auto_host_armed", car_id=car_id, slot=slot_id)
+        return True
+
+    # ─── 수동/자동 전환 API (hybrid_gui.py 가 호출) ──────────────────────────
+
+    def hybrid_available(self, car_id: int) -> bool:
+        return car_id in self.hybrid_controls
+
+    def hybrid_mode(self, car_id: int) -> str:
+        mux = self.hybrid_controls.get(car_id)
+        return mux.mode if mux is not None else "UNAVAILABLE"
+
+    def switch_to_manual(self, car_id: int) -> None:
+        mux = self._require_mux(car_id)
+        mux.switch_to_manual()
+
+    def switch_to_auto(self, car_id: int) -> None:
+        """AUTO_PENDING 으로 두고, 새 카메라 pose 가 오면 그때 주행을 재개한다."""
+        mux = self._require_mux(car_id)
+        mux.switch_to_auto()
+
+    def set_manual_drive(self, car_id: int, throttle: float, steering: float) -> None:
+        mux = self.hybrid_controls.get(car_id)
+        if mux is not None:
+            mux.set_manual_wire(throttle, steering)
+
+    def manual_stop(self, car_id: int) -> None:
+        """즉시 정지. AUTO 가 100ms 뒤에 덮어쓰지 않도록 MANUAL 로 내린다."""
+        mux = self._require_mux(car_id)
+        if mux.mode != "MANUAL_WASD":
+            mux.switch_to_manual()
+        mux.set_manual_wire(0.0, 0.0)
+        self.server.stop_control(car_id)
+
+    def _require_mux(self, car_id: int) -> HybridControlMux:
+        mux = self.hybrid_controls.get(car_id)
+        if mux is None:
+            raise RuntimeError(
+                f"car {car_id}: 아직 AUTO_HOST 세션이 없습니다 "
+                "(차량 접속·슬롯 배정 후에 사용 가능)")
+        return mux
+
+    def _feed_auto_host(self, view: VehicleView) -> None:
+        """카메라 관측만 넘긴다. 제어 계산·송신은 러너의 100ms 루프가 한다."""
+        runner = self.auto_hosts.get(view.car_id)
+        if runner is None:
+            return
+        # mux 가 있으면 그쪽으로 넣는다 — MANUAL 중에도 pose 는 최신으로 유지하되
+        # 구동은 하지 않고, AUTO_PENDING 이면 새 pose 를 받은 뒤에만 자동 재개한다.
+        mux = self.hybrid_controls.get(view.car_id)
+        target = mux if mux is not None else runner
+        target.on_camera_pose(view.position_mm[0], view.position_mm[1],
+                              view.heading_deg, view.last_obs_time)
+
+    def _on_auto_host_status(self, car_id: int, prev: MissionStatus,
+                             status: MissionStatus) -> None:
+        """AUTO_HOST 미션 상태 변화 → 기존 슬롯·대시보드 로직에 연결.
+
+        이 경로가 없으면 FINAL 도착이 파이프라인까지 올라오지 않아 슬롯이
+        영원히 비어 있는 것으로 남는다 (WAYPOINT_AUTO 의 PARKED_CHECK 에 해당).
+        """
+        if status is MissionStatus.DONE:
+            # 정지 재확인은 카메라를 보는 이쪽 몫이다 (§11). 프레임 루프에서 판정한다.
+            log.info("car %d: AUTO_HOST 최종 waypoint 도착 — 정지 확인 중", car_id)
+        elif status is MissionStatus.REPLAN_REQUIRED:
+            log.info("car %d: 위치는 도달했으나 방향 불일치 — 재접근 경로 생성", car_id)
+            self._replan_auto_host(car_id)
+
+    def _check_auto_host_parked(self, view: VehicleView) -> None:
+        """DONE 인 차량이 실제로 멈췄는지 확인하고 PARKED 를 확정한다."""
+        runner = self.auto_hosts.get(view.car_id)
+        if runner is None or runner.status is not MissionStatus.DONE:
+            return
+        if not view.is_stationary(self.config.stationary_tolerance_mm,
+                                  self.config.stationary_window):
+            return
+        runner.confirm_parked()
+        runner.stop()                      # 제어 스트림 0 으로 고정
+        slot_id = self._auto_host_slot.get(view.car_id)
+        if slot_id is not None:
+            self._on_parked(view.car_id, slot_id)
+
+    def _replan_auto_host(self, car_id: int) -> None:
+        """현재 pose 에서 슬롯까지 새 경로를 만들어 러너에 갈아 끼운다."""
+        runner = self.auto_hosts.get(car_id)
+        slot_id = self._auto_host_slot.get(car_id)
+        track_id = self.track_of_car.get(car_id)
+        view = self.views.get(track_id) if track_id is not None else None
+        if runner is None or slot_id is None or view is None:
+            log.warning("car %d: AUTO_HOST 재계획 불가 (pose/슬롯 없음)", car_id)
+            return
+        node = view.node or position_to_node(view.position_mm)
+        route_id = self.orchestrator.next_route_id()
+        wps = build_waypoints(default_slot_specs()[slot_id], route_id=route_id,
+                              route_nodes=[node] if node else None)
+        runner.load_route(wps)
+        log.info("car %d: AUTO_HOST 재계획 → route %d (%d개)",
+                 car_id, route_id, len(wps))
 
     # ─── B안 주행 제어 ───────────────────────────────────────────────────────
 
@@ -574,6 +788,10 @@ class ParkingPipeline:
         with self._lock:
             self._comm_lost.discard(car_id)      # 새 세션이므로 복구 재계획은 불필요
             self._mode_set.discard(car_id)       # 새 세션에서 모드를 다시 잡는다
+            self._manual_shell_starting.discard(car_id)
+            runner = self.auto_hosts.pop(car_id, None)
+            mux = self.hybrid_controls.pop(car_id, None)
+            self._auto_host_slot.pop(car_id, None)
             self.controllers.pop(car_id, None)
             self.last_control.pop(car_id, None)
             self._last_control_mode.pop(car_id, None)
@@ -581,6 +799,14 @@ class ParkingPipeline:
             if track_id is not None and track_id in self.views:
                 self.views[track_id].car_id = None
                 self.views[track_id].slot_id = None
+        if mux is not None:
+            try:
+                mux.stop()
+            except Exception:                      # noqa: BLE001
+                pass
+        if runner is not None:
+            # 세션이 바뀌었으므로 REMOTE_DIRECT 협상부터 다시 해야 한다.
+            runner.stop()
 
     def _hold_check(self, car_id: int, hello: dict[str, Any]) -> str | None:
         """HELLO 판정 훅 — 카메라가 차량을 못 보면 매핑 불가이므로 HOLD (H3)."""

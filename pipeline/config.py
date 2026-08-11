@@ -60,10 +60,20 @@ class PipelineConfig:
     # ─── B안 주행 제어 (DIRECT_CONTROL) ──────────────────────────────────────
     # 노트북이 throttle/steering 을 계산해 내려준다. 실차 안전을 위해 기본은
     # 끔 — 켜도 ESP32 의 ENABLE_ACTUATOR_OUTPUT 이 0 이면 모터는 돌지 않는다.
+    # 제어 방식:
+    #   "waypoint-auto" — 기존 경로. WAYPOINT/GO 로 ESP32 상태기계를 몰고,
+    #                     direct_control 을 켜면 그 위에 제어값을 얹는다.
+    #   "auto-host"     — 하드웨어팀 AUTO_HOST 패키지. WAYPOINT/GO 를 보내지 않고
+    #                     host 내부 waypoint + DIRECT_CONTROL 만 쓴다 (현재 1대 전용).
+    control_mode: str = "waypoint-auto"
     direct_control: bool = False
     # 켜기 전에 SET_MODE REMOTE_DIRECT 를 보낼지 (펌웨어가 모드를 요구할 때)
     direct_control_set_mode: bool = True
     vehicle_limits: VehicleLimits = field(default_factory=VehicleLimits)
+    # AUTO_HOST 제어 루프 주기 (초). 펌웨어 DIRECT 타임아웃 500ms 대비 5배 여유.
+    auto_host_period_s: float = 0.100
+    # SET_MODE REMOTE_DIRECT 의 ACCEPTED 를 기다리는 시간 (초)
+    auto_host_handshake_s: float = 2.0
 
     # ─── 대시보드 ────────────────────────────────────────────────────────────
     # 차량 위치를 대시보드로 보내는 최소 간격 (초). 탐지 주기보다 성기게 둔다.

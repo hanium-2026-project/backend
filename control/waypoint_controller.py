@@ -17,8 +17,11 @@ ESP32 내부 waypoint 추종기는 미구현이고, `DIRECT_CONTROL` → 모터/
 --------------
 - 위치: 바닥판 좌하단 원점, +x 우, +y 상, 단위 mm (내부 표준)
 - heading: 0~360°, 우측 0° / 위쪽 90° (반시계 양수)
-- steering: -1.0~1.0. **양수 = 좌회전(heading 증가 방향)** 을 기본으로 두되,
-  실차 서보 배선이 반대일 수 있어 `steering_sign` 으로 뒤집을 수 있다.
+- steering: -1.0~1.0. **wire 부호는 음수 = 좌회전** 이다.
+  ESP32 `actuator.c::steering_to_angle` 실측 (2026-08-08 하드웨어팀 패키지):
+  -1.0 → servo 50°(좌 강) / 0.0 → 86°(중립) / +1.0 → 122°(우 강).
+  내부 계산은 "양수 = 좌회전"(heading 증가 방향)으로 하고 `steering_sign` 으로
+  wire 부호를 맞춘다. 실차에서 반대로 돌면 이 값만 뒤집으면 된다.
 - throttle: -1.0~1.0. 현재 경로 설계는 전진만 쓴다.
 """
 
@@ -50,7 +53,8 @@ class VehicleLimits:
     max_steer_deg: float = 30.0        # 서보 최대 조향각 (steering=±1.0 에 대응)
     steer_kp: float = 1.6              # heading 오차(rad) → 조향 명령
     steer_kd: float = 0.25             # 오차 변화율 감쇠 (진동 억제)
-    steering_sign: float = 1.0         # 서보 방향이 반대면 -1.0
+    # 실제 펌웨어 wire 부호가 음수=좌회전이므로 기본값이 -1.0 이다 (추정 아님).
+    steering_sign: float = -1.0
 
     # ── 구동 ──
     min_throttle: float = 0.22         # 이보다 작으면 차가 안 움직인다 (실측 필요)

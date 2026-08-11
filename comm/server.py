@@ -41,6 +41,7 @@ class VehicleSession:
     latest_pose: dict[str, Any] | None = None      # 최신값만 (§19)
     control_seq: int = 0
     latest_control: dict[str, Any] | None = None   # DIRECT_CONTROL 최신값만
+    latest_control_at: float = 0.0                 # 갱신 시각 (ms) — 신선도 판정용
     alive: bool = True
     comm_failed: bool = False                      # 통신 장애 통지 상태 (엣지 판정용)
 
@@ -77,14 +78,24 @@ class VehicleServer:
         self.on_comm_recovered: Callable[[int], None] | None = None
         # B안 제어 스트림 송신 여부. 실차 안전을 위해 기본은 꺼둔다.
         self.direct_control_enabled = False
+        # 제어값이 이 시간 넘게 갱신되지 않으면 0 을 대신 보낸다.
+        # 갱신이 끊겼는데 마지막 값을 계속 재전송하면 차가 그대로 달린다 —
+        # 게다가 스트림이 계속 도착하므로 펌웨어의 500ms DIRECT 타임아웃도 안 걸린다.
+        self.control_stale_ms = 300.0
         # 신뢰성 명령이 거절된 경우 (car_id, result, status) — 상위에서 복구 판단
         self.on_command_rejected: Callable[[int, str, dict[str, Any]], None] | None = None
+        # terminal 결과 전체 (car_id, seq, result, status). 거절뿐 아니라 ACCEPTED 도 통지한다 —
+        # REMOTE_DIRECT 전환이 실제로 수락됐는지 확인해야 제어값을 내보낼 수 있다.
+        self.on_command_result: Callable[[int, int, str, dict[str, Any]], None] | None = None
         # HOLD 판정 훅: 카메라 검출 여부 등 외부 조건 (car_id → 사유 문자열 | None)
         self.hold_check: Callable[[int, dict[str, Any]], str | None] | None = None
         # HOLD 로 판정될 때마다 호출 (car_id, 사유) — 상위에서 원인 해소를 유도
         self.on_hold: Callable[[int, str], None] | None = None
         # HOLD 가 이만큼 반복되면 연결을 정리한다 (무한 재시도 방지)
         self.max_hold_retries = 20
+        # 재접속 HELLO 의 previous_state=EMERGENCY_STOP 을 HOLD 로 볼지.
+        # 기본 False — 켜면 복구 불가 고리에 빠진다 (_judge_hello 주석 참고).
+        self.hold_on_estop_history = False
 
     # ─── 라이프사이클 ────────────────────────────────────────────────────────
 
@@ -154,6 +165,7 @@ class VehicleServer:
             s.control_seq += 1
             s.latest_control = protocol.make_direct_control(
                 car_id, s.session_id, s.control_seq, throttle, steering)
+            s.latest_control_at = time.monotonic() * 1000
 
     def stop_control(self, car_id: int) -> None:
         """제어 스트림을 0 으로 고정한다 (미션 종료·정지)."""
@@ -250,6 +262,10 @@ class VehicleServer:
                 conn.close(); return
             if result == "HOLD":
                 hold_count += 1
+                # HOLD 중에도 링크는 살려둬야 한다. HEARTBEAT 가 끊기면 차량이
+                # 1초 뒤 COMM_TIMEOUT 으로 떨어져 나가 조건을 해소할 기회조차 없다.
+                threading.Thread(target=self._hold_heartbeat, args=(conn, car_id),
+                                 daemon=True).start()
                 if self.on_hold is not None:
                     self.on_hold(car_id, reason or "HOLD")
                 if hold_count >= self.max_hold_retries:
@@ -286,6 +302,21 @@ class VehicleServer:
             self.on_ready(car_id)
         self._rx_loop(sess, rest)
 
+    def _hold_heartbeat(self, conn: socket.socket, car_id: int) -> None:
+        """HOLD 대기 구간 전용 HEARTBEAT. 세션이 열리면 tick 루프가 이어받는다."""
+        seq = 0
+        deadline = time.monotonic() + TIMING["COMM_TIMEOUT"] / 1000.0 * 4
+        while time.monotonic() < deadline:
+            with self._lock:
+                if car_id in self.sessions:
+                    return                      # 세션 생김 → tick 루프가 담당
+            seq += 1
+            try:
+                conn.sendall(encode(protocol.make_heartbeat(car_id, "", seq)))
+            except OSError:
+                return
+            time.sleep(TIMING["HEARTBEAT_INTERVAL"] / 1000.0)
+
     def _judge_hello(self, hello: dict[str, Any]) -> tuple[str, str | None]:
         """HELLO_ACK 판정 초안 (REJECTED → HOLD → READY_ALLOWED)."""
         if hello.get("type") != "HELLO":
@@ -296,7 +327,15 @@ class VehicleServer:
             return "REJECTED", "UNKNOWN_CAR_ID"                         # R2
         if str(hello.get("error_code", "NONE")) not in ("NONE", ""):
             return "HOLD", "ERROR_NOT_CLEARED"                          # H1
-        if hello.get("previous_state") == "EMERGENCY_STOP":
+        if self.hold_on_estop_history and \
+                hello.get("previous_state") == "EMERGENCY_STOP":
+            # 기본 비활성. 실물 확인(2026-08-10): 펌웨어는 통신이 한 번만 끊겨도
+            # EMERGENCY_STOP 으로 가고, 재접속 HELLO 에 previous_state=EMERGENCY_STOP
+            # 을 실어 보낸다. 이걸 HOLD 로 잡으면 세션이 안 열리고 → HEARTBEAT 를
+            # 못 보내고 → 차량이 다시 COMM_TIMEOUT 으로 EMERGENCY_STOP 이 되어
+            # 영원히 빠져나올 수 없다 (EMERGENCY_STOP 해제는 RESET 뿐인데 RESET 을
+            # 보내려면 세션이 있어야 한다). 정지 상태 유지는 펌웨어가 이미 강제하므로
+            # (RESET 전에는 GO/DIRECT_CONTROL 을 받지 않는다) 여기서 막을 필요가 없다.
             return "HOLD", "ESTOP_HISTORY"                              # H2
         if self.hold_check is not None:
             reason = self.hold_check(int(hello["car_id"]), hello)
@@ -374,6 +413,8 @@ class VehicleServer:
         if acked != seq and rejected != seq:
             return
         sess.sender.on_ack(int(seq))
+        if self.on_command_result is not None:
+            self.on_command_result(sess.car_id, int(seq), result, msg)
         if result in protocol.NEGATIVE_RESULTS and self.on_command_rejected is not None:
             self.on_command_rejected(sess.car_id, result, msg)
 
@@ -409,8 +450,14 @@ class VehicleServer:
                     now_ms - last_control_ms >= TIMING["CONTROL_INTERVAL"]:
                 last_control_ms = now_ms
                 for s in sessions:
-                    if s.alive and s.latest_control is not None:
-                        self._safe_send(s.conn, s.latest_control)
+                    if not s.alive or s.latest_control is None:
+                        continue
+                    if now_ms - s.latest_control_at > self.control_stale_ms:
+                        s.control_seq += 1
+                        s.latest_control = protocol.make_direct_control(
+                            s.car_id, s.session_id, s.control_seq, 0.0, 0.0)
+                        s.latest_control_at = now_ms
+                    self._safe_send(s.conn, s.latest_control)
             # POSE_UPDATE — 펌웨어 수신 enum 에 추가되기 전까지는 비활성
             if protocol.POSE_UPDATE_ENABLED and now_ms - last_pose_ms >= TIMING["POSE_INTERVAL"]:
                 last_pose_ms = now_ms

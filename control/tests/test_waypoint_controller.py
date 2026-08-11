@@ -32,20 +32,24 @@ def pose(x: float, y: float, heading: float | None, t: float = 0.0,
 
 
 class TestSteeringSign(unittest.TestCase):
-    """heading 은 반시계 양수(우 0°, 상 90°). 좌회전이 양수여야 한다."""
+    """wire 부호는 실제 펌웨어 기준 **음수 = 좌회전** (actuator.c 실측).
+
+    heading 자체는 반시계 양수(우 0°, 상 90°)라 내부 오차 부호와 wire 부호가
+    반대다. 이 클래스가 그 변환을 고정한다.
+    """
 
     def setUp(self) -> None:
         self.c = WaypointController()
 
-    def test_target_to_the_left_steers_positive(self):
-        # 우측(0°)을 보고 있는데 목표는 위쪽 → 좌회전
+    def test_target_to_the_left_steers_negative(self):
+        # 우측(0°)을 보고 있는데 목표는 위쪽 → 좌회전 → wire 음수
         out = self.c.compute(pose(0, 0, 0.0), wp(1000.0, 1000.0), now=0.0)
-        self.assertGreater(out.steering, 0.0)
+        self.assertLess(out.steering, 0.0)
         self.assertAlmostEqual(out.heading_error_deg, 45.0, places=3)
 
-    def test_target_to_the_right_steers_negative(self):
+    def test_target_to_the_right_steers_positive(self):
         out = self.c.compute(pose(0, 1000, 0.0), wp(1000.0, 0.0), now=0.0)
-        self.assertLess(out.steering, 0.0)
+        self.assertGreater(out.steering, 0.0)
         self.assertAlmostEqual(out.heading_error_deg, -45.0, places=3)
 
     def test_straight_ahead_no_steering(self):
@@ -53,9 +57,10 @@ class TestSteeringSign(unittest.TestCase):
         self.assertAlmostEqual(out.steering, 0.0, places=6)
 
     def test_steering_sign_can_be_inverted(self):
-        c = WaypointController(VehicleLimits(steering_sign=-1.0))
+        """실차 배선이 반대면 이 값만 뒤집어 대응한다."""
+        c = WaypointController(VehicleLimits(steering_sign=1.0))
         out = c.compute(pose(0, 0, 0.0), wp(1000.0, 1000.0), now=0.0)
-        self.assertLess(out.steering, 0.0)
+        self.assertGreater(out.steering, 0.0)
 
     def test_steering_saturates_at_one(self):
         out = self.c.compute(pose(0, 0, 180.0), wp(1000.0, 100.0), now=0.0)
@@ -159,7 +164,9 @@ class TestConvergence(unittest.TestCase):
             if out.mode in ("ARRIVED", "ALIGN"):
                 return (x, y, heading), out
             speed_mm_s = out.throttle * self.SPEED_PER_THROTTLE * 10.0
-            steer_rad = math.radians(out.steering * c.limits.max_steer_deg)
+            # wire 부호(음수=좌)를 차량 모델의 논리 부호(양수=좌, heading 증가)로 되돌린다
+            logical_steer = out.steering * c.limits.steering_sign
+            steer_rad = math.radians(logical_steer * c.limits.max_steer_deg)
             heading = (heading + math.degrees(
                 speed_mm_s / self.WHEELBASE_MM * math.tan(steer_rad) * dt)) % 360.0
             x += speed_mm_s * math.cos(math.radians(heading)) * dt
@@ -202,7 +209,8 @@ class TestConvergence(unittest.TestCase):
             signs.append(0 if abs(out.steering) < 1e-3 else
                          (1 if out.steering > 0 else -1))
             speed_mm_s = out.throttle * self.SPEED_PER_THROTTLE * 10.0
-            steer_rad = math.radians(out.steering * c.limits.max_steer_deg)
+            logical_steer = out.steering * c.limits.steering_sign
+            steer_rad = math.radians(logical_steer * c.limits.max_steer_deg)
             heading = (heading + math.degrees(
                 speed_mm_s / self.WHEELBASE_MM * math.tan(steer_rad) * 0.1)) % 360.0
             x += speed_mm_s * math.cos(math.radians(heading)) * 0.1
