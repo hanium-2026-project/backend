@@ -17,6 +17,13 @@ from enum import Enum
 from typing import Optional
 
 
+class MotionDirection(str, Enum):
+    """Waypoint가 요구하는 실제 이동 방향."""
+
+    FORWARD = "FORWARD"
+    REVERSE = "REVERSE"
+
+
 class ControlMode(str, Enum):
     """제어기 상태 라벨.
 
@@ -62,6 +69,9 @@ class Waypoint:
     target_heading_deg: Optional[float] = None
     speed_cm_s: float = 12.0
     position_tolerance_cm: float = 8.0
+    # APPROACH 1차 capture 반경. None이면 ControllerConfig 기본값 사용.
+    # position_tolerance_cm은 2차 정밀 완료 반경으로 유지한다.
+    capture_tolerance_cm: Optional[float] = None
     heading_tolerance_deg: float = 30.0
     heading_required: bool = False
     is_final: bool = False
@@ -69,6 +79,7 @@ class Waypoint:
     route_id: Optional[int] = None
     waypoint_id: Optional[int] = None
     phase: Optional[str] = None
+    motion_direction: MotionDirection = MotionDirection.FORWARD
 
 
 @dataclass(frozen=True)
@@ -79,7 +90,7 @@ class ControlCommand:
     그대로 넣을 수 있다.
 
     steering  : [-1, 1], **ESP32 실제 wire 부호** — 음수 = LEFT, 0 = CENTER, 양수 = RIGHT.
-    throttle  : [-1, 1], 양수 = 전진. (1차 controller 는 기본 전진 전용)
+    throttle  : [-1, 1], 양수 = 전진, 음수 = 후진.
     """
 
     throttle: float

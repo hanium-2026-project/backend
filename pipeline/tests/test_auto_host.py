@@ -158,14 +158,22 @@ class TestControlStream(AutoHostTestBase):
 class TestParkedWiring(AutoHostTestBase):
     """구멍 2번: AUTO_HOST 최종 도착이 슬롯 점유까지 이어지는지."""
 
-    def _drive(self, max_steps: int = 60) -> None:
+    def _drive(self, max_steps: int = 120) -> None:
+        """목표 위치로 순간이동시켜 미션을 진행시킨다.
+
+        HW 7fc17c6 부터 route 교체 시 pose_source 를 비우므로(옛 관측으로
+        출발하지 않기 위해) 같은 목표에 프레임을 두 번 먹여야 제어기가
+        새 pose 를 받고 도착을 판정한다.
+        """
         r = self.runner()
         for _ in range(max_steps):
-            if r.status in (MissionStatus.DONE, MissionStatus.PARKED):
+            if r.status in (MissionStatus.DONE, MissionStatus.PARKED,
+                            MissionStatus.REPLAN_REQUIRED):
                 return
             target = r.current_target
             if target is None:
                 return
+            self.feed((7, (target.x_mm, target.y_mm)), settle=0.05)
             self.feed((7, (target.x_mm, target.y_mm)), settle=0.05)
 
     def test_final_arrival_marks_slot_occupied(self):
@@ -197,9 +205,12 @@ class TestParkedWiring(AutoHostTestBase):
         self._drive()
         if self.runner().status is not MissionStatus.DONE:
             self.skipTest("DONE 에 도달하지 못한 경로 — 이 검증 대상 아님")
+        # 정지 판정 창(stationary_window)을 확실히 깨도록 매 프레임 크게 움직인다.
+        # 도착 직전 순간이동으로 같은 좌표가 창에 쌓여 있어, 첫 프레임부터
+        # 허용오차를 넘겨야 "움직이는 중"으로 인식된다.
         base = self.pipeline.views[7].position_mm
-        for i in range(4):                       # 계속 움직이는 중
-            self.feed((7, (base[0] + 40 * i, base[1])), settle=0.05)
+        for i in range(1, self.config.stationary_window + 4):
+            self.feed((7, (base[0] + 60 * i, base[1])), settle=0.05)
         self.assertIsNot(self.runner().status, MissionStatus.PARKED,
                          "움직이는 중인데 PARKED 로 확정됐다")
 

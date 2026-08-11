@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 from controller.config import ControllerConfig
-from controller.models import ControlMode, Pose, Waypoint
+from controller.models import ControlMode, MotionDirection, Pose, Waypoint
 from controller.pose_controller import PoseWaypointController
 
 
@@ -169,6 +169,47 @@ class TestAlignment(unittest.TestCase):
         cmd = ctl.compute(pose, wp, now=100.0)
         self.assertEqual(cmd.mode, ControlMode.ARRIVED)
         self.assertTrue(cmd.arrived)
+
+
+class TestReverseControl(unittest.TestCase):
+    def test_reverse_disabled_by_default(self) -> None:
+        ctl = PoseWaypointController()
+        pose = make_pose(0, 0, heading_deg=0.0)
+        wp = far_waypoint(-1000.0, 0.0, phase="RECOVERY",
+                          motion_direction=MotionDirection.REVERSE)
+        cmd = ctl.compute(pose, wp, now=100.0)
+        self.assertEqual(cmd.throttle, 0.0)
+        self.assertEqual(cmd.reason, "REVERSE_NOT_ALLOWED")
+
+    def test_reverse_only_in_allowed_phase(self) -> None:
+        ctl = PoseWaypointController(ControllerConfig(allow_reverse=True))
+        pose = make_pose(0, 0, heading_deg=0.0)
+        wp = far_waypoint(-1000.0, 0.0, phase="CRUISE",
+                          motion_direction=MotionDirection.REVERSE)
+        cmd = ctl.compute(pose, wp, now=100.0)
+        self.assertEqual(cmd.throttle, 0.0)
+        self.assertEqual(cmd.reason, "REVERSE_PHASE_NOT_ALLOWED")
+
+    def test_reverse_straight_outputs_negative_throttle(self) -> None:
+        ctl = PoseWaypointController(ControllerConfig(allow_reverse=True))
+        pose = make_pose(0, 0, heading_deg=0.0)
+        wp = far_waypoint(-1000.0, 0.0, phase="RECOVERY",
+                          motion_direction=MotionDirection.REVERSE)
+        cmd = ctl.compute(pose, wp, now=100.0)
+        self.assertLess(cmd.throttle, 0.0)
+        self.assertAlmostEqual(cmd.steering, 0.0, places=6)
+        self.assertEqual(cmd.mode, ControlMode.DRIVE)
+
+    def test_reverse_steering_sign_is_physically_reversed(self) -> None:
+        ctl = PoseWaypointController(ControllerConfig(allow_reverse=True, steer_kd=0.0))
+        pose = make_pose(0, 0, heading_deg=0.0)
+        # 후진 기준 NW(135°)는 reverse 진행방향 180°의 오른쪽.
+        # 후진 물리에서는 바퀴를 LEFT로 틀어야 rear trajectory가 그쪽으로 간다.
+        wp = far_waypoint(-1000.0, 1000.0, phase="RECOVERY",
+                          motion_direction=MotionDirection.REVERSE)
+        cmd = ctl.compute(pose, wp, now=100.0)
+        self.assertLess(cmd.steering, 0.0)  # wire 음수 = LEFT
+        self.assertGreater(cmd.logical_steering, 0.0)
 
 
 if __name__ == "__main__":

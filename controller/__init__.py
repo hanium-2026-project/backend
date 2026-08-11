@@ -21,7 +21,7 @@ Source of truth
 - throttle: steering 의존 PWM (아직 cm/s 미보정)
 """
 
-from .models import Pose, Waypoint, ControlCommand, ControlMode
+from .models import Pose, Waypoint, ControlCommand, ControlMode, MotionDirection
 from .config import ControllerConfig, FirmwareConstants
 from .pose_controller import PoseWaypointController
 
@@ -30,6 +30,7 @@ __all__ = [
     "Waypoint",
     "ControlCommand",
     "ControlMode",
+    "MotionDirection",
     "ControllerConfig",
     "FirmwareConstants",
     "PoseWaypointController",

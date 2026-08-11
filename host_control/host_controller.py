@@ -23,6 +23,8 @@ from controller.config import ControllerConfig
 from controller.models import ControlCommand, ControlMode, Pose, Waypoint
 
 from .authority import Authority, ControlAuthority
+from .approach_guard import ApproachProgressGuard
+from .final_pose_guard import FinalPoseGuard
 from .direct_control import DirectControlSender, TransportTiming
 from .mission import HostWaypointMission, MissionStatus
 from .producers import (
@@ -36,12 +38,11 @@ from .pose_source import CameraPoseSource
 # camera 관련 stale/invalid 사유(→ AUTO_HOST 에서 latched fault 대상)
 _STALE_REASONS = frozenset({"POSE_STALE", "POSE_INVALID", "NO_HEADING"})
 
-# ── backend 결선 시 수정 (2026-08-08) ────────────────────────────────────────
-# NO_HEADING 은 "아직 heading 을 못 구한 상태"와 "구했다가 잃은 상태"가 섞여 있다.
-# 앞의 경우는 정상적인 초기 구간이다 — 우리 heading 추정기는 전방 쿠션이 잡히거나
-# 차가 조금 움직여야 방향을 알 수 있어서, 무장 직후 몇 프레임은 항상 heading 이 없다.
-# 여기서 latch 하면 AUTO_HOST 가 출발도 못 해보고 죽어 수동 re-arm 이 필요하다.
-# 그래서 heading 을 한 번이라도 확보한 뒤에 잃은 경우만 fault 로 본다.
+# ── backend 결선 시 수정 (2026-08-11) ────────────────────────────────────────
+# NO_HEADING 은 "아직 못 구한 상태"와 "구했다가 잃은 상태"가 섞여 있다. 우리
+# heading 추정기는 전방 쿠션이 잡히거나 차가 움직여야 방향을 알 수 있어서,
+# 무장 직후 몇 프레임은 항상 heading 이 없다. 여기서 latch 하면 출발도 못 해보고
+# 죽는다. heading 을 한 번이라도 확보한 뒤 잃은 경우만 fault 로 본다.
 _WARMUP_REASONS = frozenset({"NO_HEADING"})
 
 
@@ -67,6 +68,8 @@ class HostController:
         self.authority = ControlAuthority()
         self.pose_source = CameraPoseSource()
         self.mission = mission or HostWaypointMission()
+        self.approach_guard = ApproachProgressGuard(self.config)
+        self.final_pose_guard = FinalPoseGuard(self.config.final_confirm_observations)
         self.manual_producer = ManualControlProducer(self.config)
         self.auto_producer = AutoControlProducer(self.config)
         self.sender = sender or DirectControlSender(timing=timing)
@@ -112,6 +115,25 @@ class HostController:
         pose = self.pose_source.latest()
         if pose is not None and pose.has_heading:
             self._had_heading = True
+
+        # APPROACH 2단계 gate. stale/invalid/no-heading은 기존 controller fail-safe가 우선.
+        if (
+            pose is not None
+            and pose.valid
+            and pose.has_heading
+            and (now - pose.timestamp) <= self.config.max_pose_age_s
+        ):
+            progress = self.approach_guard.evaluate(
+                pose, target, previous_target=self.mission.previous_target()
+            )
+            if progress.missed:
+                reason = progress.event.value
+                self.mission.request_replan(reason)
+                self.auto_producer.reset()
+                self.final_pose_guard.reset()
+                cmd = _zero_command(reason)
+                return self._finish(cmd, zero=True)
+
         cmd = self.auto_producer.compute(
             pose, target, allow_drive=True, now=now
         )
@@ -126,6 +148,27 @@ class HostController:
             cmd = _zero_command(cmd.reason)
             return self._finish(cmd, zero=True)
 
+        # FINAL은 한 번의 frame으로 DONE 처리하지 않는다. 첫 ARRIVED부터 motor는
+        # zero이고 서로 다른 fresh camera observation이 연속 N회 만족해야 확정한다.
+        final_progress = self.final_pose_guard.evaluate(pose, target, cmd)
+        if (
+            (target.phase or "").upper() == "FINAL"
+            and cmd.arrived
+            and not final_progress.confirmed
+        ):
+            cmd = ControlCommand(
+                throttle=0.0,
+                steering=0.0,
+                mode=ControlMode.HOLD,
+                arrived=False,
+                distance_error_cm=cmd.distance_error_cm,
+                heading_error_deg=cmd.heading_error_deg,
+                target_bearing_deg=cmd.target_bearing_deg,
+                reason=f"FINAL_CONFIRMING_{final_progress.count}_OF_{final_progress.required}",
+                logical_steering=0.0,
+            )
+            return self._finish(cmd, zero=True)
+
         # 미션 진행 반영(도착→다음 target, ALIGN→REPLAN, final→DONE)
         self.mission.notify_result(cmd)
         return self._finish(cmd, zero=cmd.is_stopped)
@@ -133,6 +176,8 @@ class HostController:
     # ------------------------------------------------------------ 편의 API
     def arm_auto(self) -> None:
         self.auto_producer.reset()
+        self.approach_guard.reset()
+        self.final_pose_guard.reset()
         self._had_heading = False
         self.authority.arm_auto()
 
@@ -151,8 +196,25 @@ class HostController:
 
     def re_arm_auto(self) -> None:
         self.auto_producer.reset()
+        self.approach_guard.reset()
+        self.final_pose_guard.reset()
         self._had_heading = False
         self.authority.re_arm_auto()
+
+    def prepare_route_switch(self) -> Dict:
+        """재계획/Recovery route 전환 직전 즉시 zero + fresh pose 강제.
+
+        scheduler 를 멈추지는 않는다. 대신 마지막 카메라 pose 를 폐기하므로 새 route 가
+        RUNNING 으로 바뀌어도 새 관측이 들어오기 전까지 tick() 은 NO_POSE zero를 보낸다.
+        이 순서로 REPLAN_REQUIRED → Recovery 전환 중 예전 pose/제어값 재사용을 막는다.
+        """
+        payload = self.sender.send_zero()
+        self.auto_producer.reset()
+        self.approach_guard.reset()
+        self.final_pose_guard.reset()
+        self._had_heading = False
+        self.pose_source.clear()
+        return payload
 
     # ------------------------------------------------------------ 내부
     def _finish(self, cmd: ControlCommand, *, zero: bool) -> TickResult:

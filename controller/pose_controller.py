@@ -23,7 +23,7 @@ from typing import Optional
 
 from . import geometry as geo
 from .config import ControllerConfig
-from .models import ControlCommand, ControlMode, Pose, Waypoint
+from .models import ControlCommand, ControlMode, MotionDirection, Pose, Waypoint
 
 
 class PoseWaypointController:
@@ -33,10 +33,16 @@ class PoseWaypointController:
         self.config = config or ControllerConfig()
         self._prev_err_rad: Optional[float] = None
         self._prev_time: Optional[float] = None
+        self._motion_direction: Optional[MotionDirection] = None
 
     # ------------------------------------------------------------------ public
     def reset(self) -> None:
-        """PD 미분 상태 초기화. mode 전환/재접속 시 호출 권장."""
+        """mode 전환/재접속용 전체 제어상태 초기화."""
+        self._reset_derivative()
+        self._motion_direction = None
+
+    def _reset_derivative(self) -> None:
+        """PD 미분 이력만 초기화하고 구동 방향 latch는 보존한다."""
         self._prev_err_rad = None
         self._prev_time = None
 
@@ -76,17 +82,50 @@ class PoseWaypointController:
             return self._halt(distance_cm, 0.0, bearing, "POSE_STALE")
 
         # ---- 도착 판정은 heading 없이도 가능하다 (backend 결선 시 수정) --------
-        # 목표에 닿았는지는 위치만으로 정해진다. heading 게이트를 먼저 두면,
-        # 이미 목표 위에 있는데 방향을 아직 못 구한 차량이 영원히 다음 waypoint 로
-        # 넘어가지 못한다(정지 상태에서는 궤적으로 heading 을 못 구하므로 교착).
+        # 목표에 닿았는지는 위치만으로 정해진다. heading 게이트를 앞에 두면,
+        # 이미 목표 위에 있는데 방향을 못 구한 차량이 영원히 다음 waypoint 로
+        # 넘어가지 못한다 (정지 상태에서는 궤적으로 heading 을 못 구해 교착).
         # 방향이 필요한 waypoint(heading_required)일 때만 heading 을 요구한다.
-        brake_radius = cfg.brake_radius_cm(waypoint.position_tolerance_cm)
-        if distance_cm <= brake_radius:
-            if waypoint.heading_required and not pose.has_heading:
-                return self._halt(distance_cm, 0.0, bearing, "NO_HEADING")
-            if pose.has_heading and self._needs_alignment(waypoint, pose.heading_deg):
-                head_err = geo.wrap180(
-                    (waypoint.target_heading_deg or 0.0) - pose.heading_deg)
+        if not pose.has_heading:
+            arrival_radius_nh = cfg.arrival_radius_cm(
+                waypoint.position_tolerance_cm, waypoint.phase)
+            if distance_cm <= arrival_radius_nh and not waypoint.heading_required:
+                self.reset()
+                return ControlCommand(
+                    throttle=0.0, steering=0.0, mode=ControlMode.ARRIVED,
+                    arrived=True, distance_error_cm=distance_cm,
+                    heading_error_deg=0.0, target_bearing_deg=bearing,
+                    reason="ARRIVED",
+                )
+            return self._halt(distance_cm, 0.0, bearing, "NO_HEADING")
+
+        heading = pose.heading_deg  # not None (위에서 보장)
+        direction = waypoint.motion_direction
+        reverse = direction is MotionDirection.REVERSE
+
+        # 후진은 명시적으로 허용된 주차/복구 phase에서만 실행한다.
+        if reverse:
+            if not cfg.allow_reverse:
+                return self._halt(distance_cm, 0.0, bearing, "REVERSE_NOT_ALLOWED")
+            phase = (waypoint.phase or "").upper()
+            if phase not in cfg.reverse_allowed_phases:
+                return self._halt(distance_cm, 0.0, bearing, "REVERSE_PHASE_NOT_ALLOWED")
+
+        # 후진에서는 실제 이동방향이 body heading + 180°.
+        motion_heading = geo.wrap180(heading + (180.0 if reverse else 0.0))
+        err_deg = geo.heading_error_deg(bearing, motion_heading)
+        err_rad = math.radians(err_deg)
+
+        if not allow_drive:
+            return self._halt(distance_cm, err_deg, bearing, "DRIVE_NOT_ALLOWED")
+
+        # ---- 도착/정렬 판정 ------------------------------------------------
+        arrival_radius = cfg.arrival_radius_cm(
+            waypoint.position_tolerance_cm, waypoint.phase
+        )
+        if distance_cm <= arrival_radius:
+            if self._needs_alignment(waypoint, heading):
+                head_err = geo.wrap180((waypoint.target_heading_deg or 0.0) - heading)
                 # 전진 전용 1차 controller 는 제자리 회전을 하지 않는다.
                 # 위치는 도착했으니 정지하고 heading 오차만 보고 (정렬 기동은 향후 과제).
                 return ControlCommand(
@@ -99,37 +138,44 @@ class PoseWaypointController:
                     target_bearing_deg=bearing,
                     reason="HEADING_OUT_OF_TOLERANCE",
                 )
-            self.reset()  # 도착: 미분 상태 정리
+            # 다음 waypoint가 FORWARD<->REVERSE로 바뀌는지 확인해야 하므로
+            # 방향 latch는 보존하고 PD 이력만 지운다.
+            self._reset_derivative()
             return ControlCommand(
                 throttle=0.0,
                 steering=0.0,
                 mode=ControlMode.ARRIVED,
                 arrived=True,
                 distance_error_cm=distance_cm,
-                heading_error_deg=0.0 if not pose.has_heading else geo.heading_error_deg(
-                    bearing, pose.heading_deg),
+                heading_error_deg=err_deg,
                 target_bearing_deg=bearing,
                 reason="ARRIVED",
             )
 
-        # ---- 주행하려면 heading 이 있어야 한다 -------------------------------
-        if not pose.has_heading:
-            return self._halt(distance_cm, 0.0, bearing, "NO_HEADING")
+        # 전/후진 방향이 주행 중 바뀌면 한 tick zero를 넣어 DIR 급전환을 막는다.
+        if self._motion_direction is not None and direction is not self._motion_direction:
+            self._motion_direction = direction
+            self._prev_err_rad = None
+            self._prev_time = None
+            return ControlCommand(
+                throttle=0.0, steering=0.0, mode=ControlMode.HOLD, arrived=False,
+                distance_error_cm=distance_cm, heading_error_deg=err_deg,
+                target_bearing_deg=bearing, reason="DIRECTION_CHANGE_STOP",
+            )
+        self._motion_direction = direction
 
-        heading = pose.heading_deg  # not None (위에서 보장)
-        err_deg = geo.heading_error_deg(bearing, heading)
-        err_rad = math.radians(err_deg)
-
-        # PD 미분 항 갱신(안전 게이트 통과 후에만). 미분은 이후 halt 시 reset.
+        # PD 미분 항 갱신. 후진은 조향의 물리 효과가 반대라 제어 부호를 반전한다.
         derr = self._derivative(err_rad, now)
-
-        if not allow_drive:
-            return self._halt(distance_cm, err_deg, bearing, "DRIVE_NOT_ALLOWED")
+        steering_err_rad = -err_rad if reverse else err_rad
+        steering_derr = -derr if reverse else derr
 
         # ---- 정상 주행: steering / throttle --------------------------------
-        logical_steer, wire_steer = self._steering(err_rad, derr)
-        throttle = self._throttle(waypoint, distance_cm, err_deg)
-        mode = ControlMode.DRIVE if throttle > 0.0 else ControlMode.BRAKE
+        logical_steer, wire_steer = self._steering(steering_err_rad, steering_derr)
+        throttle_mag = self._throttle(
+            waypoint, distance_cm, err_deg, reverse=reverse
+        )
+        throttle = -throttle_mag if reverse else throttle_mag
+        mode = ControlMode.DRIVE if abs(throttle) > 0.0 else ControlMode.BRAKE
 
         return ControlCommand(
             throttle=throttle,
@@ -153,15 +199,21 @@ class PoseWaypointController:
         cfg = self.config
         raw = cfg.steer_kp * err_rad + cfg.steer_kd * derr_rad_s
         norm = raw / math.radians(cfg.steer_normalize_deg)
-        limit = max(0.05, min(1.0, cfg.max_wire_steering))
-        logical = geo.clamp(norm, -limit, limit)
-        wire = geo.clamp(cfg.wire_steering_sign * logical, -limit, limit)
+        logical = geo.clamp(norm, -1.0, 1.0)
+        wire = geo.clamp(cfg.wire_steering_sign * logical, -1.0, 1.0)
         # -0.0 정규화(로그 가독성)
         logical = round(logical, 4) or 0.0
         wire = round(wire, 4) or 0.0
         return logical, wire
 
-    def _throttle(self, waypoint: Waypoint, distance_cm: float, err_deg: float) -> float:
+    def _throttle(
+        self,
+        waypoint: Waypoint,
+        distance_cm: float,
+        err_deg: float,
+        *,
+        reverse: bool = False,
+    ) -> float:
         """보수적 정규화 throttle 스케줄.
 
         ⚠ throttle ↔ 실제 속도(cm/s)는 미보정. 아래는 잠정 스케줄이다.
@@ -186,10 +238,18 @@ class PoseWaypointController:
         if desired_cm_s <= 0.0:
             return 0.0
 
-        # 잠정 물리 매핑 (미보정) + 상/하한.
+        # phase별 저속 floor / 상한. 일반 CRUISE baseline은 유지하면서
+        # 주차/Recovery에서는 waypoint speed가 실제 throttle 차이로 남게 한다.
         throttle = desired_cm_s * cfg.throttle_per_cm_s
-        throttle = max(throttle, cfg.min_move_throttle)
-        throttle = geo.clamp(throttle, 0.0, cfg.max_throttle)
+        throttle = max(
+            throttle,
+            cfg.min_move_throttle_for(waypoint.phase, reverse=reverse),
+        )
+        throttle = geo.clamp(
+            throttle,
+            0.0,
+            cfg.throttle_limit(waypoint.phase, reverse=reverse),
+        )
         return round(throttle, 4)
 
     def _needs_alignment(self, waypoint: Waypoint, heading_deg: float) -> bool:

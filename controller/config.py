@@ -23,11 +23,11 @@ class FirmwareConstants:
     """실제 ESP32 펌웨어에서 관측된 사실값 (source: app_config.example.h, actuator.c).
 
     steering wire 부호 (actuator.c::steering_to_angle 에서 확정):
-        -1.0 -> LEFT  strong (servo 50 deg)
-        -0.5 -> LEFT  weak   (servo 68 deg)
+        -1.0 -> LEFT  strong (servo 46 deg)
+        -0.5 -> LEFT  weak   (servo 66 deg)
          0.0 -> CENTER        (servo 86 deg)
-        +0.5 -> RIGHT weak   (servo 104 deg)
-        +1.0 -> RIGHT strong (servo 122 deg)
+        +0.5 -> RIGHT weak   (servo 106 deg)
+        +1.0 -> RIGHT strong (servo 126 deg)
     → **wire steering: 음수 = LEFT, 양수 = RIGHT** (이것이 절대 기준)
     """
 
@@ -38,11 +38,12 @@ class FirmwareConstants:
     servo_right_weak_deg: float = 106.0
     servo_right_strong_deg: float = 126.0
 
-    # --- 모터 PWM duty (throttle_to_duty 의 steering 의존 스케줄) ---
+    # --- 모터 PWM duty (latest real-car calibration) ---
     pwm_forward_min: int = 12
     pwm_forward_default: int = 22
     pwm_turn_min: int = 32
     pwm_turn_default: int = 40
+    pwm_strong_turn_min: int = 38
     pwm_strong_turn_default: int = 50
     motor_pwm_max_duty: int = 255
     motor_deadband_throttle: float = 0.02
@@ -97,14 +98,69 @@ class ControllerConfig:
     turn_throttle_floor: float = 0.30     # PROVISIONAL. 회전 감속 하한 비율(0~1)
     slow_radius_cm: float = 25.0          # PROVISIONAL. 목표 이 거리 안에서 선형 감속 시작
     stop_distance_cm: float = 3.0         # PROVISIONAL. 정지 여유 거리
-    allow_reverse: bool = False           # 1차 controller 는 기본 전진 전용
+    allow_reverse: bool = False           # 일반 AUTO는 기본 전진 전용
+    # 후진은 일반 CRUISE에 열지 않고 복구/주차 phase로 제한한다.
+    reverse_allowed_phases: tuple[str, ...] = (
+        "RECOVERY", "PARKING", "ALIGN", "ENTRY", "FINAL",
+    )
+
+    # === 자동주차 / recovery =================================================
+    # APPROACH/ALIGN/ENTRY/FINAL은 stop_distance를 tolerance에 더하지 않고
+    # waypoint 자체 허용오차로 도착을 판단한다. CRUISE는 기존 실차 baseline 유지.
+    strict_arrival_phases: tuple[str, ...] = (
+        "APPROACH", "ALIGN", "ENTRY", "FINAL", "PARKING",
+    )
+    precision_drive_phases: tuple[str, ...] = (
+        "APPROACH", "ALIGN", "ENTRY", "FINAL", "PARKING", "RECOVERY",
+    )
+
+    # 동일 APPROACH target을 COARSE(1차 capture) -> FINE(정밀 완료)로 해석.
+    approach_capture_tolerance_cm: float = 10.0
+    approach_pass_margin_cm: float = 1.0
+
+    # FINAL은 서로 다른 fresh camera observation이 연속 N회 만족해야 DONE.
+    final_confirm_observations: int = 3
+
+    # 일반 CRUISE의 min_move_throttle=0.22는 유지하되, 정밀 주차에서는
+    # 4~8cm/s waypoint 속도 차이가 0.22 하나로 뭉개지지 않게 낮은 floor 사용.
+    parking_min_move_throttle: float | None = 0.08
+    reverse_min_move_throttle: float | None = 0.10
+    parking_max_throttle: float | None = 0.25
+    reverse_max_throttle: float | None = 0.25
 
     # === 안전/신선도 =========================================================
     max_pose_age_s: float = 0.5           # 이 시간 초과한 pose 는 stale → 정지
 
     def brake_radius_cm(self, position_tolerance_cm: float) -> float:
-        """도착/정지 판정 반경(cm). 이 안으로 들어오면 throttle 0."""
+        """기존 CRUISE 도착 반경(cm)."""
         return position_tolerance_cm + self.stop_distance_cm
+
+    def arrival_radius_cm(self, position_tolerance_cm: float, phase: str | None) -> float:
+        """phase별 실제 ARRIVED 판정 반경."""
+        phase_key = (phase or "").upper()
+        if phase_key in self.strict_arrival_phases:
+            return float(position_tolerance_cm)
+        return self.brake_radius_cm(position_tolerance_cm)
+
+    def throttle_limit(self, phase: str | None, *, reverse: bool) -> float:
+        """phase/direction별 normalized throttle 상한."""
+        limit = float(self.max_throttle)
+        phase_key = (phase or "").upper()
+        if phase_key in self.precision_drive_phases and self.parking_max_throttle is not None:
+            limit = min(limit, max(0.0, float(self.parking_max_throttle)))
+        if reverse and self.reverse_max_throttle is not None:
+            limit = min(limit, max(0.0, float(self.reverse_max_throttle)))
+        return limit
+
+    def min_move_throttle_for(self, phase: str | None, *, reverse: bool) -> float:
+        """phase/direction별 stiction 극복용 throttle floor."""
+        phase_key = (phase or "").upper()
+        floor = float(self.min_move_throttle)
+        if phase_key in self.precision_drive_phases and self.parking_min_move_throttle is not None:
+            floor = max(0.0, float(self.parking_min_move_throttle))
+        if reverse and self.reverse_min_move_throttle is not None:
+            floor = max(0.0, float(self.reverse_min_move_throttle))
+        return min(floor, self.throttle_limit(phase, reverse=reverse))
 
 
 @dataclass(frozen=True)

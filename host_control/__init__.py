@@ -12,6 +12,8 @@ core 제어 계산은 controller/ 패키지를 재사용한다. 이 패키지는
 """
 
 from .authority import Authority, AuthorityError, ControlAuthority
+from .approach_guard import ApproachEvent, ApproachProgress, ApproachProgressGuard, ApproachStage
+from .final_pose_guard import FinalPoseGuard, FinalPoseProgress
 from .direct_control import DirectControlSender, TransportTiming
 from .host_controller import HostController, TickResult
 from .mission import HostWaypointMission, MissionStatus
@@ -26,6 +28,12 @@ __all__ = [
     "Authority",
     "AuthorityError",
     "ControlAuthority",
+    "ApproachEvent",
+    "ApproachProgress",
+    "ApproachProgressGuard",
+    "ApproachStage",
+    "FinalPoseGuard",
+    "FinalPoseProgress",
     "DirectControlSender",
     "TransportTiming",
     "HostController",

@@ -203,10 +203,26 @@ class AutoHostRunner:
         self.host.pose_source.observe(x_mm, y_mm, heading_deg, obs_time)
 
     def load_route(self, backend_waypoints: Sequence[Any]) -> None:
-        """재계획된 경로로 교체한다."""
+        """새 route 로 교체한다. 새 카메라 pose 가 올 때까지 zero 를 유지한다.
+
+        HW 7fc17c6: route 를 갈아끼우는 순간 기존 pose·제어값을 재사용하면
+        옛 관측으로 출발할 수 있다. prepare_route_switch() 가 즉시 zero 를
+        내보내고 pose_source 를 비운다.
+        """
+        self.host.prepare_route_switch()
         self.mission.load(waypoints_from_backend(backend_waypoints))
-        self.host.auto_producer.reset()
         self._last_status = self.mission.status
+
+    def load_recovery_waypoints(self, backend_waypoints: Sequence[Any]):
+        """REPLAN_REQUIRED 에서 복구 경로를 끼워 넣는다 (HW 7fc17c6).
+
+        복구 waypoint 를 마치면 실패했던 기존 target 과 남은 route 로 자동
+        복귀한다. 복구 경로 생성 자체는 상위(파이프라인) 몫이다.
+        """
+        self.host.prepare_route_switch()
+        status = self.mission.load_recovery(waypoints_from_backend(backend_waypoints))
+        self._last_status = self.mission.status
+        return status
 
     def confirm_parked(self) -> None:
         self.mission.confirm_parked()
@@ -215,6 +231,18 @@ class AutoHostRunner:
     @property
     def current_target(self):
         return self.mission.current_target()
+
+    @property
+    def current_phase(self):
+        return self.mission.current_phase
+
+    @property
+    def parking_active(self) -> bool:
+        return self.mission.parking_active
+
+    @property
+    def approach_stage(self) -> str:
+        return self.host.approach_guard.stage
 
     @property
     def status(self) -> MissionStatus:

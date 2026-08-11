@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from controller.models import Pose, Waypoint
+from controller.models import ControlCommand, ControlMode, Pose, Waypoint
 from host_control import (
     Authority,
     HostController,
@@ -116,6 +116,63 @@ class TestStaleAndFault(unittest.TestCase):
         r = hc.tick(100.0, observation=fresh_pose())
         self.assertEqual(r.authority, Authority.FAULTED)
         self.assertEqual(r.command.throttle, 0.0)
+
+
+class TestRecoveryHold(unittest.TestCase):
+    def test_replan_required_holds_zero_until_recovery_and_fresh_pose(self) -> None:
+        mission = HostWaypointMission([
+            Waypoint(
+                30.0, 0.0,
+                target_heading_deg=90.0,
+                position_tolerance_cm=8.0,
+                heading_tolerance_deg=12.0,
+                heading_required=True,
+                phase="APPROACH",
+                is_final=True,
+            )
+        ])
+        hc = HostController(mission=mission)
+        hc.arm_auto()
+
+        r1 = hc.tick(100.0, observation=fresh_pose(h=0.0, t=100.0))
+        self.assertIs(r1.mission_status, MissionStatus.REPLAN_REQUIRED)
+        self.assertEqual(r1.command.throttle, 0.0)
+
+        r2 = hc.tick(100.1, observation=fresh_pose(h=0.0, t=100.1))
+        self.assertEqual(r2.command.throttle, 0.0)
+        self.assertEqual(r2.command.reason, "MISSION_REPLAN_REQUIRED")
+
+        hc.prepare_route_switch()
+        mission.load_recovery([Waypoint(500.0, 0.0, phase="RECOVERY")])
+
+        r3 = hc.tick(100.2)
+        self.assertIs(r3.mission_status, MissionStatus.RUNNING)
+        self.assertEqual(r3.command.throttle, 0.0)
+        self.assertEqual(r3.command.reason, "NO_POSE")
+
+        r4 = hc.tick(100.3, observation=fresh_pose(h=0.0, t=100.3))
+        self.assertGreater(r4.command.throttle, 0.0)
+
+    def test_recovery_failed_is_latched_zero(self) -> None:
+        mission = HostWaypointMission([
+            Waypoint(500.0, 0.0, phase="APPROACH", is_final=True)
+        ], max_recovery_attempts=1)
+        align = ControlCommand(
+            0.0, 0.0, ControlMode.ALIGN, False, 2.0, 30.0, 0.0,
+            "HEADING_OUT_OF_TOLERANCE",
+        )
+        mission.notify_result(align)
+        mission.load_recovery([Waypoint(0.0, -100.0, phase="RECOVERY")])
+        mission.notify_result(align)
+        status = mission.load_recovery([Waypoint(-50.0, -100.0, phase="RECOVERY")])
+        self.assertIs(status, MissionStatus.RECOVERY_FAILED)
+
+        hc = HostController(mission=mission)
+        hc.arm_auto()
+        r = hc.tick(100.0, observation=fresh_pose(t=100.0))
+        self.assertEqual(r.command.throttle, 0.0)
+        self.assertEqual(r.command.steering, 0.0)
+        self.assertEqual(r.command.reason, "MISSION_RECOVERY_FAILED")
 
 
 class TestTransportContract(unittest.TestCase):
