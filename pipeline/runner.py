@@ -394,6 +394,10 @@ class ParkingPipeline:
             return                       # 아직 접속한 차량이 없음
         if car_id in self.orchestrator.missions:
             return                       # 미션 진행 중
+        if car_id in self._manual_shell_starting:
+            # 수동 셸이 백그라운드로 REMOTE_DIRECT 협상 중이다. 지금 미션을
+            # 시작하면 러너가 두 개 생겨 같은 제어 스트림을 다투게 된다.
+            return                       # 다음 프레임에 재시도
         if frame_index - view.last_alloc_frame < self.config.alloc_retry_frames:
             return                       # 재시도 주기 대기
         view.last_alloc_frame = frame_index

@@ -67,6 +67,19 @@ class AutoHostTestBase(unittest.TestCase):
     def runner(self, car_id: int = 1):
         return self.pipeline.auto_hosts.get(car_id)
 
+    def wait_slot(self, car_id: int = 1, tries: int = 25) -> str | None:
+        """슬롯 배정까지 프레임을 계속 먹인다.
+
+        러너 존재만으로는 부족하다 — READY 직후 수동 셸이 먼저 러너를 만들고,
+        슬롯 배정(=자동 주행 시작)은 그 뒤 프레임에서 일어난다.
+        """
+        for _ in range(tries):
+            slot = self.pipeline._auto_host_slot.get(car_id)
+            if slot:
+                return slot
+            self.feed((7, (150.0, 100.0)), settle=0.1)
+        return None
+
 
 class TestHandshake(AutoHostTestBase):
     def test_arms_only_after_set_mode_accepted(self):
@@ -157,9 +170,7 @@ class TestParkedWiring(AutoHostTestBase):
 
     def test_final_arrival_marks_slot_occupied(self):
         self.connect()
-        self.feed((7, (150.0, 100.0)))
-        self.assertTrue(wait_until(lambda: self.runner() is not None))
-        slot_id = self.pipeline._auto_host_slot.get(1)
+        slot_id = self.wait_slot()
         self.assertIsNotNone(slot_id, "슬롯이 배정되지 않음")
 
         self._drive()
@@ -182,8 +193,7 @@ class TestParkedWiring(AutoHostTestBase):
     def test_moving_car_is_not_confirmed_parked(self):
         """최종 위치에 있어도 움직이는 중이면 확정하지 않는다."""
         self.connect()
-        self.feed((7, (150.0, 100.0)))
-        self.assertTrue(wait_until(lambda: self.runner() is not None))
+        self.assertIsNotNone(self.wait_slot(), "슬롯이 배정되지 않음")
         self._drive()
         if self.runner().status is not MissionStatus.DONE:
             self.skipTest("DONE 에 도달하지 못한 경로 — 이 검증 대상 아님")
