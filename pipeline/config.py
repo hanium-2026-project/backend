@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from control import VehicleLimits
+from controller.config import ControllerConfig
 
 # 바닥판 실측 (mm) — rl.parking_env / parking.services 와 동일
 LOT_WIDTH_MM = 1200.0
@@ -52,8 +53,16 @@ class PipelineConfig:
 
     # ─── RL ──────────────────────────────────────────────────────────────────
     policy_path: str = "models/sb3_parking_policy.zip"
-    # 이 노드에 스냅되면 신규 차량으로 보고 슬롯을 배정한다
-    entry_nodes: tuple[str, ...] = ("entrance",)
+    # 이 노드에 스냅되면 신규 차량으로 보고 슬롯을 배정한다.
+    #
+    # junction(150,600) = 통로 왼쪽 끝. entrance(150,100) 이 아닌 이유:
+    # 최소 선회 반경이 610mm(2026-08-12 실측)인데 바닥 아래쪽에서 통로(y=600)
+    # 까지는 600mm 뿐이라, 코너에서 출발하면 90° 우회전을 통로 안에서 끝낼 수
+    # 없다(정렬 완료 지점이 y=764mm 로 B행 코앞이다). 그래서 지금은 차를
+    # **통로 위에 통로 방향으로 놓고** 시작한다.
+    # 진입 우회전을 지원하게 되면 entrance 로 되돌린다 (plan_entry_turn 은
+    # 그때를 위해 남겨뒀다).
+    entry_nodes: tuple[str, ...] = ("junction", "entrance")
     # RL 이 WAIT 을 반환했을 때 슬롯 배정을 다시 시도하는 간격 (프레임)
     alloc_retry_frames: int = 10
 
@@ -70,10 +79,42 @@ class PipelineConfig:
     # 켜기 전에 SET_MODE REMOTE_DIRECT 를 보낼지 (펌웨어가 모드를 요구할 때)
     direct_control_set_mode: bool = True
     vehicle_limits: VehicleLimits = field(default_factory=VehicleLimits)
+    # AUTO_HOST 제어기 설정. vehicle_limits 는 waypoint-auto 전용이라
+    # auto-host 에서는 아무 효과가 없다 — 실차 튜닝값은 반드시 이쪽에 넣는다.
+    #
+    # allow_reverse 를 켜둔다. parking.recovery 가 만드는 후진 복구 waypoint 는
+    # 이 값이 False 면 제어기가 REVERSE_NOT_ALLOWED 로 정지시켜, 복구가 조용히
+    # 무력화된다. 통로 주행 중 후진은 phase 게이트
+    # (ControllerConfig.reverse_allowed_phases)가 계속 막는다.
+    controller_config: ControllerConfig = field(
+        default_factory=lambda: ControllerConfig(allow_reverse=True))
     # AUTO_HOST 제어 루프 주기 (초). 펌웨어 DIRECT 타임아웃 500ms 대비 5배 여유.
     auto_host_period_s: float = 0.100
     # SET_MODE REMOTE_DIRECT 의 ACCEPTED 를 기다리는 시간 (초)
     auto_host_handshake_s: float = 2.0
+    # 같은 슬롯으로 경로를 다시 만드는 최대 횟수. 초과하면 정지한다 —
+    # 기하가 같으면 같은 지점에서 계속 실패해 무한 루프가 된다.
+    max_replan_attempts: int = 3
+    # 후진 복구를 걸 waypoint phase.
+    #
+    # 통로 중간(CRUISE)은 허용오차가 넓고 다음 점이 이어지므로, 조금 밀려도
+    # 계속 가면 된다 — 거기서 후진을 걸면 진행이 끊긴다(실차 확인).
+    # APPROACH 는 인계 25cm 앞 감속점이라 사실상 인계와 한 몸이고, 여기서
+    # 지나치면(APPROACH_*_MISSED) 전진으로는 되잡을 수 없다. FINAL 은
+    # 정확한 자세가 HW 주차 공식의 전제라 반드시 되잡아야 한다.
+    # 빈 튜플이면 후진 복구를 끈다.
+    recover_phases: tuple[str, ...] = ("APPROACH", "FINAL")
+    # 목표가 전진 사각지대에 들어간 상태로 이만큼 연속 관측되면 경로 이탈로
+    # 보고 후진 복구를 건다. 1프레임으로 판단하면 pose 잡음에 걸린다.
+    deviation_frames: int = 3
+    # 경로 계획에 쓸 최소 선회 반경(mm). None 이면 실측값(610mm).
+    # 진입 우회전 실험용으로 낮춰 잡을 수 있다 — 차가 실제로 그 반경을 못 돌면
+    # 원호 바깥으로 밀리므로, 제어값을 맞춘 뒤에만 의미가 있다.
+    plan_turn_radius_mm: float | None = None
+    # 수동 계측 모드: 슬롯 배정·자동 주행을 하지 않는다. 차량은 READY 직후
+    # 잡히는 MANUAL_WASD 셸에 머물고, 카메라는 계속 pose 를 기록한다.
+    # 선회 반경·속도 실측처럼 "사람이 몰고 로그로 재는" 용도.
+    manual_only: bool = False
 
     # ─── 대시보드 ────────────────────────────────────────────────────────────
     # 차량 위치를 대시보드로 보내는 최소 간격 (초). 탐지 주기보다 성기게 둔다.

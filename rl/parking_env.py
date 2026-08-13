@@ -83,14 +83,19 @@ SLOT_INDEX: dict[str, int] = {name: i for i, name in enumerate(SLOT_NAMES)}
 # Slot physical positions (mm).  Match the *_front node coordinates exactly.
 #
 # Distance convention: A4 / B4 are CLOSEST to the entrance, A1 / B1 are the
-# farthest.  The numbering within each row goes from far→near (1=far, 4=near).
+# farthest.  The numbering within each row goes from near→far (1=near, 4=far),
+# matching SLOT_COORDINATES and SLOT_ROUTES below.
 # Slots are reached via the central lane; route length is proportional to
 # distance from the junction:
 #
-#     A4 = B4   (4 nodes / 4.0 s,  x=425)   ← efficiency reward highest
-#     A3 = B3   (5 nodes / 5.0 s,  x=650)
-#     A2 = B2   (6 nodes / 6.0 s,  x=875)
-#     A1 = B1   (7 nodes / 7.0 s,  x=1100)  ← efficiency reward lowest
+#     A1 = B1   (4 nodes,  x= 425)  ← junction 에서 가장 가깝다 (efficiency 최고)
+#     A2 = B2   (5 nodes,  x= 650)
+#     A3 = B3   (6 nodes,  x= 875)
+#     A4 = B4   (7 nodes,  x=1100)  ← 가장 멀다 (efficiency 최저)
+#
+# 2026-08-13: 이 블록이 원래 번호를 거꾸로(1=far) 적고 있었다. 좌표·경로·
+# 아래 인라인 주석 셋은 서로 일치했고 이 주석만 틀렸다. 경로 생성기가 이
+# 주석을 근거로 슬롯 위치를 추정하면 안 된다 — SLOT_COORDINATES 가 기준이다.
 SLOT_COORDINATES: dict[str, tuple[float, float]] = {
     # A행 = 아래쪽(입구 방향), B행 = 위쪽(출구 방향). 번호는 입구에서 가까운 순.
     "A1": ( 425.0,  150.0), "A2": ( 650.0,  150.0),

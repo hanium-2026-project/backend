@@ -77,14 +77,14 @@ class AutoHostTestBase(unittest.TestCase):
             slot = self.pipeline._auto_host_slot.get(car_id)
             if slot:
                 return slot
-            self.feed((7, (150.0, 100.0)), settle=0.1)
+            self.feed((7, (150.0, 600.0)), settle=0.1)
         return None
 
 
 class TestHandshake(AutoHostTestBase):
     def test_arms_only_after_set_mode_accepted(self):
         esp = self.connect()
-        self.feed((7, (150.0, 100.0)))            # 진입 → 슬롯 배정 → AUTO_HOST 시작
+        self.feed((7, (150.0, 600.0)))            # 진입 → 슬롯 배정 → AUTO_HOST 시작
 
         self.assertTrue(wait_until(lambda: self.runner() is not None),
                         "AUTO_HOST 러너가 뜨지 않음")
@@ -96,7 +96,7 @@ class TestHandshake(AutoHostTestBase):
     def test_no_waypoint_or_go_on_the_wire(self):
         """AUTO_HOST 는 host 내부 waypoint 를 쓴다 — 차량에 경로를 보내지 않는다."""
         esp = self.connect()
-        self.feed((7, (150.0, 100.0)))
+        self.feed((7, (150.0, 600.0)))
         self.assertTrue(wait_until(lambda: self.runner() is not None))
         for pos in [(150.0, 140.0), (150.0, 190.0), (150.0, 240.0)]:
             self.feed((7, pos))
@@ -110,7 +110,7 @@ class TestHandshake(AutoHostTestBase):
 class TestControlStream(AutoHostTestBase):
     def test_control_reaches_vehicle_with_firmware_sign(self):
         esp = self.connect()
-        self.feed((7, (150.0, 100.0)))
+        self.feed((7, (150.0, 600.0)))
         self.assertTrue(wait_until(lambda: self.runner() is not None))
         # 위쪽으로 이동시켜 heading 을 잡는다 (목표도 위쪽이므로 직진 상황)
         for pos in [(150.0, 150.0), (150.0, 210.0), (150.0, 270.0)]:
@@ -128,8 +128,10 @@ class TestControlStream(AutoHostTestBase):
     def test_stream_drops_to_zero_when_camera_stalls(self):
         """카메라가 멈췄는데 마지막 제어값이 계속 나가면 차가 그대로 달린다."""
         esp = self.connect()
-        self.feed((7, (150.0, 100.0)))
-        self.assertTrue(wait_until(lambda: self.runner() is not None))
+        # 출발 지점에 머무는 동안 슬롯을 받아야 한다. 진입 우회전 반경은
+        # 출발 y 가 정하므로(R = 통로y − y), 차가 위로 올라간 뒤에는 어떤
+        # 슬롯으로도 경로를 만들 수 없다.
+        self.assertIsNotNone(self.wait_slot(), "슬롯이 배정되지 않음")
         for pos in [(150.0, 150.0), (150.0, 210.0), (150.0, 270.0)]:
             self.feed((7, pos))
 
@@ -144,8 +146,7 @@ class TestControlStream(AutoHostTestBase):
     def test_faulted_does_not_auto_restart(self):
         """복구돼도 명시적 re-arm 전에는 다시 출발하지 않는다."""
         self.connect()
-        self.feed((7, (150.0, 100.0)))
-        self.assertTrue(wait_until(lambda: self.runner() is not None))
+        self.assertIsNotNone(self.wait_slot(), "슬롯이 배정되지 않음")
         for pos in [(150.0, 150.0), (150.0, 210.0)]:
             self.feed((7, pos))
         self.assertTrue(wait_until(lambda: self.runner().is_faulted, timeout=3.0))
@@ -224,3 +225,113 @@ class TestLegacyPathUntouched(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPathDeviation(AutoHostTestBase):
+    """경로를 벗어나 목표를 전진으로 못 잡으면 후진 복구가 걸린다.
+
+    기존 트리거(APPROACH 놓침 / ALIGN 방향 불일치)는 주차 단계에서만 돌아서,
+    통로·진입 원호 구간에서 밀려나면 아무것도 걸리지 않고 계속 앞으로만 갔다.
+    """
+
+    def feed_pair(self, car, cushion, settle: float = 0.06) -> None:
+        """차체 + 전방 쿠션 → heading_source=FRONT_CUSHION (후진 허용 조건)."""
+        from cv.vehicle_detector import Detection
+        self.frame_no += 1
+
+        def det(pos, label, tid):
+            px, py = pos[0], FRAME - pos[1]
+            return Detection(label=label, confidence=0.9, track_id=tid,
+                             bbox=(int(px - 30), int(py - 30),
+                                   int(px + 30), int(py + 30)))
+        self.pipeline.on_frame(TrackState(
+            frame_index=self.frame_no, timestamp=time.monotonic(),
+            detections=[det(car, "rc_car", 7), det(cushion, "front_cushion", 8)],
+            fps=30.0, frame_size=(FRAME, FRAME)))
+        time.sleep(settle)
+
+    def arm(self):
+        self.connect()
+        for _ in range(25):
+            if self.pipeline._auto_host_slot.get(1):
+                return self.pipeline.auto_hosts[1]
+            self.feed_pair((150.0, 600.0), (210.0, 600.0), settle=0.08)
+        self.fail("슬롯 배정 실패")
+
+    def test_overshoot_triggers_reverse_then_resumes(self):
+        r = self.arm()
+        target = r.current_target
+        past = [target.x_mm + 250.0, 600.0]          # 목표를 한참 지나침
+
+        for _ in range(6):
+            self.feed_pair(tuple(past), (past[0] + 60, past[1]))
+            cur = r.current_target
+            if cur is not None and cur.motion_direction.value == "REVERSE":
+                break
+        else:
+            self.fail("경로를 벗어났는데 후진 복구가 걸리지 않았다")
+
+        self.assertEqual(r.mission.recovery_attempts, 1)
+        self.assertEqual(r.current_target.phase, "RECOVERY")
+
+        # 차가 실제로 물러나면 원래 경로로 복귀해야 한다
+        for _ in range(6):
+            self.feed_pair(tuple(past), (past[0] + 60, past[1]))
+            past[0] -= 90.0
+            cur = r.current_target
+            if cur is not None and cur.motion_direction.value == "FORWARD":
+                break
+        else:
+            self.fail("후진을 마쳤는데 원래 경로로 복귀하지 않았다")
+        self.assertEqual(r.mission.recovery_attempts, 1, "복구가 중복으로 걸렸다")
+
+    def test_reverse_waypoint_does_not_retrigger_itself(self):
+        """복구 waypoint 는 정의상 등 뒤에 있다 — 그걸 이탈로 잡으면 안 된다."""
+        r = self.arm()
+        past = (r.current_target.x_mm + 250.0, 600.0)
+        for _ in range(6):
+            self.feed_pair(past, (past[0] + 60, past[1]))
+            cur = r.current_target
+            if cur is not None and cur.motion_direction.value == "REVERSE":
+                break
+        # 차를 그대로 둔 채 여러 프레임 — 재시도 횟수가 늘면 안 된다
+        for _ in range(5):
+            self.feed_pair(past, (past[0] + 60, past[1]))
+        self.assertLessEqual(r.mission.recovery_attempts, 1)
+
+    def test_on_path_never_triggers(self):
+        """경로 위에 있으면 후진이 걸리지 않는다."""
+        r = self.arm()
+        for _ in range(6):
+            t = r.current_target
+            if t is None:
+                break
+            self.feed_pair((t.x_mm - 200.0, 600.0), (t.x_mm - 140.0, 600.0))
+        self.assertEqual(r.mission.recovery_attempts, 0)
+
+
+class TestRecoverPhases(AutoHostTestBase):
+    """후진 복구를 거는 phase 는 config 로 정한다 (기본 APPROACH + FINAL)."""
+
+    def test_default_covers_approach_and_final(self):
+        from pipeline import PipelineConfig
+        self.assertEqual(PipelineConfig().recover_phases, ("APPROACH", "FINAL"))
+
+    def _wp(self, phase: str, is_final: bool = False):
+        class W:
+            pass
+        w = W()
+        w.phase, w.is_final = phase, is_final
+        return w
+
+    def test_cruise_is_not_recoverable(self):
+        """통로 중간은 허용오차가 넓고 다음 점이 이어진다 — 후진하면 진행이 끊긴다."""
+        self.assertFalse(self.pipeline._recoverable(self._wp("CRUISE")))
+
+    def test_approach_and_final_are_recoverable(self):
+        self.assertTrue(self.pipeline._recoverable(self._wp("APPROACH")))
+        self.assertTrue(self.pipeline._recoverable(self._wp("FINAL", True)))
+
+    def test_empty_tuple_disables_recovery(self):
+        self.pipeline.config.recover_phases = ()
+        self.assertFalse(self.pipeline._recoverable(self._wp("FINAL", True)))

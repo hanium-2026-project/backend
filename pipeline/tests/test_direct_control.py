@@ -70,7 +70,7 @@ class TestControlStream(DirectControlTestBase):
     def test_control_reaches_vehicle_while_driving(self):
         esp = self.connect()
         self.assertTrue(wait_until(lambda: esp.state == "READY"))
-        self.feed((7, (150.0, 100.0)))            # 진입 → 슬롯 배정 → 미션 시작
+        self.feed((7, (150.0, 600.0)))            # 진입 → 슬롯 배정 → 미션 시작
 
         orch = self.pipeline.orchestrator
         self.assertTrue(wait_until(
@@ -97,7 +97,7 @@ class TestControlStream(DirectControlTestBase):
     def test_control_seq_increases(self):
         esp = self.connect()
         self.assertTrue(wait_until(lambda: esp.state == "READY"))
-        self.feed((7, (150.0, 100.0)))
+        self.feed((7, (150.0, 600.0)))
         for pos in [(150.0, 140.0), (150.0, 190.0), (150.0, 240.0)]:
             self.feed((7, pos))
         self.assertTrue(wait_until(lambda: esp.direct_controls >= 2))
@@ -109,7 +109,7 @@ class TestControlStream(DirectControlTestBase):
         """heading 을 모르는 첫 프레임에서 차를 밀면 안 된다."""
         esp = self.connect()
         self.assertTrue(wait_until(lambda: esp.state == "READY"))
-        self.feed((7, (150.0, 100.0)))
+        self.feed((7, (150.0, 600.0)))
         out = self.pipeline.last_control.get(1)
         if out is not None and self.pipeline.views[7].heading_deg is None:
             self.assertEqual(out.throttle, 0.0)
@@ -118,7 +118,7 @@ class TestControlStream(DirectControlTestBase):
     def test_zero_control_when_mission_not_driving(self):
         esp = self.connect()
         self.assertTrue(wait_until(lambda: esp.state == "READY"))
-        self.feed((7, (150.0, 100.0)))
+        self.feed((7, (150.0, 600.0)))
         orch = self.pipeline.orchestrator
         self.assertTrue(wait_until(lambda: 1 in orch.missions))
 
@@ -135,7 +135,7 @@ class TestControlStream(DirectControlTestBase):
         """재접속하면 제어기 상태를 버린다 (옛 오차로 조향이 튀지 않게)."""
         esp = self.connect()
         self.assertTrue(wait_until(lambda: esp.state == "READY"))
-        self.feed((7, (150.0, 100.0)))
+        self.feed((7, (150.0, 600.0)))
         self.feed((7, (150.0, 160.0)))
         self.assertIn(1, self.pipeline.controllers)
 
@@ -150,7 +150,7 @@ class TestControlDisabledByDefault(DirectControlTestBase):
     def test_no_control_stream_when_disabled(self):
         esp = self.connect()
         self.assertTrue(wait_until(lambda: esp.state == "READY"))
-        self.feed((7, (150.0, 100.0)))
+        self.feed((7, (150.0, 600.0)))
         for pos in [(150.0, 140.0), (150.0, 190.0), (150.0, 240.0)]:
             self.feed((7, pos))
         time.sleep(0.3)

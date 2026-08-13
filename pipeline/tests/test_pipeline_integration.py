@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 import unittest
 
@@ -95,21 +96,21 @@ class PipelineTestBase(unittest.TestCase):
         car1 을 경로대로 움직이며 car2 의 배정을 기다린다.
         """
         orch = self.pipeline.orchestrator
-        self.feed((7, (150.0, 100.0)))
-        self.feed((8, (150.0, 100.0)))
+        self.feed((7, (150.0, 600.0)))
+        self.feed((8, (150.0, 600.0)))
         for _ in range(max_steps):
             if 1 in orch.missions and 2 in orch.missions:
                 return
             m1 = orch.missions.get(1)
             wp = m1.current if m1 else None
             if wp is not None:
-                self.feed((7, (wp.x, wp.y)), (8, (150.0, 100.0)))
+                self.feed((7, (wp.x, wp.y)), (8, (150.0, 600.0)))
             else:
-                self.feed((8, (150.0, 100.0)))
+                self.feed((8, (150.0, 600.0)))
         self.fail(f"두 차량 미션 생성 실패: {sorted(orch.missions)}")
 
     def drive_mission(self, car_id: int, track_id: int,
-                      max_steps: int = 40) -> MissionState:
+                      max_steps: int = 80) -> MissionState:
         """현재 목표 waypoint 좌표로 차량을 순차 이동시켜 미션을 완주한다."""
         orch = self.pipeline.orchestrator
         for _ in range(max_steps):
@@ -129,11 +130,11 @@ class TestSingleVehicle(PipelineTestBase):
         esp = self.connect(1)
         self.assertEqual(self.pipeline._pending_cars, [1])
 
-        self.feed((7, (150.0, 100.0)))            # entrance 위치
+        self.feed((7, (150.0, 600.0)))            # junction(통로 왼쪽 끝) 위치
 
         view = self.pipeline.views[7]
         self.assertEqual(view.car_id, 1, "track↔car 매핑 실패")
-        self.assertEqual(view.node, "entrance")
+        self.assertEqual(view.node, "junction")
         self.assertIsNotNone(view.slot_id, "슬롯 미배정")
         self.assertIn(1, self.pipeline.orchestrator.missions)
         self.assertTrue(wait_until(lambda: esp.target is not None),
@@ -143,7 +144,7 @@ class TestSingleVehicle(PipelineTestBase):
     def test_full_drive_to_parked(self):
         """전 구간 주행 → FINAL → 정지 확인 → PARKED, 슬롯 점유."""
         esp = self.connect(1)
-        self.feed((7, (150.0, 100.0)))
+        self.feed((7, (150.0, 600.0)))
         slot_id = self.pipeline.views[7].slot_id
 
         state = self.drive_mission(car_id=1, track_id=7)
@@ -158,7 +159,7 @@ class TestSingleVehicle(PipelineTestBase):
     def test_parked_requires_stationary(self):
         """움직이는 중에는 FINAL 위치에 있어도 PARKED 로 확정하지 않는다 (§11)."""
         self.connect(1)
-        self.feed((7, (150.0, 100.0)))
+        self.feed((7, (150.0, 600.0)))
         orch = self.pipeline.orchestrator
         m = orch.missions[1]
 
@@ -171,11 +172,12 @@ class TestSingleVehicle(PipelineTestBase):
 
         final = m.current
         self.assertTrue(final.is_final)
-        # 슬롯 방향(heading)을 유지한 채 FINAL 로 접근 — 위치·방향은 맞지만
-        # 계속 이동 중이므로 PARKED 로 확정되면 안 된다
-        approach = -1 if final.target_heading_deg == 90.0 else 1
+        # 요구 heading 축을 따라 뒤에서 접근 — 위치·방향은 맞지만 계속
+        # 이동 중이므로 PARKED 로 확정되면 안 된다. 축을 하드코딩하지 않는다
+        # (인계 모델에서 목표 heading 은 통로 축 0°/180° 다).
+        h = math.radians(final.target_heading_deg)
         for d in (120, 80, 40, 0):
-            self.feed((7, (final.x, final.y + approach * d)))
+            self.feed((7, (final.x - d * math.cos(h), final.y - d * math.sin(h))))
         self.assertIsNot(m.state, MissionState.DONE, "움직이는데 PARKED 확정됨")
 
         for _ in range(4):                      # 같은 자리 유지 → 정지 성립
@@ -185,8 +187,8 @@ class TestSingleVehicle(PipelineTestBase):
     def test_heading_flows_into_pose(self):
         """궤적 heading 이 계산되어 차량 관측에 반영된다."""
         self.connect(1)
-        self.feed((7, (150.0, 100.0)))
-        for y in (150.0, 250.0, 350.0, 450.0):   # 위로 이동 → 90°
+        self.feed((7, (150.0, 600.0)))
+        for y in (650.0, 700.0, 750.0, 800.0):   # 통로에서 위로 이동 → 90°
             self.feed((7, (150.0, y)))
         view = self.pipeline.views[7]
         self.assertIsNotNone(view.heading_deg)
@@ -254,7 +256,7 @@ class TestRecovery(PipelineTestBase):
     def test_reconnect_discards_route(self):
         """재접속 시 기존 경로를 폐기하고 자동 재개하지 않는다 (§21)."""
         self.connect(1)
-        self.feed((7, (150.0, 100.0)))
+        self.feed((7, (150.0, 600.0)))
         self.assertIn(1, self.pipeline.orchestrator.missions)
 
         self.esps[0].close()
@@ -267,7 +269,7 @@ class TestRecovery(PipelineTestBase):
     def test_rejected_command_triggers_replan(self):
         """STALE_ROUTE 계열 거절 → 현재 pose 기준 새 route 로 재생성."""
         self.connect(1)
-        self.feed((7, (150.0, 100.0)))
+        self.feed((7, (150.0, 600.0)))
         orch = self.pipeline.orchestrator
         before = orch.missions[1].route_id
 
@@ -307,7 +309,7 @@ class TestTwoClassModel(PipelineTestBase):
         """정지 상태에서도 heading 이 나온다 — 궤적 방식으로는 불가능한 경우."""
         self.connect(1)
         for _ in range(3):
-            self.feed_with_cushion((150.0, 100.0), (0.0, 60.0))
+            self.feed_with_cushion((150.0, 600.0), (0.0, 60.0))
         view = self.pipeline.views[7]
         self.assertEqual(view.heading_source, "FRONT_CUSHION")
         self.assertAlmostEqual(view.heading_deg, 90.0, delta=5.0)
@@ -315,7 +317,7 @@ class TestTwoClassModel(PipelineTestBase):
     def test_cushion_does_not_break_mission(self):
         """쿠션이 섞여 들어와도 차량으로 오인되지 않고 주행이 정상 진행된다."""
         esp = self.connect(1)
-        self.feed_with_cushion((150.0, 100.0), (0.0, 60.0))
+        self.feed_with_cushion((150.0, 600.0), (0.0, 60.0))
         self.assertIsNotNone(self.pipeline.views[7].slot_id, "슬롯 미배정")
         # 쿠션이 별도 차량으로 등록되지 않았는지
         self.assertEqual(len(self.pipeline.views), 1,

@@ -19,6 +19,7 @@ reference 계약 재현(spec)으로 실행한다. 실제 backend full source 는
 from __future__ import annotations
 
 import math
+import time
 import unittest
 
 from controller.config import SimulationConfig
@@ -295,3 +296,53 @@ class TestV5CallbackContract(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSchedulerSelfStop(unittest.TestCase):
+    """제어 루프 안에서 stop() 을 불러도 터지지 않아야 한다.
+
+    on_tick 콜백은 스케줄러 스레드 위에서 돈다. 거기서 stop() 을 부르면
+    자기 자신을 join 해 RuntimeError 가 나고, 그 예외가 콜백 경로를 타고
+    올라가 **이후 상태 전이가 통째로 유실된다**(실차 확인 2026-08-13:
+    재계획 실패 → runner.stop() → cannot join current thread).
+    """
+
+    def test_stop_from_inside_tick_does_not_raise(self):
+        import threading
+        from integration.control_scheduler import ControlScheduler
+
+        calls = []
+
+        class FakeHost:
+            def tick(self, now, **kw):
+                return "tick"
+
+        sched = ControlScheduler(FakeHost(), period_s=0.01)
+
+        def on_tick(_result):
+            calls.append(threading.current_thread())
+            sched.stop()                      # ← 자기 스레드에서 정지
+
+        sched._on_tick = on_tick
+        sched.start()
+        for _ in range(100):
+            if calls:
+                break
+            time.sleep(0.01)
+        self.assertTrue(calls, "on_tick 이 한 번도 안 불렸다")
+        time.sleep(0.1)
+        self.assertFalse(sched._thread.is_alive() if sched._thread else False,
+                         "정지 신호를 받고도 루프가 계속 돈다")
+
+    def test_stop_from_other_thread_still_joins(self):
+        from integration.control_scheduler import ControlScheduler
+
+        class FakeHost:
+            def tick(self, now, **kw):
+                return None
+
+        sched = ControlScheduler(FakeHost(), period_s=0.01)
+        sched.start()
+        time.sleep(0.05)
+        sched.stop()
+        self.assertIsNone(sched._thread, "다른 스레드에서 부르면 회수까지 해야 한다")

@@ -100,9 +100,32 @@ class ControllerConfig:
     stop_distance_cm: float = 3.0         # PROVISIONAL. 정지 여유 거리
     allow_reverse: bool = False           # 일반 AUTO는 기본 전진 전용
     # 후진은 일반 CRUISE에 열지 않고 복구/주차 phase로 제한한다.
+    # APPROACH 추가(2026-08-12): 원호 시작점을 지나치면(APPROACH_*_MISSED)
+    # 전진으로는 되잡을 수 없어 후진 복구가 필요하다. TURN/CRUISE 는 계속 제외 —
+    # 통로 주행 중 후진은 뒤를 못 보므로 허용하지 않는다.
     reverse_allowed_phases: tuple[str, ...] = (
-        "RECOVERY", "PARKING", "ALIGN", "ENTRY", "FINAL",
+        "RECOVERY", "PARKING", "APPROACH", "ALIGN", "ENTRY", "FINAL",
     )
+    # 후진 중에는 앞바퀴를 중립(11자)으로 고정한다.
+    # 후진 조향은 뒤를 못 보는 상태에서 궤적을 휘게 만들고, 카메라 heading 이
+    # 궤적 기반이면 부호까지 뒤집혀 상황을 악화시킨다. 복구는 "곧게 물러났다
+    # 다시 들어간다"로 충분하다 — 복구 경로도 현재 heading 축을 따라 만든다.
+    reverse_straight_steering: bool = True
+
+    # === 최대 조향 정지 마찰 =================================================
+    # 바퀴를 끝까지 꺾으면 정지 마찰이 급증한다. 펌웨어 throttle_to_duty 는
+    # |steering|>0.5 구간에서 duty = lerp(38, 50, throttle) 이라, max_throttle 을
+    # 낮게 잡으면 duty 가 38~40 에 묶여 **차가 아예 못 움직인다**.
+    #   실측 2026-08-12: max_throttle 0.20, |steering| 1.00 → duty 40,
+    #                    12초간 pose 변화 0. 명령은 계속 나가는데 정지.
+    # 조향이 strong_turn_steering 을 넘으면 throttle 하한을 올려 duty 를
+    # 끌어올린다. 이 하한은 max_throttle 을 **의도적으로 넘을 수 있다** —
+    # max_throttle 은 속도 상한인데, 최대 조향에서는 duty 를 올려도 차가
+    # 기어가듯 움직이기 때문이다. None 이면 끈다.
+    # 0.9 = **바퀴가 스토퍼에 닿기 직전**. 여기부터 정지 마찰이 급증한다.
+    # 0.5 로 잡으면 heading 오차 9도만 넘어도 걸려 max_throttle 이 무의미해진다.
+    strong_turn_steering: float = 0.9
+    strong_turn_min_throttle: float | None = 0.7
 
     # === 자동주차 / recovery =================================================
     # APPROACH/ALIGN/ENTRY/FINAL은 stop_distance를 tolerance에 더하지 않고

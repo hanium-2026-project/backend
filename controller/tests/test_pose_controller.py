@@ -114,13 +114,34 @@ class TestThrottle(unittest.TestCase):
         self.assertGreater(t_far, t_near)
 
     def test_large_heading_error_slower(self) -> None:
+        """회전 감속 — 단, 조향이 포화되기 전 구간에서다.
+
+        최대 조향(|steering|>=0.9)에서는 정지 마찰 하한이 우선한다.
+        거기서도 감속을 고집하면 duty 가 38~40 에 묶여 차가 아예 안 움직인다
+        (실측 2026-08-12). test_full_lock_overrides_turn_slowdown 참조.
+        """
         pose = make_pose(0, 0, heading_deg=0.0)
         aligned = far_waypoint(1000.0, 0.0)       # 정면
-        skew = far_waypoint(1000.0, 600.0)        # 큰 heading 오차(약 31°)
+        skew = far_waypoint(1000.0, 250.0)        # 약 14° — 조향 0.75, 미포화
         t_aligned = self.ctl.compute(pose, aligned, now=100.0).throttle
         self.ctl.reset()
         t_skew = self.ctl.compute(pose, skew, now=100.0).throttle
+        self.assertLess(abs(self.ctl.compute(pose, skew, now=100.0).steering), 0.9)
         self.assertGreater(t_aligned, t_skew)
+
+    def test_full_lock_overrides_turn_slowdown(self) -> None:
+        """바퀴를 끝까지 꺾으면 정지 마찰 하한이 회전 감속을 이긴다."""
+        pose = make_pose(0, 0, heading_deg=0.0)
+        full = far_waypoint(1000.0, 600.0)        # 약 31° — 조향 포화
+        cmd = self.ctl.compute(pose, full, now=100.0)
+        self.assertGreaterEqual(abs(cmd.steering), 0.9)
+        self.assertGreaterEqual(cmd.throttle, 0.7)
+
+    def test_stiction_floor_can_be_disabled(self) -> None:
+        ctl = PoseWaypointController(ControllerConfig(strong_turn_min_throttle=None))
+        cmd = ctl.compute(make_pose(0, 0, heading_deg=0.0),
+                          far_waypoint(1000.0, 600.0), now=100.0)
+        self.assertLess(cmd.throttle, 0.7)
 
     def test_arrival_zero(self) -> None:
         pose = make_pose(0, 0, heading_deg=0.0)
@@ -201,7 +222,11 @@ class TestReverseControl(unittest.TestCase):
         self.assertEqual(cmd.mode, ControlMode.DRIVE)
 
     def test_reverse_steering_sign_is_physically_reversed(self) -> None:
-        ctl = PoseWaypointController(ControllerConfig(allow_reverse=True, steer_kd=0.0))
+        # 부호 수학 자체를 보는 테스트다. 실차 기본값은 11자 후진
+        # (reverse_straight_steering=True)이라 조향이 0 으로 고정되므로,
+        # 여기서만 꺼서 계산식을 검증한다.
+        ctl = PoseWaypointController(ControllerConfig(
+            allow_reverse=True, steer_kd=0.0, reverse_straight_steering=False))
         pose = make_pose(0, 0, heading_deg=0.0)
         # 후진 기준 NW(135°)는 reverse 진행방향 180°의 오른쪽.
         # 후진 물리에서는 바퀴를 LEFT로 틀어야 rear trajectory가 그쪽으로 간다.
@@ -210,6 +235,15 @@ class TestReverseControl(unittest.TestCase):
         cmd = ctl.compute(pose, wp, now=100.0)
         self.assertLess(cmd.steering, 0.0)  # wire 음수 = LEFT
         self.assertGreater(cmd.logical_steering, 0.0)
+
+    def test_reverse_keeps_wheels_straight_by_default(self) -> None:
+        """실차 기본값은 11자 후진 — 뒤를 못 보는 상태에서 궤적을 휘게 하지 않는다."""
+        ctl = PoseWaypointController(ControllerConfig(allow_reverse=True))
+        wp = far_waypoint(-1000.0, 1000.0, phase="RECOVERY",
+                          motion_direction=MotionDirection.REVERSE)
+        cmd = ctl.compute(make_pose(0, 0, heading_deg=0.0), wp, now=100.0)
+        self.assertEqual(cmd.steering, 0.0)
+        self.assertLess(cmd.throttle, 0.0)          # 후진은 하고 있다
 
 
 if __name__ == "__main__":

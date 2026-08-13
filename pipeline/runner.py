@@ -29,7 +29,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from comm import MissionOrchestrator, MissionState, VehicleServer
 from control import ControlOutput, Pose, WaypointController
@@ -40,9 +40,13 @@ from cv.heading import HeadingEstimator
 from cv.homography import compute_homography, warp_point
 from cv.tracker import RCCarTracker, TrackState
 from cv.vehicle_detector import YoloVehicleDetector
+from parking.recovery import (REVERSE_TRIGGER_REASONS, forward_unreachable,
+                              plan_reverse_recovery)
 from parking.safety import CollisionMonitor, VehiclePose
-from parking.waypoints import build_waypoints, default_slot_specs
+from parking.waypoints import (AISLE_Y, MIN_TURN_RADIUS_MM, InfeasibleRouteError,
+                               build_waypoints, default_slot_specs, plan_handoff)
 from rl.bridge import RealtimeAllocator, position_to_node
+from rl.parking_env import SLOT_NAMES
 
 from .config import PipelineConfig
 from .dashboard import DashboardBridge
@@ -68,6 +72,9 @@ class VehicleView:
     last_obs_time: float = 0.0
     last_alloc_frame: int = -10_000        # 슬롯 배정 재시도 조절용
     recent: deque[tuple[float, float]] = field(default_factory=lambda: deque(maxlen=8))
+    # 로그용 원본 픽셀값 (요청문 6절). homography 검증에 필요해 변환 전 값을 남긴다.
+    last_pixel: tuple[float, float] | None = None
+    last_bbox: tuple[int, int, int, int] | None = None
 
     def is_stationary(self, tolerance_mm: float, window: int) -> bool:
         """최근 창 안에서 거의 움직이지 않았는지 (PARKED 재검증용, §11)."""
@@ -112,6 +119,15 @@ class ParkingPipeline:
         # AUTO_HOST 모드: 차량별 제어 소유자 (waypoint-auto 에서는 비어 있다)
         self.auto_hosts: dict[int, AutoHostRunner] = {}
         self._auto_host_slot: dict[int, str] = {}        # car_id → 배정 슬롯
+        self._replan_attempts: dict[int, int] = {}       # car_id → 재계획 횟수
+        self._deviation_streak: dict[int, int] = {}      # car_id → 연속 이탈 프레임
+        self._last_no_route_warn = 0.0                   # 경로 불가 경고 간격 제한
+        self._unreachable_slots: set[str] = set()        # 현재 위치에서 못 가는 슬롯
+        self._auto_host_route: dict[int, list[Any]] = {}  # car_id → 화면 표시용 경로
+        # 경로 계획 반경. 실측값(610mm)이 기본이고, 진입 우회전 실험 때만 낮춘다.
+        self._plan_radius = (self.config.plan_turn_radius_mm
+                             if self.config.plan_turn_radius_mm is not None
+                             else MIN_TURN_RADIUS_MM)
         # 수동 WASD ↔ 자동 전환 mux (하드웨어팀 통합본). auto-host 모드에서만 쓴다.
         self.hybrid_controls: dict[int, HybridControlMux] = {}
         self._manual_shell_starting: set[int] = set()
@@ -120,6 +136,17 @@ class ParkingPipeline:
         self._pending_cars: list[int] = []               # HELLO 순서 대기열
         self._lock = threading.Lock()
         self._tracker: RCCarTracker | None = None
+
+        # ─ Run 기록기 연결점 (tools/run_recorder.py) ─
+        # 파이프라인은 기록기를 알지 못한다. 프레임마다 pose 레코드를 만들어
+        # last_pose_rec 에 두고, 콜백이 붙어 있으면 밀어준다. 기본은 꺼짐.
+        self.on_pose_record: Callable[[dict], None] | None = None
+        # (waypoints, is_recovery) — route.json / recovery_route.json 용
+        self.on_route_load: Callable[[list, bool], None] | None = None
+        self.last_pose_rec: dict | None = None
+        self._frame_seq = 0
+        self._prev_frame_index: int | None = None
+        self._dropped_frames = 0
 
         self.server.on_status = self.orchestrator.on_vehicle_status
         self.server.on_command_rejected = self.orchestrator.on_command_rejected
@@ -193,6 +220,9 @@ class ParkingPipeline:
             return int(v[0] / v[2]), int(v[1] / v[2])
 
         y = 60
+        if self.auto_host_mode:
+            return self._draw_auto_host(image, to_px, y)
+
         for car_id, m in self.orchestrator.missions.items():
             wp = m.current
             if wp is None:
@@ -242,10 +272,82 @@ class ParkingPipeline:
                         cv2.arrowedLine(image, origin, tip, color, 2, tipLength=0.3)
         return image
 
+    def _draw_auto_host(self, image, to_px, y: int):
+        """AUTO_HOST 경로를 화면에 그린다.
+
+        기존 오버레이는 orchestrator.missions 를 봤는데 auto-host 에서는 그게
+        항상 비어 있어 아무것도 안 보였다. 실차에서 "지금 어디로 가라고 하는
+        중인지"가 안 보이면 검증이 불가능하다.
+        """
+        import cv2
+
+        CYAN, GREEN, GREY, RED = (255, 200, 0), (80, 255, 120), (170, 170, 170), (80, 80, 255)
+
+        # 통로선 — 인계 지점이 놓이는 기준선
+        a, b = to_px((0.0, AISLE_Y)), to_px((self.config.lot_width_mm, AISLE_Y))
+        if a and b:
+            cv2.line(image, a, b, GREY, 1, cv2.LINE_AA)
+
+        for car_id, runner in self.auto_hosts.items():
+            route = self._auto_host_route.get(car_id) or []
+            target = runner.current_target
+            tx = (target.x_mm, target.y_mm) if target is not None else None
+
+            pts = [to_px((w.x, w.y)) for w in route]
+            for p, q in zip(pts, pts[1:]):
+                if p and q:
+                    cv2.line(image, p, q, CYAN, 1, cv2.LINE_AA)
+
+            for w, pt in zip(route, pts):
+                if pt is None:
+                    continue
+                cur = tx is not None and abs(w.x - tx[0]) < 1 and abs(w.y - tx[1]) < 1
+                col = GREEN if cur else CYAN
+                edge = to_px((w.x + w.position_tolerance_cm * 10.0, w.y))
+                r = abs(edge[0] - pt[0]) if edge else 14
+                cv2.circle(image, pt, max(r, 8), col, 2 if cur else 1)
+                cv2.drawMarker(image, pt, col, cv2.MARKER_CROSS, 14, 2 if cur else 1)
+                cv2.putText(image, f"{w.waypoint_id} {w.phase}", (pt[0] + 10, pt[1] - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
+                if w.target_heading_deg is not None:      # 인계 자세(가로) 화살표
+                    ang = math.radians(w.target_heading_deg)
+                    cv2.arrowedLine(image, pt,
+                                    (int(pt[0] + 55 * math.cos(ang)),
+                                     int(pt[1] - 55 * math.sin(ang))),
+                                    col, 2, tipLength=0.3)
+
+            slot = self._auto_host_slot.get(car_id, "-")
+            idx = runner.mission.index + 1 if route else 0
+            head = (f"car{car_id} {runner.status.value} slot={slot} "
+                    f"wp{idx}/{len(route)}")
+            track_id = self.track_of_car.get(car_id)
+            view = self.views.get(track_id) if track_id is not None else None
+            if view is not None and tx is not None:
+                head += (f"  남은거리 "
+                         f"{math.hypot(tx[0] - view.position_mm[0], tx[1] - view.position_mm[1]):.0f}mm")
+            cv2.putText(image, head, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        RED if runner.is_faulted else GREEN, 2, cv2.LINE_AA)
+            y += 26
+
+            if view is not None:
+                cv2.putText(image,
+                            f"   pose ({view.position_mm[0]:.0f},{view.position_mm[1]:.0f})mm "
+                            f"hdg {view.heading_deg if view.heading_deg is None else round(view.heading_deg)}"
+                            f" [{view.heading_source}]",
+                            (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREEN, 1, cv2.LINE_AA)
+                y += 22
+
+        for slot in sorted(self._unreachable_slots):
+            cv2.putText(image, f"   슬롯 {slot} 도달불가", (10, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, RED, 1, cv2.LINE_AA)
+            y += 20
+        return image
+
     # ─── 프레임 처리 (핵심) ──────────────────────────────────────────────────
 
     def on_frame(self, state: TrackState) -> None:
         """탐지 결과 1프레임을 좌표·판정·명령까지 흘린다."""
+        t_recv = time.monotonic()
         if self._homography is None:
             self._init_homography(state)
 
@@ -270,6 +372,8 @@ class ParkingPipeline:
             seen.append(self._update_view(det, state.frame_index,
                                           obs_time=state.timestamp))
 
+        self._record_pose(seen, state, t_recv)
+
         for view in seen:
             self._ensure_mission(view, state.frame_index)
             self._push_to_vehicle(view)
@@ -278,6 +382,51 @@ class ParkingPipeline:
 
         self._check_collisions(seen)
         self._forget_stale(state.frame_index)
+
+    def _record_pose(self, seen: list[VehicleView], state: TrackState,
+                     t_recv: float) -> None:
+        """이번 프레임의 pose 원본을 기록기에 넘긴다 (요청문 6절).
+
+        car_id 가 붙은 차량 하나만 남긴다 — 기록기가 차량 1대 기준이라
+        여러 track 을 섞으면 시계열이 뒤엉킨다.
+        """
+        self._frame_seq += 1
+        if self._prev_frame_index is not None:
+            gap = state.frame_index - self._prev_frame_index - 1
+            if gap > 0:
+                self._dropped_frames += gap
+        self._prev_frame_index = state.frame_index
+
+        view = next((v for v in seen if v.car_id is not None), None)
+        if view is None:
+            return
+        px = view.last_pixel or (None, None)
+        self.last_pose_rec = {
+            "frame_id": self._frame_seq,
+            "tracker_frame_index": state.frame_index,
+            "capture_ts": state.timestamp,
+            "pose_ts": time.monotonic(),
+            "obs_time": view.last_obs_time,
+            "car_id": view.car_id,
+            "track_id": view.track_id,
+            "pixel_x": None if px[0] is None else round(px[0], 1),
+            "pixel_y": None if px[1] is None else round(px[1], 1),
+            "bbox": list(view.last_bbox) if view.last_bbox else None,
+            "x_mm": round(view.position_mm[0], 1),
+            "y_mm": round(view.position_mm[1], 1),
+            "heading_deg": (None if view.heading_deg is None
+                            else round(view.heading_deg, 1)),
+            "heading_source": view.heading_source,
+            "node": view.node,
+            "slot_id": view.slot_id,
+            "valid": True,
+            "confidence": view.confidence,
+            "latency_ms": round((time.monotonic() - t_recv) * 1000, 2),
+            "fps": round(state.fps, 1),
+            "dropped_total": self._dropped_frames,
+        }
+        if self.on_pose_record is not None:
+            self.on_pose_record(self.last_pose_rec)
 
     def _init_homography(self, state: TrackState) -> None:
         """첫 프레임 크기로 캘리브레이션 행렬을 만든다."""
@@ -321,6 +470,8 @@ class ParkingPipeline:
             view.confidence = det.confidence
             view.last_seen_frame = frame_index
             view.last_obs_time = time.monotonic() if obs_time is None else obs_time
+            view.last_pixel = center_px
+            view.last_bbox = (int(x1), int(y1), int(x2), int(y2))
             view.recent.append((mx, my))
 
         front_mm = warp_point(front_px, self._homography) if front_px else None
@@ -392,6 +543,8 @@ class ParkingPipeline:
         car_id = view.car_id if view.car_id is not None else self._bind_car(view)
         if car_id is None:
             return                       # 아직 접속한 차량이 없음
+        if self.config.manual_only:
+            return                       # 수동 계측 — 매핑만 하고 자동 주행 안 함
         if car_id in self.orchestrator.missions:
             return                       # 미션 진행 중
         if car_id in self._manual_shell_starting:
@@ -408,11 +561,21 @@ class ParkingPipeline:
             log.info("car %d: no slot available (RL WAIT) — will retry", car_id)
             return
         route_id = self.orchestrator.next_route_id()
-        wps = build_waypoints(default_slot_specs()[slot_id], route_id=route_id)
+        # 접근 방향(좌/우)과 진입 선회 반경은 차량 현재 위치가 정한다. 슬롯에
+        # 따라 "지나쳐 버려서 전진으로 못 돌아오는" 경우가 있으므로 반드시
+        # strict 로 만들고, 불가능하면 무장하지 않는다 — 예전에는 그대로 실어
+        # 보내서 차가 뒤로 가야 하는 경로를 받았다.
+        slot_id, wps = self._feasible_route(view, slot_id, route_id)
+        if slot_id is None:
+            return                       # 갈 수 있는 칸이 없다 — 다음 프레임 재시도
+
         if self.auto_host_mode:
             if not self._start_auto_host(car_id, slot_id, wps):
                 return
             view.slot_id = slot_id
+            self._emit_route(wps, car_id=car_id)
+            log.info("car %d → slot %s (route %d, %d waypoints)",
+                     car_id, slot_id, route_id, len(wps))
             return
         try:
             self.orchestrator.start_mission(car_id, wps, slot_id=slot_id)
@@ -426,6 +589,101 @@ class ParkingPipeline:
                  car_id, slot_id, route_id, len(wps))
         self.dashboard.push_event("slot_assigned", car_id=car_id, slot=slot_id,
                                   route_id=route_id)
+
+    def _feasible_route(self, view: VehicleView, slot_id: str, route_id: int):
+        """RL 이 고른 칸으로 경로를 만들되, 물리적으로 불가하면 대체한다.
+
+        접근 방향과 진입 선회 반경은 차량 현재 자세가 정한다. 합류점보다
+        왼쪽에 있는 칸은 지나쳐 버려 전진으로 되돌아올 수 없으므로, 그런
+        경로를 그대로 실으면 차가 뒤로 가야 하는 목표를 받는다(실차 확인).
+
+        RL 은 혼잡도만 보고 고르지 이 기하를 모른다. 그래서 여기서 한 번
+        걸러 **도달 가능한 가장 가까운 빈 칸**으로 바꾼다. 슬롯 점유 상태를
+        직접 조작해 RL 을 우회하면 정책이 WAIT 으로 굳으므로 하지 않는다.
+
+        Returns:
+            (확정 슬롯, waypoint 목록). 갈 수 있는 칸이 없으면 (None, None).
+        """
+        specs = default_slot_specs()
+        try:
+            return slot_id, build_waypoints(
+                specs[slot_id], route_id=route_id, from_pose=view.position_mm,
+                from_heading_deg=view.heading_deg,
+                min_radius_mm=self._plan_radius, strict=True)
+        except InfeasibleRouteError as exc:
+            reason = exc.reason
+
+        alt = self._nearest_feasible_slot(view, exclude=slot_id)
+        if alt is None:
+            # 어느 칸도 안 되면 슬롯 문제가 아니라 **차량 자세 문제**다
+            # (통로 합류 자체가 불가능하면 8칸이 같은 이유로 실패한다).
+            # RL 배정은 캐시되므로 다음 프레임에도 같은 칸이 나온다 — 조용히
+            # 반복하지 말고 무엇을 해야 하는지 주기적으로 알린다.
+            self._reject_slot(view.car_id, slot_id, reason)
+            self._warn_no_route(view, reason)
+            return None, None
+        log.warning("car %s: RL 배정 %s 는 현재 자세에서 불가 (%s) — %s 로 대체",
+                    view.car_id, slot_id, reason, alt)
+        self.allocator.reassign(view.track_id, alt)
+        self.dashboard.push_event("slot_reassigned", car_id=view.car_id,
+                                  slot=alt, replaced=slot_id, reason=reason)
+        return alt, build_waypoints(
+            specs[alt], route_id=route_id, from_pose=view.position_mm,
+            from_heading_deg=view.heading_deg,
+            min_radius_mm=self._plan_radius, strict=True)
+
+    def _warn_no_route(self, view: VehicleView, reason: str) -> None:
+        """갈 수 있는 칸이 하나도 없을 때 주기적으로 사유를 알린다."""
+        now = time.monotonic()
+        if now - self._last_no_route_warn < 3.0:
+            return
+        self._last_no_route_warn = now
+        x, y = view.position_mm
+        need = (AISLE_Y - y) / 10.0
+        log.warning(
+            "car %s: 현재 자세(%.0f,%.0f)mm hdg %s 에서 **갈 수 있는 슬롯이 없다** — %s",
+            view.car_id, x, y,
+            "None" if view.heading_deg is None else f"{view.heading_deg:.0f}deg",
+            reason)
+        if 0.0 < need:
+            log.warning("   → 차를 통로(y=%.0fcm)에 더 붙이거나, "
+                        "--turn-radius %.0f 이하로 주고 다시 실행",
+                        AISLE_Y / 10.0, max(need - 1.0, 1.0))
+
+    def _nearest_feasible_slot(self, view: VehicleView, *,
+                               exclude: str | None = None) -> str | None:
+        """현재 자세에서 갈 수 있는 빈 칸 중 인계 지점이 가장 가까운 것."""
+        best, best_d = None, float("inf")
+        for slot_id, spec in default_slot_specs().items():
+            if slot_id == exclude:
+                continue
+            idx = SLOT_NAMES.index(slot_id)
+            if self.allocator.slot_statuses[idx] >= 1.0:
+                continue                                  # 이미 점유/선점됨
+            plan = plan_handoff(spec, from_pose=view.position_mm,
+                                from_heading_deg=view.heading_deg,
+                                min_radius_mm=self._plan_radius)
+            if not plan.feasible:
+                continue
+            d = math.hypot(plan.point[0] - view.position_mm[0],
+                           plan.point[1] - view.position_mm[1])
+            if d < best_d:
+                best, best_d = slot_id, d
+        return best
+
+    def _reject_slot(self, car_id: int, slot_id: str, reason: str) -> None:
+        """차량 현재 위치에서 갈 수 없는 슬롯을 배정 후보에서 뺀다.
+
+        점유 상태를 조작하지는 않는다 — 정책이 그걸 혼잡으로 읽어 WAIT 으로
+        굳어버린다(실측). 기록·보고용으로만 남긴다.
+        """
+        if slot_id in self._unreachable_slots:
+            return
+        self._unreachable_slots.add(slot_id)
+        log.warning("car %d: 슬롯 %s 경로 불가 — %s. 배정 후보에서 제외하고 재배정",
+                    car_id, slot_id, reason)
+        self.dashboard.push_event("slot_unreachable", car_id=car_id, slot=slot_id,
+                                  reason=reason)
 
     def _push_to_vehicle(self, view: VehicleView) -> None:
         """도착 판정 + POSE 스트림 갱신."""
@@ -474,7 +732,8 @@ class ParkingPipeline:
     def _start_manual_shell(self, car_id: int) -> None:
         """READY 직후 세션만 열고 수동(WASD) 조작을 가능하게 한다."""
         runner = AutoHostRunner(self.server, car_id, [],
-                                period_s=self.config.auto_host_period_s)
+                                period_s=self.config.auto_host_period_s,
+                                config=self.config.controller_config)
         runner.on_status_change = self._on_auto_host_status
         mux = None
         try:
@@ -511,7 +770,8 @@ class ParkingPipeline:
             return True
 
         runner = AutoHostRunner(self.server, car_id, waypoints,
-                                period_s=self.config.auto_host_period_s)
+                                period_s=self.config.auto_host_period_s,
+                                config=self.config.controller_config)
         runner.on_status_change = self._on_auto_host_status
         try:
             runner.start(wait_s=self.config.auto_host_handshake_s)
@@ -522,6 +782,7 @@ class ParkingPipeline:
         self.auto_hosts[car_id] = runner
         self.hybrid_controls[car_id] = HybridControlMux(runner)
         self._auto_host_slot[car_id] = slot_id
+        self._replan_attempts.pop(car_id, None)
         self.dashboard.push_event("auto_host_armed", car_id=car_id, slot=slot_id)
         return True
 
@@ -575,6 +836,73 @@ class ParkingPipeline:
         target = mux if mux is not None else runner
         target.on_camera_pose(view.position_mm[0], view.position_mm[1],
                               view.heading_deg, view.last_obs_time)
+        self._check_path_deviation(view, runner)
+
+    def _recoverable(self, target: Any) -> bool:
+        """이 waypoint 에서 후진 복구를 걸어도 되는가 (phase 기준)."""
+        phase = str(getattr(target, "phase", "") or "").upper()
+        return phase in self.config.recover_phases
+
+    def _check_path_deviation(self, view: VehicleView, runner: AutoHostRunner) -> None:
+        """매 프레임 "지금 목표를 전진으로 잡을 수 있나"를 본다.
+
+        기존 트리거(APPROACH 놓침 / ALIGN 방향 불일치)는 주차 단계에서만
+        돈다. 진입 원호는 전부 CRUISE 라, 차가 원호 바깥으로 밀려 목표를
+        지나쳐도 아무것도 걸리지 않고 계속 앞으로만 갔다.
+
+        판정은 후진 계획기와 같은 기준이다 — 목표가 좌/우 최소 선회원 안에
+        들어갔거나, 등 뒤인데 되돌아올 원이 맵에 안 들어가면 이탈이다.
+        반경은 **실측값**을 쓴다. 계획 반경을 낮춰 잡았더라도 차가 실제로
+        돌 수 있는 크기가 도달 가능성을 정한다.
+
+        연속 관측을 요구해 pose 잡음에 걸리지 않게 한다.
+        """
+        car_id = view.car_id
+        if car_id is None or runner.status is not MissionStatus.RUNNING:
+            return
+        target = runner.current_target
+        if target is None or view.heading_deg is None:
+            return
+        # 궤적 heading 이면 후진 시 180° 뒤집히므로 애초에 판정하지 않는다.
+        if view.heading_source == "TRAJECTORY":
+            return
+        # 후진 목표에 전진 도달성을 따지면 안 된다. 복구 waypoint 는 정의상
+        # 등 뒤에 있어서 매번 "이탈"로 잡히고, 복구가 복구를 부르며 몇 프레임
+        # 만에 재시도 횟수를 태워버린다.
+        if (runner.mission.is_recovering
+                or getattr(getattr(target, "motion_direction", None), "value", "")
+                == "REVERSE"):
+            self._deviation_streak.pop(car_id, None)
+            return
+        # 통로 중간 점은 허용오차가 넓고 다음 점이 이어진다 — 조금 밀려도 계속
+        # 가면 된다. 여기서 후진을 걸면 진행이 끊긴다.
+        if not self._recoverable(target):
+            self._deviation_streak.pop(car_id, None)
+            return
+
+        off = forward_unreachable(
+            view.position_mm, view.heading_deg, (target.x_mm, target.y_mm),
+            radius_mm=MIN_TURN_RADIUS_MM,
+            lot_mm=(self.config.lot_width_mm, self.config.lot_height_mm))
+        if not off:
+            self._deviation_streak.pop(car_id, None)
+            return
+
+        n = self._deviation_streak.get(car_id, 0) + 1
+        self._deviation_streak[car_id] = n
+        if n < self.config.deviation_frames:
+            return
+        self._deviation_streak.pop(car_id, None)
+
+        # 미션을 REPLAN_REQUIRED 로 올리면 기존 배선(_on_auto_host_status)이
+        # 후진 복구를 만들어 끼운다. 여기서 직접 만들지 않는다.
+        log.warning("car %d: 경로 이탈 — 목표 wp%s(%.0f,%.0f) 를 전진으로 못 잡는다 "
+                    "(pose %.0f,%.0f hdg %.0f°)", car_id,
+                    getattr(target, "waypoint_id", "?"), target.x_mm, target.y_mm,
+                    view.position_mm[0], view.position_mm[1], view.heading_deg)
+        runner.mission.request_replan("PATH_DEVIATION")
+        self.dashboard.push_event("path_deviation", car_id=car_id,
+                                  waypoint_id=getattr(target, "waypoint_id", None))
 
     def _on_auto_host_status(self, car_id: int, prev: MissionStatus,
                              status: MissionStatus) -> None:
@@ -587,7 +915,11 @@ class ParkingPipeline:
             # 정지 재확인은 카메라를 보는 이쪽 몫이다 (§11). 프레임 루프에서 판정한다.
             log.info("car %d: AUTO_HOST 최종 waypoint 도착 — 정지 확인 중", car_id)
         elif status is MissionStatus.REPLAN_REQUIRED:
-            log.info("car %d: 위치는 도달했으나 방향 불일치 — 재접근 경로 생성", car_id)
+            # 먼저 후진 복구를 시도한다. 전진으로 못 잡는 자세라 재계획을 해봐야
+            # 같은 기하가 다시 나오기 때문이다 (같은 슬롯 = 같은 원호).
+            if self._recover_auto_host(car_id):
+                return
+            log.info("car %d: 후진 복구 불가 — 전체 재계획", car_id)
             self._replan_auto_host(car_id)
 
     def _check_auto_host_parked(self, view: VehicleView) -> None:
@@ -604,8 +936,79 @@ class ParkingPipeline:
         if slot_id is not None:
             self._on_parked(view.car_id, slot_id)
 
+    def _recover_auto_host(self, car_id: int) -> bool:
+        """전진으로 못 잡는 자세면 후진 복구 경로를 끼워 넣는다.
+
+        미션이 복구 구간을 마치면 실패했던 target 부터 원래 route 로 자동
+        복귀하므로, 여기서는 "얼마나 물러날지" 한 점만 만들면 된다.
+
+        Returns:
+            복구 경로를 실제로 적재했으면 True.
+        """
+        runner = self.auto_hosts.get(car_id)
+        if runner is None:
+            return False
+        # REPLAN_REQUIRED 에서는 current_target 이 None 이다 — 실패한 target 을 쓴다.
+        target = runner.failed_target
+        if target is None:
+            return False
+
+        if not self._recoverable(target):
+            log.info("car %d: 후진 대상 phase 가 아니라 보류 (%s, 허용 %s)",
+                     car_id, getattr(target, "phase", "?"),
+                     "/".join(self.config.recover_phases) or "없음")
+            return False
+
+        reason = runner.replan_reason or ""
+        if reason not in REVERSE_TRIGGER_REASONS:
+            log.info("car %d: 후진 대상 아닌 사유 (%s)", car_id, reason)
+            return False
+
+        track_id = self.track_of_car.get(car_id)
+        view = self.views.get(track_id) if track_id is not None else None
+        if view is None:
+            return False
+
+        # heading 을 이동 궤적에서 추정하는 동안에는 후진하면 안 된다.
+        # 후진하면 진행 방향이 뒤집혀 추정 heading 이 180° 틀어지고, 제어기가
+        # 그 값을 믿고 반대로 조향해 상황을 더 나쁘게 만든다. 전방 쿠션을
+        # 잡아 방향을 직접 재는 동안(heading_source != TRAJECTORY)만 허용한다.
+        if view.heading_source == "TRAJECTORY":
+            log.info("car %d: heading 이 궤적 추정이라 후진 보류 "
+                     "(전방 쿠션 미탐지)", car_id)
+            return False
+
+        wps = plan_reverse_recovery(
+            view.position_mm, view.heading_deg, target,
+            route_id=self.orchestrator.next_route_id(), reason=reason,
+            bounds_mm=(self.config.lot_width_mm, self.config.lot_height_mm),
+        )
+        if not wps:
+            return False
+
+        try:
+            status = runner.load_recovery_waypoints(wps)
+        except (RuntimeError, ValueError) as exc:
+            log.warning("car %d: 후진 복구 적재 실패 (%s)", car_id, exc)
+            return False
+        if status is MissionStatus.RECOVERY_FAILED:
+            log.warning("car %d: 후진 복구 횟수 초과 — 포기", car_id)
+            return False
+
+        self._emit_route(wps, recovery=True)
+        log.info("car %d: 후진 복구 (%s) → (%.0f,%.0f) 로 %.0fmm 후진",
+                 car_id, reason, wps[0].x, wps[0].y,
+                 math.hypot(wps[0].x - view.position_mm[0],
+                            wps[0].y - view.position_mm[1]))
+        self.dashboard.push_event("reverse_recovery", car_id=car_id, reason=reason)
+        return True
+
     def _replan_auto_host(self, car_id: int) -> None:
-        """현재 pose 에서 슬롯까지 새 경로를 만들어 러너에 갈아 끼운다."""
+        """현재 pose 에서 슬롯까지 새 경로를 만들어 러너에 갈아 끼운다.
+
+        같은 슬롯이면 기하가 거의 같아 같은 지점에서 다시 실패하기 쉽다.
+        횟수를 제한하지 않으면 REPLAN_REQUIRED ↔ RUNNING 을 무한히 오간다.
+        """
         runner = self.auto_hosts.get(car_id)
         slot_id = self._auto_host_slot.get(car_id)
         track_id = self.track_of_car.get(car_id)
@@ -613,13 +1016,41 @@ class ParkingPipeline:
         if runner is None or slot_id is None or view is None:
             log.warning("car %d: AUTO_HOST 재계획 불가 (pose/슬롯 없음)", car_id)
             return
-        node = view.node or position_to_node(view.position_mm)
+
+        tries = self._replan_attempts.get(car_id, 0) + 1
+        self._replan_attempts[car_id] = tries
+        if tries > self.config.max_replan_attempts:
+            log.warning("car %d: 재계획 %d회 초과 — 정지하고 REPLAN_REQUIRED 유지 "
+                        "(경로가 차량 선회 반경으로 불가능할 수 있음)", car_id, tries - 1)
+            runner.stop()
+            self.dashboard.push_event("replan_exhausted", car_id=car_id,
+                                      slot=slot_id, attempts=tries - 1)
+            return
         route_id = self.orchestrator.next_route_id()
-        wps = build_waypoints(default_slot_specs()[slot_id], route_id=route_id,
-                              route_nodes=[node] if node else None)
+        # 현재 pose 를 기준으로 다시 만든다. route_nodes=[node] 만 넘기던 옛
+        # 방식은 노드가 CRUISE 목록에서 잘려나가 결국 원래와 같은 경로가
+        # 나왔고, 같은 지점에서 다시 실패해 무한 재계획이 됐다.
+        try:
+            wps = build_waypoints(default_slot_specs()[slot_id], route_id=route_id,
+                                  from_pose=view.position_mm,
+                                  from_heading_deg=view.heading_deg, strict=True)
+        except InfeasibleRouteError as exc:
+            log.warning("car %d: 현재 위치에서 슬롯 %s 재계획 불가 (%s) — 정지",
+                        car_id, slot_id, exc.reason)
+            runner.stop()
+            return
         runner.load_route(wps)
+        self._emit_route(wps, car_id=car_id)
         log.info("car %d: AUTO_HOST 재계획 → route %d (%d개)",
                  car_id, route_id, len(wps))
+
+    def _emit_route(self, waypoints: list[Any], *, recovery: bool = False,
+                    car_id: int | None = None) -> None:
+        """적재한 route 를 기록기·화면에 넘긴다 (route.json / overlay)."""
+        if car_id is not None and not recovery:
+            self._auto_host_route[car_id] = list(waypoints)
+        if self.on_route_load is not None:
+            self.on_route_load(list(waypoints), recovery)
 
     # ─── B안 주행 제어 ───────────────────────────────────────────────────────
 

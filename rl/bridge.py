@@ -97,6 +97,22 @@ class RealtimeAllocator:
     def remove_vehicle(self, track_id: int) -> None:
         self.vehicles.pop(track_id, None)
 
+    def reassign(self, track_id: int, slot_name: str) -> None:
+        """이미 배정된 차량을 다른 슬롯으로 옮긴다 (선점 표시도 함께 이동).
+
+        RL 이 고른 칸이 차량 현재 자세에서 물리적으로 도달 불가일 때 쓴다.
+        allocate() 가 슬롯을 캐시하고 점유로 선점하므로, 그 둘을 같이
+        되돌리지 않으면 옛 칸이 영영 잠긴 채로 남는다.
+        """
+        v = self.vehicles.get(track_id)
+        if v is None:
+            raise KeyError(f"unknown track_id: {track_id}")
+        if v.assigned_slot is not None and v.assigned_slot != slot_name:
+            self.set_slot_occupied(v.assigned_slot, False)
+        v.assigned_slot = slot_name
+        v.route = list(SLOT_ROUTES[slot_name])
+        self.set_slot_occupied(slot_name, True)
+
     # ─── RL 연동 ─────────────────────────────────────────────────────────────
 
     def allocate(self, track_id: int) -> str | None:

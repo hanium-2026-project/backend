@@ -170,9 +170,14 @@ class PoseWaypointController:
         steering_derr = -derr if reverse else derr
 
         # ---- 정상 주행: steering / throttle --------------------------------
-        logical_steer, wire_steer = self._steering(steering_err_rad, steering_derr)
+        if reverse and getattr(cfg, "reverse_straight_steering", False):
+            # 11자 후진 — 곧게 물러난다 (config 주석 참조)
+            logical_steer, wire_steer = 0.0, 0.0
+        else:
+            logical_steer, wire_steer = self._steering(steering_err_rad, steering_derr)
         throttle_mag = self._throttle(
-            waypoint, distance_cm, err_deg, reverse=reverse
+            waypoint, distance_cm, err_deg, reverse=reverse,
+            wire_steering=wire_steer,
         )
         throttle = -throttle_mag if reverse else throttle_mag
         mode = ControlMode.DRIVE if abs(throttle) > 0.0 else ControlMode.BRAKE
@@ -213,6 +218,7 @@ class PoseWaypointController:
         err_deg: float,
         *,
         reverse: bool = False,
+        wire_steering: float = 0.0,
     ) -> float:
         """보수적 정규화 throttle 스케줄.
 
@@ -250,6 +256,15 @@ class PoseWaypointController:
             0.0,
             cfg.throttle_limit(waypoint.phase, reverse=reverse),
         )
+
+        # 최대 조향 정지 마찰 극복 (config 주석 참조).
+        # 상한 clamp **뒤에** 적용한다 — max_throttle 은 속도 상한이고, 최대
+        # 조향에서는 duty 를 올려도 차가 기어가듯 움직이기 때문이다.
+        floor = getattr(cfg, "strong_turn_min_throttle", None)
+        if (floor is not None
+                and abs(wire_steering) >= getattr(cfg, "strong_turn_steering", 0.5)):
+            throttle = max(throttle, float(floor))
+
         return round(throttle, 4)
 
     def _needs_alignment(self, waypoint: Waypoint, heading_deg: float) -> bool:

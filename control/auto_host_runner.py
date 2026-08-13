@@ -233,6 +233,21 @@ class AutoHostRunner:
         return self.mission.current_target()
 
     @property
+    def failed_target(self):
+        """REPLAN_REQUIRED 를 일으킨 target.
+
+        `current_target` 은 RUNNING 이 아니면 None 을 돌려주므로 재계획
+        시점에는 쓸 수 없다. 실패한 target 은 미션이 복귀용 snapshot 의
+        맨 앞에 보존해 두는데 공개 접근자가 없어 직접 읽는다.
+        """
+        resume = getattr(self.mission, "_resume_waypoints", None)
+        return resume[0] if resume else None
+
+    @property
+    def replan_reason(self) -> str | None:
+        return self.mission.replan_reason
+
+    @property
     def current_phase(self):
         return self.mission.current_phase
 
