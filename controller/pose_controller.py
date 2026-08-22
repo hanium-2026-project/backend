@@ -34,12 +34,16 @@ class PoseWaypointController:
         self._prev_err_rad: Optional[float] = None
         self._prev_time: Optional[float] = None
         self._motion_direction: Optional[MotionDirection] = None
+        self._align_capture_key: tuple[object, ...] | None = None
+        self._align_in_tolerance_timestamp: float | None = None
 
     # ------------------------------------------------------------------ public
     def reset(self) -> None:
         """mode 전환/재접속용 전체 제어상태 초기화."""
         self._reset_derivative()
         self._motion_direction = None
+        self._align_capture_key = None
+        self._align_in_tolerance_timestamp = None
 
     def _reset_derivative(self) -> None:
         """PD 미분 이력만 초기화하고 구동 방향 latch는 보존한다."""
@@ -110,21 +114,38 @@ class PoseWaypointController:
             phase = (waypoint.phase or "").upper()
             if phase not in cfg.reverse_allowed_phases:
                 return self._halt(distance_cm, 0.0, bearing, "REVERSE_PHASE_NOT_ALLOWED")
+            # 궤적 기반 heading 은 후진에서 180° 뒤집힌다. 그 값으로 조향하면
+            # 정확히 반대로 꺾으므로, 신뢰 가능한 heading 이 올 때까지 멈춘다.
+            if cfg.reverse_heading_unsafe(waypoint.phase, pose.heading_source,
+                                          reverse=True):
+                return self._halt(distance_cm, 0.0, bearing,
+                                  "REVERSE_HEADING_UNSAFE")
 
         # 후진에서는 실제 이동방향이 body heading + 180°.
         motion_heading = geo.wrap180(heading + (180.0 if reverse else 0.0))
-        err_deg = geo.heading_error_deg(bearing, motion_heading)
+        # A curved segment must follow its planned circle, not continuously aim
+        # at the segment endpoint.  Endpoint bearing is the chord direction; on
+        # a finite arc it differs from the local tangent by half the remaining
+        # sweep and can therefore cancel (or amplify) the curvature feedforward.
+        guidance_heading = bearing
+        if waypoint.curvature and waypoint.target_heading_deg is not None:
+            guidance_heading = self._arc_guidance_heading(
+                pose, waypoint, reverse=reverse)
+        err_deg = geo.heading_error_deg(guidance_heading, motion_heading)
         err_rad = math.radians(err_deg)
 
         if not allow_drive:
             return self._halt(distance_cm, err_deg, bearing, "DRIVE_NOT_ALLOWED")
 
         # ---- 도착/정렬 판정 ------------------------------------------------
+        settled_alignment = self._settled_alignment_capture(
+            pose, waypoint, distance_cm=distance_cm)
         arrival_radius = cfg.arrival_radius_cm(
             waypoint.position_tolerance_cm, waypoint.phase
         )
         if distance_cm <= arrival_radius:
-            if self._needs_alignment(waypoint, heading):
+            needs_alignment = self._needs_alignment(waypoint, heading)
+            if needs_alignment and not settled_alignment:
                 head_err = geo.wrap180((waypoint.target_heading_deg or 0.0) - heading)
                 # 전진 전용 1차 controller 는 제자리 회전을 하지 않는다.
                 # 위치는 도착했으니 정지하고 heading 오차만 보고 (정렬 기동은 향후 과제).
@@ -147,9 +168,39 @@ class PoseWaypointController:
                 mode=ControlMode.ARRIVED,
                 arrived=True,
                 distance_error_cm=distance_cm,
-                heading_error_deg=err_deg,
+                heading_error_deg=(
+                    geo.wrap180((waypoint.target_heading_deg or 0.0) - heading)
+                    if needs_alignment else err_deg),
                 target_bearing_deg=bearing,
-                reason="ARRIVED",
+                reason=("ALIGN_SETTLED_CAPTURE" if needs_alignment
+                        else "ARRIVED"),
+            )
+
+        # Curved non-terminal waypoints are samples of one continuous path.
+        # If the vehicle crosses the endpoint tangent inside the planned-circle
+        # corridor, chasing that sample backwards creates an orbit/replan loop.
+        # This is deliberately separate from (and does not enlarge) the point
+        # arrival radius; FINAL still requires the ordinary exact capture.
+        if self._arc_endpoint_captured(pose, waypoint, reverse=reverse):
+            needs_alignment = self._needs_alignment(waypoint, heading)
+            if needs_alignment and not settled_alignment:
+                head_err = geo.wrap180((waypoint.target_heading_deg or 0.0) - heading)
+                return ControlCommand(
+                    throttle=0.0, steering=0.0, mode=ControlMode.ALIGN,
+                    arrived=False, distance_error_cm=distance_cm,
+                    heading_error_deg=head_err, target_bearing_deg=bearing,
+                    reason="HEADING_OUT_OF_TOLERANCE",
+                )
+            self._reset_derivative()
+            return ControlCommand(
+                throttle=0.0, steering=0.0, mode=ControlMode.ARRIVED,
+                arrived=True, distance_error_cm=distance_cm,
+                heading_error_deg=(
+                    geo.wrap180((waypoint.target_heading_deg or 0.0) - heading)
+                    if needs_alignment else err_deg),
+                target_bearing_deg=bearing,
+                reason=("ALIGN_SETTLED_CAPTURE" if needs_alignment
+                        else "ARC_ENDPOINT_PASSED"),
             )
 
         # 전/후진 방향이 주행 중 바뀌면 한 tick zero를 넣어 DIR 급전환을 막는다.
@@ -170,11 +221,19 @@ class PoseWaypointController:
         steering_derr = -derr if reverse else derr
 
         # ---- 정상 주행: steering / throttle --------------------------------
-        if reverse and getattr(cfg, "reverse_straight_steering", False):
-            # 11자 후진 — 곧게 물러난다 (config 주석 참조)
+        if (reverse and cfg.reverse_steering_locked(waypoint.phase)
+                and not waypoint.curvature):
+            # 11자 후진 — 곧게 물러난다 (RECOVERY 전용, config 주석 참조).
+            # 곡률 0인 기존 recovery만 잠근다. setup recovery는 같은 phase를
+            # 재사용하지만 명시적 곡률이 있어 계획한 원호를 타야 한다.
             logical_steer, wire_steer = 0.0, 0.0
         else:
-            logical_steer, wire_steer = self._steering(steering_err_rad, steering_derr)
+            # 경로 곡률만큼 미리 넣고(feedforward), PD 는 오차 보정만 한다.
+            # 원호에서 "오차가 생긴 뒤에야 꺾는" 지연이 사라진다.
+            feed_fwd = cfg.feedforward_steering(waypoint.phase, waypoint.curvature,
+                                               reverse=reverse)
+            logical_steer, wire_steer = self._steering(
+                steering_err_rad, steering_derr, feedforward=feed_fwd)
         throttle_mag = self._throttle(
             waypoint, distance_cm, err_deg, reverse=reverse,
             wire_steering=wire_steer,
@@ -195,21 +254,69 @@ class PoseWaypointController:
         )
 
     # ----------------------------------------------------------------- private
-    def _steering(self, err_rad: float, derr_rad_s: float) -> tuple[float, float]:
+    def _steering(self, err_rad: float, derr_rad_s: float,
+                  *, feedforward: float = 0.0) -> tuple[float, float]:
         """(논리 steering, wire steering) 반환.
 
         논리 steering: 양수 = LEFT 요구 (heading_error > 0 과 같은 부호).
         wire steering : ESP32 실제 부호(음수 = LEFT). = wire_steering_sign * 논리.
+
+        feedforward 는 경로 곡률에서 온 기본 조향이고, PD 항이 그 위에
+        오차 보정을 얹는다. 직선 구간은 feedforward=0 이라 기존과 동일하다.
         """
         cfg = self.config
         raw = cfg.steer_kp * err_rad + cfg.steer_kd * derr_rad_s
         norm = raw / math.radians(cfg.steer_normalize_deg)
-        logical = geo.clamp(norm, -1.0, 1.0)
+        if feedforward:
+            # 곡률 추종 중에는 PD 를 보정 폭 안으로 묶는다 (config 주석 참조).
+            lim = cfg.curvature_feedback_limit
+            norm = geo.clamp(norm, -lim, lim)
+        logical = geo.clamp(feedforward + norm, -1.0, 1.0)
         wire = geo.clamp(cfg.wire_steering_sign * logical, -1.0, 1.0)
         # -0.0 정규화(로그 가독성)
         logical = round(logical, 4) or 0.0
         wire = round(wire, 4) or 0.0
         return logical, wire
+
+    @staticmethod
+    def _arc_guidance_heading(
+        pose: Pose,
+        waypoint: Waypoint,
+        *,
+        reverse: bool,
+    ) -> float:
+        """Return the motion tangent of the waypoint's planned circle.
+
+        ``waypoint.curvature`` follows the planner contract ``d(body_heading)
+        = curvature * ds`` where reverse travel has negative ``ds``.  Guidance
+        is expressed in the actual motion direction, so reverse motion uses the
+        opposite signed curvature and the body endpoint heading + 180 degrees.
+
+        The radial term is a geometry-scaled cross-track correction.  It is
+        exactly zero on the planned circle and uses ``atan(error / radius)``;
+        no new vehicle-specific gain or curvature calibration is introduced.
+        """
+        body_curvature = float(waypoint.curvature)
+        motion_curvature = -body_curvature if reverse else body_curvature
+        end_motion_heading = geo.wrap180(
+            float(waypoint.target_heading_deg) + (180.0 if reverse else 0.0))
+        heading_rad = math.radians(end_motion_heading)
+        radius = 1.0 / abs(motion_curvature)
+
+        # Signed-curvature circle centre: p + left_normal(heading) / k.
+        center_x = waypoint.x_mm - math.sin(heading_rad) / motion_curvature
+        center_y = waypoint.y_mm + math.cos(heading_rad) / motion_curvature
+        dx = pose.x_mm - center_x
+        dy = pose.y_mm - center_y
+        radial_distance = math.hypot(dx, dy)
+        radial_angle = math.degrees(math.atan2(dy, dx))
+        tangent = radial_angle + (90.0 if motion_curvature > 0.0 else -90.0)
+
+        radial_error = radial_distance - radius
+        cross_track_correction = math.degrees(math.atan2(radial_error, radius))
+        if motion_curvature < 0.0:
+            cross_track_correction = -cross_track_correction
+        return geo.wrap180(tangent + cross_track_correction)
 
     def _throttle(
         self,
@@ -260,10 +367,16 @@ class PoseWaypointController:
         # 최대 조향 정지 마찰 극복 (config 주석 참조).
         # 상한 clamp **뒤에** 적용한다 — max_throttle 은 속도 상한이고, 최대
         # 조향에서는 duty 를 올려도 차가 기어가듯 움직이기 때문이다.
-        floor = getattr(cfg, "strong_turn_min_throttle", None)
-        if (floor is not None
-                and abs(wire_steering) >= getattr(cfg, "strong_turn_steering", 0.5)):
-            throttle = max(throttle, float(floor))
+        # 단 후진 정밀 주차는 제외한다 — 거기서는 속도 상한이 우선이다.
+        floor = cfg.stiction_floor_for(waypoint.phase, reverse=reverse)
+        if floor is not None and abs(wire_steering) >= cfg.strong_turn_steering:
+            throttle = max(throttle, floor)
+
+        # 마지막 안전 clamp — 어떤 조합(정지마찰/곡률/조향포화)이 와도
+        # 후진과 정밀 주차 구간이 상한을 넘지 못하게 한다.
+        ceiling = cfg.final_throttle_ceiling(waypoint.phase, reverse=reverse)
+        if ceiling is not None:
+            throttle = min(throttle, ceiling)
 
         return round(throttle, 4)
 
@@ -272,6 +385,91 @@ class PoseWaypointController:
             return False
         head_err = geo.wrap180(waypoint.target_heading_deg - heading_deg)
         return abs(head_err) > waypoint.heading_tolerance_deg
+
+    def _settled_alignment_capture(
+        self,
+        pose: Pose,
+        waypoint: Waypoint,
+        *,
+        distance_cm: float,
+    ) -> bool:
+        """Accept only a small subsequent ALIGN endpoint overshoot.
+
+        This is state/geometry hysteresis, not a larger one-shot tolerance.
+        Evidence is remembered only in the endpoint corridor and only for the
+        same route waypoint.  Repeated controller ticks carrying the same
+        camera timestamp do not count as a prior convergence.
+        """
+        phase = (waypoint.phase or "").upper()
+        corridor_cm = waypoint.path_capture_tolerance_cm
+        eligible = bool(
+            phase == "ALIGN"
+            and waypoint.heading_required
+            and waypoint.target_heading_deg is not None
+            and waypoint.curvature
+            and not waypoint.is_final
+            and corridor_cm is not None
+            and corridor_cm > 0.0
+        )
+        key = (
+            waypoint.route_id, waypoint.waypoint_id,
+            waypoint.x_mm, waypoint.y_mm, waypoint.target_heading_deg,
+        )
+        if key != self._align_capture_key:
+            self._align_capture_key = key
+            self._align_in_tolerance_timestamp = None
+        if not eligible:
+            return False
+
+        error = abs(geo.wrap180(
+            float(waypoint.target_heading_deg) - float(pose.heading_deg)))
+        previous_timestamp = self._align_in_tolerance_timestamp
+        settled = bool(
+            previous_timestamp is not None
+            and pose.timestamp > previous_timestamp
+            and error <= (waypoint.heading_tolerance_deg
+                          + self.config.align_settled_hysteresis_deg)
+        )
+        if (distance_cm <= float(corridor_cm)
+                and error <= waypoint.heading_tolerance_deg):
+            self._align_in_tolerance_timestamp = pose.timestamp
+        return settled
+
+    @staticmethod
+    def _arc_endpoint_captured(
+        pose: Pose,
+        waypoint: Waypoint,
+        *,
+        reverse: bool,
+    ) -> bool:
+        """Whether a non-final arc sample was safely crossed in its corridor."""
+        tolerance_cm = waypoint.path_capture_tolerance_cm
+        if (tolerance_cm is None or tolerance_cm <= 0.0 or waypoint.is_final
+                or not waypoint.curvature
+                or waypoint.target_heading_deg is None):
+            return False
+
+        motion_curvature = (-waypoint.curvature if reverse
+                            else waypoint.curvature)
+        end_motion_heading = geo.wrap180(
+            waypoint.target_heading_deg + (180.0 if reverse else 0.0))
+        heading_rad = math.radians(end_motion_heading)
+
+        # Positive means the current position has crossed the endpoint tangent
+        # in the segment's intended physical motion direction.
+        progress_mm = (
+            (pose.x_mm - waypoint.x_mm) * math.cos(heading_rad)
+            + (pose.y_mm - waypoint.y_mm) * math.sin(heading_rad)
+        )
+        if progress_mm < 0.0:
+            return False
+
+        center_x = waypoint.x_mm - math.sin(heading_rad) / motion_curvature
+        center_y = waypoint.y_mm + math.cos(heading_rad) / motion_curvature
+        radius_mm = 1.0 / abs(motion_curvature)
+        radial_error_mm = abs(
+            math.hypot(pose.x_mm - center_x, pose.y_mm - center_y) - radius_mm)
+        return radial_error_mm <= tolerance_cm * 10.0
 
     def _derivative(self, err_rad: float, now: float) -> float:
         prev_err, prev_t = self._prev_err_rad, self._prev_time

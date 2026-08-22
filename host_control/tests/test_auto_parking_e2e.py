@@ -52,6 +52,7 @@ def finish_from_approach(tc, host, mission, t, *, expect_direction_interlock=Fal
     t+=.1; tc.assertGreater(host.tick(t,observation=p(-40,0,0,t)).command.throttle,0)
     t+=.1; tc.assertEqual(host.tick(t,observation=p(100,0,0,t)).command.throttle,0); tc.assertEqual(mission.current_phase,"ENTRY")
     t+=.1; r=host.tick(t,observation=p(100,0,0,t)); tc.assertEqual(r.command.reason,"DIRECTION_CHANGE_STOP")
+    no_new_frame=host.tick(t+.03); tc.assertEqual(no_new_frame.command.throttle,0.0); tc.assertEqual(no_new_frame.command.reason,"NO_POSE")
     t+=.1; tc.assertLess(host.tick(t,observation=p(100,0,0,t)).command.throttle,0)
     t+=.1; tc.assertEqual(host.tick(t,observation=p(0,0,0,t)).command.throttle,0); tc.assertEqual(mission.current_phase,"FINAL")
     t+=.1; tc.assertLess(host.tick(t,observation=p(0,0,0,t)).command.throttle,0)

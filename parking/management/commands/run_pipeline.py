@@ -17,7 +17,7 @@ import os
 
 from pathlib import Path
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 
 from control import VehicleLimits
 from controller.config import ControllerConfig
@@ -59,10 +59,24 @@ class Command(BaseCommand):
                             help="수동 계측 모드: 슬롯 배정·자동 주행을 하지 않고 "
                                  "WASD 창으로 직접 몬다. 카메라 pose 는 계속 "
                                  "기록되므로 선회 반경·속도 실측에 쓴다")
+        parser.add_argument("--parking-mode", choices=["handoff", "rear"],
+                            default="handoff",
+                            help="handoff=슬롯 앞 인계(08-12 실차 성공), "
+                                 "rear=후진 슬롯 진입 (현재 B1 만 검증)")
         parser.add_argument("--turn-radius", type=float, default=None, metavar="CM",
                             help="경로 계획에 쓸 최소 선회 반경(cm). 기본 61 (실측). "
                                  "왼쪽 아래에서 우회전 진입을 시험하려면 낮춰 잡는다 "
                                  "— 차가 실제로 못 도는 반경을 주면 원호 바깥으로 밀린다")
+        parser.add_argument("--steer-normalize", type=float, default=None,
+                            metavar="DEG",
+                            help="이 heading 오차에서 조향이 포화된다 (기본 30). "
+                                 "값을 낮추면 같은 오차에 더 크게 꺾는다 — 최소 "
+                                 "선회반경 원호를 추종하려면 필요하다")
+        parser.add_argument("--parking-throttle", type=float, default=None,
+                            metavar="V",
+                            help="APPROACH/ALIGN/ENTRY/FINAL 구간 throttle 상한 "
+                                 "(기본 0.25). --max-throttle 은 이 구간에 "
+                                 "영향을 주지 못한다")
         parser.add_argument("--strong-turn-throttle", type=float, default=None,
                             metavar="V",
                             help="최대 조향(|steering|>0.5)에서 쓸 throttle 하한. "
@@ -84,6 +98,11 @@ class Command(BaseCommand):
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         )
+        if (options["parking_mode"] == "rear"
+                and options["control_mode"] != "auto-host"):
+            raise CommandError(
+                "rear production parking requires --control-mode auto-host "
+                "(REMOTE_DIRECT); WAYPOINT_AUTO is not permitted")
         camera: int | str = options["camera"]
         if isinstance(camera, str) and camera.isdigit():
             camera = int(camera)
@@ -124,6 +143,13 @@ class Command(BaseCommand):
                 "strong_turn_min_throttle": (
                     None if options["strong_turn_throttle"] <= 0
                     else options["strong_turn_throttle"])}),
+            **({} if options["steer_normalize"] is None else {
+                "steer_normalize_deg": options["steer_normalize"]}),
+            # 주차 구간 상한은 전진/후진 두 값이 같이 움직여야 의미가 있다 —
+            # 둘 중 작은 쪽이 이기므로 하나만 올리면 효과가 없다.
+            **({} if options["parking_throttle"] is None else {
+                "parking_max_throttle": options["parking_throttle"],
+                "reverse_max_throttle": options["parking_throttle"]}),
             **{k: v for k, v in (
                 ("max_throttle", options["max_throttle"]),
                 ("wire_steering_sign", options["steering_sign"]),
@@ -166,6 +192,7 @@ class Command(BaseCommand):
             lot_height_mm=lot_h,
             control_mode=options["control_mode"],
             direct_control=direct_control,
+            parking_mode=options["parking_mode"],
             plan_turn_radius_mm=(None if options["turn_radius"] is None
                                  else options["turn_radius"] * 10.0),
             vehicle_limits=limits,
@@ -246,6 +273,7 @@ class Command(BaseCommand):
             options["record"], pipeline.server, car_id=1,
             pose_provider=lambda: pipeline.last_pose_rec,
             runner_provider=lambda: next(iter(pipeline.auto_hosts.values()), None),
+            lifecycle_provider=lambda: pipeline.lifecycle_snapshot(1),
             control_period_s=pipeline.config.auto_host_period_s,
             params={
                 "entrypoint": "manage.py run_pipeline",
@@ -270,6 +298,7 @@ class Command(BaseCommand):
             },
         )
         pipeline.on_pose_record = recorder.log_pose
+        pipeline.on_event_record = recorder.event
         pipeline.on_route_load = lambda wps, rec: recorder.write_route(wps, recovery=rec)
         recorder.start()
         self.stdout.write(f"Run 기록: {recorder.dir}")

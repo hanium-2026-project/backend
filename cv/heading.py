@@ -24,6 +24,9 @@ from dataclasses import dataclass
 MIN_MOVE_DISTANCE: float = 3.0
 # heading 계산에 사용할 궤적 창 크기 (프레임 수)
 TRAJECTORY_WINDOW: int = 5
+MAX_HEADING_JUMP_DEG: float = 45.0
+FRONT_JUMP_CONFIRM_DEG: float = 15.0
+FRONT_JUMP_CONFIRM_FRAMES: int = 2
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,43 @@ class HeadingEstimator:
         self.min_move = min_move
         self._history: dict[int, deque[tuple[float, float]]] = {}
         self._last_valid: dict[int, float] = {}
+        self._last_source: dict[int, str] = {}
+        # A single bad cushion association must not poison a track forever.
+        # Large FRONT_CUSHION corrections are accepted after two mutually
+        # consistent current-frame observations.
+        self._pending_front_jump: dict[int, tuple[float, int]] = {}
+
+    @staticmethod
+    def _delta(a: float, b: float) -> float:
+        return abs((a - b + 180.0) % 360.0 - 180.0)
+
+    def _accept(self, track_id: int, heading: float, source: str,
+                moving: bool) -> HeadingResult:
+        previous = self._last_valid.get(track_id)
+        previous_source = self._last_source.get(track_id)
+        if (previous is not None
+                and not (source == "FRONT_CUSHION"
+                         and previous_source == "TRAJECTORY")
+                and self._delta(heading, previous) > MAX_HEADING_JUMP_DEG):
+            if source == "FRONT_CUSHION":
+                pending, count = self._pending_front_jump.get(
+                    track_id, (heading, 0))
+                if self._delta(heading, pending) <= FRONT_JUMP_CONFIRM_DEG:
+                    count += 1
+                else:
+                    pending, count = heading, 1
+                if count < FRONT_JUMP_CONFIRM_FRAMES:
+                    self._pending_front_jump[track_id] = (pending, count)
+                    return HeadingResult(previous, "LAST_VALID", is_moving=moving)
+                self._pending_front_jump.pop(track_id, None)
+            else:
+                self._pending_front_jump.pop(track_id, None)
+                return HeadingResult(previous, "LAST_VALID", is_moving=moving)
+        else:
+            self._pending_front_jump.pop(track_id, None)
+        self._last_valid[track_id] = heading
+        self._last_source[track_id] = source
+        return HeadingResult(heading, source, is_moving=moving)
 
     def update(self, track_id: int, position: tuple[float, float],
                front_point: tuple[float, float] | None = None) -> HeadingResult:
@@ -73,9 +113,8 @@ class HeadingEstimator:
             dy = front_point[1] - position[1]
             if math.hypot(dx, dy) >= 1e-6:
                 heading = math.degrees(math.atan2(dy, dx)) % 360.0
-                self._last_valid[track_id] = heading
                 moving = self._is_moving(hist)
-                return HeadingResult(heading, "FRONT_CUSHION", is_moving=moving)
+                return self._accept(track_id, heading, "FRONT_CUSHION", moving)
 
         if len(hist) >= 2:
             x0, y0 = hist[0]
@@ -84,8 +123,7 @@ class HeadingEstimator:
             if math.hypot(dx, dy) >= self.min_move:
                 # 맵 좌표계 +y=위 기준 반시계 각도 (오른쪽 0°, 위 90°)
                 heading = math.degrees(math.atan2(dy, dx)) % 360.0
-                self._last_valid[track_id] = heading
-                return HeadingResult(heading, "TRAJECTORY", is_moving=True)
+                return self._accept(track_id, heading, "TRAJECTORY", True)
 
         if track_id in self._last_valid:
             return HeadingResult(self._last_valid[track_id], "LAST_VALID", is_moving=False)
@@ -103,3 +141,5 @@ class HeadingEstimator:
         """추적 종료된 차량의 이력 제거."""
         self._history.pop(track_id, None)
         self._last_valid.pop(track_id, None)
+        self._last_source.pop(track_id, None)
+        self._pending_front_jump.pop(track_id, None)

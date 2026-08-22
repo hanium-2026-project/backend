@@ -79,9 +79,11 @@ class HybridControlMux:
         y_mm: float,
         heading_deg: float,
         obs_time: float,
+        heading_source: str | None = None,
     ) -> None:
         # Always keep the pose source current, including while in MANUAL.
-        self.runner.on_camera_pose(x_mm, y_mm, heading_deg, obs_time)
+        self.runner.on_camera_pose(x_mm, y_mm, heading_deg, obs_time,
+                                   heading_source)
 
         # AUTO resume is deliberately gated by a genuinely new CV observation.
         if self.mode == "AUTO_PENDING":
@@ -151,6 +153,13 @@ class HybridControlMux:
         if self.mode in ("AUTO_HOST", "AUTO_PENDING"):
             return
 
+        if self.mode == "COMM_RECOVERY_HOLD":
+            self._send_zero_now()
+            self._safe_disarm()
+            self.host.arm_auto()
+            self.mode = "AUTO_PENDING"
+            return
+
         neutral = ManualInput(0.0, 0.0)
         with self._lock:
             self._manual = neutral
@@ -166,6 +175,14 @@ class HybridControlMux:
         # IMPORTANT: do not start scheduler here.
         # Starting before a new camera frame can latch STALE_POSE -> FAULTED.
         self.mode = "AUTO_PENDING"
+
+    def hold_for_comm_recovery(self, reason: str = "COMM_TIMEOUT") -> None:
+        """Stop both owners and latch authority until a fresh route is loaded."""
+        self._stop_manual_loop()
+        self.runner.scheduler.stop()
+        self._send_zero_now()
+        self.host.fault(reason)
+        self.mode = "COMM_RECOVERY_HOLD"
 
     def stop(self) -> None:
         if self.mode == "MANUAL_WASD":

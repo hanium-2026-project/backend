@@ -110,6 +110,15 @@ class Waypoint:
     # "FORWARD" | "REVERSE". 후진은 복구 경로에서만 쓴다 — 제어기가
     # ControllerConfig.reverse_allowed_phases 로 한 번 더 막는다.
     motion_direction: str = "FORWARD"
+    # 이 waypoint 로 향하는 경로 구간의 곡률 (1/mm, + = 좌회전, 0 = 직선).
+    #   dθ = curvature × ds  (ds = 차체 heading 방향 부호 있는 이동량)
+    # 제어기가 steering feedforward 를 만드는 데 쓴다. 직선 구간은 0 이라
+    # 기존 경로(발렛 인계)는 값이 그대로 0 이고 동작이 바뀌지 않는다.
+    curvature: float = 0.0
+    # 곡선 중간 waypoint의 endpoint tangent를 통과했을 때 허용할 원호
+    # corridor(cm). 점 허용오차를 키우지 않고, 이미 지난 표본점 재획득만 막는다.
+    # production wire에는 필요 없는 host-only metadata다.
+    path_capture_tolerance_cm: float | None = None
 
     def to_wire(self) -> dict[str, Any]:
         """TCP 전송용 dict — 좌표는 cm 로 변환.
@@ -127,6 +136,7 @@ class Waypoint:
         )
         d.setdefault("arrival_mode", "STOP")
         del d["x"], d["y"]
+        d.pop("path_capture_tolerance_cm", None)
         return d
 
 
@@ -151,19 +161,31 @@ def default_slot_specs() -> dict[str, SlotSpec]:
 
 def _make(route_id: int, wp_id: int, phase: str, x: float, y: float,
           heading: float | None, *, is_final: bool = False,
+          heading_required: bool | None = None,
           capture_tolerance_cm: float | None = None,
-          motion_direction: str = "FORWARD") -> Waypoint:
+          motion_direction: str = "FORWARD",
+          curvature: float = 0.0,
+          path_capture_tolerance_cm: float | None = None,
+          position_tolerance_cm: float | None = None,
+          heading_tolerance_deg: float | None = None) -> Waypoint:
     p = PHASE_DEFAULTS[phase]
     return Waypoint(
         route_id=route_id, waypoint_id=wp_id, phase=phase,
         x=x, y=y, target_heading_deg=heading,
         speed_cm_s=p["speed_cm_s"],
-        position_tolerance_cm=p["position_tolerance_cm"],
-        heading_tolerance_deg=p["heading_tolerance_deg"],
-        heading_required=heading is not None,
+        position_tolerance_cm=(p["position_tolerance_cm"]
+                               if position_tolerance_cm is None
+                               else position_tolerance_cm),
+        heading_tolerance_deg=(p["heading_tolerance_deg"]
+                               if heading_tolerance_deg is None
+                               else heading_tolerance_deg),
+        heading_required=(heading is not None
+                          if heading_required is None else heading_required),
         is_final=is_final,
         capture_tolerance_cm=capture_tolerance_cm,
         motion_direction=motion_direction,
+        curvature=curvature,
+        path_capture_tolerance_cm=path_capture_tolerance_cm,
     )
 
 
@@ -538,6 +560,945 @@ def build_waypoints(
         else:
             add("CRUISE", x, y, None)
 
+    return wps
+
+
+# ─── 후면주차 (REVERSE_START → ENTRY → FINAL) ────────────────────────────────
+#
+# 발렛 인계 모델(build_waypoints)과 달리 **슬롯 안까지 후진으로 넣는다.**
+# ESP32 에 새 명령이나 FSM 을 만들지 않는다 — AUTO_HOST 를 유지하고
+# waypoint 의 phase + motion_direction 으로만 표현한다.
+#
+#   CRUISE(통로 직진) → APPROACH(감속) → ALIGN(전진 setup 원호, 마지막이
+#   REVERSE_START) → ENTRY(후진 원호) → FINAL(슬롯 중심, 후진)
+#
+# 후보는 접근 side(LEFT/RIGHT) × 후진 원호각 φ 의 조합이다. φ 를 고정하지
+# 않는 이유: 90° 로 못박으면 REVERSE_START 가 슬롯 중심에서 (R,R) 떨어져
+# 가운데 슬롯이 맵 밖으로 나간다. φ 를 가변으로 두면 y offset 이 줄어든다.
+
+# 후진 원호를 몇 도 간격으로 샘플링할지. 시작/끝 두 점만 주면 host 가 원호를
+# 모르고 직선으로 잘라 들어간다.
+REAR_ARC_STEP_DEG: float = 12.0
+# REVERSE_START 전용 허용오차. 후진 원호 전체가 이 자세를 기준으로 하므로
+# 일반 waypoint 처럼 5cm/12° 를 주면 원호가 통째로 어긋난 채 시작된다.
+#
+# 값 선택 근거 (closed-loop 스윕): 너무 좁으면(2cm) 차가 도착 판정을 못 받고
+# 그 점을 지나쳐 계속 달려 경로를 벗어난다. 너무 넓으면(>=8°) 어긋난 자세로
+# 후진 원호에 들어가 되잡지 못한다. 4cm/5° 가 "못 맞추면 그 자리에 선다"는
+# 안전한 실패로 떨어지는 구간이다.
+REVERSE_START_TOLERANCE_CM: float = 4.0
+REVERSE_START_HEADING_TOLERANCE_DEG: float = 5.0
+# 현재 자세에서 곧바로 후진 원호에 올라탈 때 허용할 **반경 방향** 오차.
+# 원호상 위치(φ)는 자유롭게 고르므로 여기서 보는 것은 "원에서 얼마나
+# 벗어나 있나"뿐이다. 실차 도착 정확도(9~11cm)와 같은 눈금.
+REAR_ENTRY_CAPTURE_MM: float = 100.0
+# 그 지점 접선 대비 heading 오차 허용치. PD + 곡률 feedforward 가 흡수할
+# 수 있는 범위여야 한다.
+REAR_ENTRY_HEADING_TOLERANCE_DEG: float = 15.0
+# ─ candidate planner (현재 자세 기반) ─
+# 계획 반경 후보. 실측 최소 610mm 보다 커야 추종 여유가 생긴다 — 610 으로
+# 계획하면 원호 내내 최대 조향이라 오차를 되잡을 여력이 0 이다.
+# 2026-08-14 실차 표(PROVISIONAL) 기준으로 현실화:
+#   |steering| 0.90 에서 실측 반경이 LEFT 780 / RIGHT 680mm 였다.
+#   따라서 700mm 로 계획하면 원호 내내 사실상 최대 조향이라 보정 여력이 0 이다.
+#   추종 여유를 두려면 |steering| 0.7 대(=800~970mm) 이상에서 계획해야 한다.
+REAR_RADIUS_CANDIDATES: tuple[float, ...] = (800.0, 900.0, 1000.0, 1100.0)
+# setup 시작점이 현재 진행선에서 벗어나도 되는 양 / 최소 직진 거리.
+# 차는 옆으로 못 가므로, 이 안이어야 달리면서 흡수할 수 있다.
+REAR_LATERAL_TOLERANCE_MM: float = 80.0
+REAR_MIN_RUN_MM: float = 60.0
+# 경로가 이보다 길면 슬롯 하나 대는 데 과하다고 본다.
+REAR_MAX_PATH_MM: float = 2500.0
+# 후진 원호로 인정할 φ 범위. 너무 작으면 슬롯 축과 거의 나란해 의미가 없고,
+# 너무 크면 원호가 맵을 벗어난다.
+REAR_ENTRY_MIN_PHI_DEG: float = 15.0
+REAR_ENTRY_MAX_PHI_DEG: float = 85.0
+# 시도할 후진 원호각 후보
+REAR_PHI_CANDIDATES: tuple[float, ...] = (30.0, 45.0, 60.0, 70.0, 80.0)
+# 차량 외형 (footprint 검사용). 04번 문서 기준 — 길이는 추정값이다.
+CAR_LENGTH_MM: float = 250.0
+CAR_WIDTH_MM: float = 150.0
+
+
+def _car_footprint(x: float, y: float, heading_deg: float
+                   ) -> list[tuple[float, float]]:
+    """차량 4모서리 좌표. 점이 아니라 면으로 맵 경계를 봐야 한다."""
+    c = math.cos(math.radians(heading_deg))
+    s = math.sin(math.radians(heading_deg))
+    return [(x + dl * CAR_LENGTH_MM * c - dw * CAR_WIDTH_MM * s,
+             y + dl * CAR_LENGTH_MM * s + dw * CAR_WIDTH_MM * c)
+            for dl, dw in ((.5, .5), (.5, -.5), (-.5, .5), (-.5, -.5))]
+
+
+def _path_clearance(path: list[tuple[float, float, float]]
+                    ) -> tuple[float, float]:
+    """(맵 밖 최대 초과 mm, 맵 경계까지 최소 여유 mm)."""
+    worst, clear = 0.0, float("inf")
+    for x, y, h in path:
+        for px, py in _car_footprint(x, y, h):
+            for v in (px, py):
+                worst = max(worst, -v, v - LOT_SIZE_MM)
+                clear = min(clear, v, LOT_SIZE_MM - v)
+    return max(worst, 0.0), clear
+
+
+def _arc_pose(x: float, y: float, heading_deg: float, sweep_deg: float,
+              turn: float, radius_mm: float) -> tuple[float, float, float]:
+    """자세 (x,y,heading) 에서 반경 radius 원호를 sweep 만큼 **전진**한 자세.
+
+    turn = +1 좌회전(heading 증가), -1 우회전. 닫힌형이라 누적 오차가 없다.
+    """
+    cdir = math.radians(heading_deg + 90.0 * turn)
+    cx = x + radius_mm * math.cos(cdir)
+    cy = y + radius_mm * math.sin(cdir)
+    a0 = math.atan2(y - cy, x - cx)
+    a = a0 + turn * math.radians(sweep_deg)
+    return (cx + radius_mm * math.cos(a), cy + radius_mm * math.sin(a),
+            (heading_deg + turn * sweep_deg) % 360.0)
+
+
+@dataclass(frozen=True)
+class RearParkingPlan:
+    """후면주차 후보 하나. 좌표는 mm, heading 은 차량 **앞** 방향."""
+
+    slot_id: str
+    side: int                                  # +1 = 통로를 +x 로 달려 접근
+    phi_deg: float                             # 후진 원호각
+    psi_deg: float                             # 전진 setup 원호각
+    aisle_heading_deg: float                   # 통로 주행 방향 (0 또는 180)
+    setup_start: tuple[float, float, float]    # CRUISE 마지막 = setup 원호 시작
+    reverse_start: tuple[float, float, float]  # ALIGN 마지막 = 후진 시작
+    align_poses: list[tuple[float, float, float]]   # setup 원호 샘플 (전진)
+    entry_poses: list[tuple[float, float, float]]   # 후진 원호 샘플 (후진)
+    final_pose: tuple[float, float, float]     # 슬롯 중심 + rear heading
+    turn_setup: float
+    turn_reverse: float
+    radius_mm: float
+    overflow_mm: float                         # 맵 밖 초과량 (0 이어야 한다)
+    clearance_mm: float                        # 맵 경계까지 최소 여유
+    aisle_offset_mm: float                     # setup 시작점의 통로 이탈량
+    feasible: bool
+    reason: str = ""
+
+
+def plan_rear_parking(slot: SlotSpec, side: int, phi_deg: float, *,
+                      aisle_y: float = AISLE_Y,
+                      min_radius_mm: float = MIN_TURN_RADIUS_MM,
+                      step_deg: float = REAR_ARC_STEP_DEG) -> RearParkingPlan:
+    """후보 하나를 만든다 (기하만 — 도달성 판단은 호출자가 한다).
+
+    ① FINAL(슬롯 중심 + rear heading)에서 후진 원호를 φ 만큼 **역산**해
+       REVERSE_START 를 구한다.
+    ② REVERSE_START 에서 통로 방향까지 전진 setup 원호를 역산해 시작점을 구한다.
+       setup 은 후진과 **반대 방향**으로 돌려야 한다 — 같은 방향이면 두 원호가
+       겹쳐서 차가 갔던 선을 그대로 되짚는 퇴화 경로가 된다.
+    """
+    rear = (slot.target_heading_deg + 180.0) % 360.0
+    aisle_h = 0.0 if side > 0 else 180.0
+
+    # 후진 원호 회전부호. 통로에서 들어오는 쪽에 REVERSE_START 가 놓이도록 정한다.
+    turn_rev = -1.0 if side > 0 else 1.0
+    if slot.entry_side == "BOTTOM":
+        turn_rev = -turn_rev
+
+    rs = _arc_pose(slot.center_x, slot.center_y, rear, phi_deg, turn_rev,
+                   min_radius_mm)
+
+    # setup 원호: 통로 heading → REVERSE_START heading
+    dh = (rs[2] - aisle_h + 180.0) % 360.0 - 180.0
+    psi = abs(dh)
+    turn_setup = 1.0 if dh > 0 else -1.0
+    # REVERSE_START 에서 psi 만큼 되돌아가면 setup 시작 자세가 나온다.
+    start = _arc_pose(rs[0], rs[1], rs[2], -psi, turn_setup, min_radius_mm)
+
+    n_align = max(1, math.ceil(psi / step_deg)) if psi > 1e-6 else 0
+    align = [_arc_pose(start[0], start[1], aisle_h, psi * i / n_align,
+                       turn_setup, min_radius_mm)
+             for i in range(1, n_align + 1)] if n_align else [rs]
+
+    n_entry = max(1, round(phi_deg / step_deg))
+    entry = [_arc_pose(slot.center_x, slot.center_y, rear,
+                       phi_deg * (n_entry + 1 - i) / (n_entry + 1), turn_rev,
+                       min_radius_mm)
+             for i in range(1, n_entry + 1)]
+
+    final_pose = (slot.center_x, slot.center_y, rear)
+    overflow, clearance = _path_clearance(align + entry + [final_pose, start])
+    aisle_offset = abs(start[1] - aisle_y)
+
+    ok, reason = True, ""
+    if overflow > 0.0:
+        ok = False
+        reason = f"경로가 맵 밖으로 {overflow:.0f}mm 나간다"
+    elif aisle_offset > ON_AISLE_TOLERANCE_MM:
+        # 통로에서 벗어난 자세로 setup 을 시작해야 하면, 거기까지 가는 경로가
+        # 또 필요하다. 좌우 벽에 붙는 경우가 많아 활주로가 안 나온다.
+        ok = False
+        reason = (f"setup 시작점이 통로에서 {aisle_offset:.0f}mm 떨어져 있다 "
+                  f"(허용 {ON_AISLE_TOLERANCE_MM:.0f}mm)")
+
+    return RearParkingPlan(
+        slot_id=slot.slot_id, side=side, phi_deg=phi_deg, psi_deg=psi,
+        aisle_heading_deg=aisle_h, setup_start=start, reverse_start=rs,
+        align_poses=align, entry_poses=entry, final_pose=final_pose,
+        turn_setup=turn_setup, turn_reverse=turn_rev, radius_mm=min_radius_mm,
+        overflow_mm=overflow, clearance_mm=clearance,
+        aisle_offset_mm=aisle_offset, feasible=ok, reason=reason)
+
+
+def choose_rear_parking_plan(slot: SlotSpec, *, aisle_y: float = AISLE_Y,
+                             min_radius_mm: float = MIN_TURN_RADIUS_MM,
+                             from_pose: tuple[float, float] | None = None,
+                             step_deg: float = REAR_ARC_STEP_DEG,
+                             ) -> tuple[RearParkingPlan | None, list[RearParkingPlan]]:
+    """모든 (side, φ) 후보 중 가장 안전한 것을 고른다.
+
+    ψ + φ 가 항상 90° 라 경로 길이와 방향전환 횟수가 전 후보 동일하다.
+    그래서 **실차 강건성**으로 고른다:
+      1순위 맵 경계 여유가 큰 것 (10mm 단위로 뭉쳐 비교)
+      2순위 후진 원호가 짧은 것 (후진 중 heading 추정이 더 어렵다)
+    from_pose 를 주면 차가 이미 있는 쪽에서 접근하는 후보를 먼저 본다.
+    """
+    cands = [plan_rear_parking(slot, side, phi, aisle_y=aisle_y,
+                               min_radius_mm=min_radius_mm, step_deg=step_deg)
+             for side in (1, -1) for phi in REAR_PHI_CANDIDATES]
+    ok = [c for c in cands if c.feasible]
+    if from_pose is not None:
+        # 차 뒤쪽에서 시작하는 후보는 지나쳐 버린 것이라 전진으로 못 잡는다.
+        ahead = [c for c in ok
+                 if (c.setup_start[0] - from_pose[0]) * c.side > 0]
+        if ahead:
+            ok = ahead
+    if not ok:
+        return None, cands
+    # 맵 여유는 FINAL 자세(슬롯 깊이 300 - 차 길이 250)가 지배해서 후보 간
+    # 변별이 거의 없다. 그래서 실제로 갈리는 값 — setup 시작점이 통로에
+    # 얼마나 가까운가 — 를 두 번째 기준으로 둔다. 차를 통로에 놓고 시작하므로
+    # 이 값이 곧 초기 배치 오차 허용량이다.
+    ok.sort(key=lambda c: (-round(c.clearance_mm / 10.0), c.aisle_offset_mm,
+                           c.phi_deg))
+    return ok[0], cands
+
+
+# ─── 주차 setup recovery ─────────────────────────────────────────────────────
+# 인계 자세에서 곧바로 후진 원호에 못 올라타는 경우가 있다. 인계는 통로와
+# 나란한데(heading 0/180) 원호 진입점은 통로에서 30~60cm 옆에 있기 때문이고,
+# 차는 옆으로 못 간다.
+#
+# 이때 옛 waypoint 를 고집하지 않는다 — **차체 각도를 만들어 주는 짧은 기동**
+# 을 넣고 fresh pose 로 다시 계획한다. 후진하며 조향하면 heading 이 바뀌므로
+# 한 segment 로 충분한 경우가 많다.
+#
+# bounded search: (반경 × 스윕각 × 회전방향) 조합만 본다. Hybrid A* 아님.
+SETUP_RECOVERY_SWEEPS_DEG: tuple[float, ...] = (10.0, 15.0, 20.0, 25.0, 30.0,
+                                                35.0, 40.0, 45.0)
+SETUP_RECOVERY_STRAIGHTS_MM: tuple[float, ...] = (100.0, 200.0, 300.0)
+SETUP_RECOVERY_MAX_MM: float = 700.0        # 기동 이동거리 상한
+SETUP_RECOVERY_MAX_SEGMENTS: int = 3
+SETUP_RECOVERY_BEAM: int = 256
+
+
+@dataclass(frozen=True)
+class SetupSegment:
+    """setup recovery를 이루는 하나의 Ackermann motion primitive."""
+
+    poses: list[tuple[float, float, float]]
+    radius_mm: float
+    sweep_deg: float
+    turn: float
+    reverse: bool
+    length_mm: float
+
+
+@dataclass(frozen=True)
+class SetupRecovery:
+    """주차 진입 자세를 만들기 위한 1~2 segment bounded 기동."""
+
+    slot_id: str
+    poses: list[tuple[float, float, float]]   # 샘플 (마지막이 목표 자세)
+    end_pose: tuple[float, float, float]
+    radius_mm: float
+    sweep_deg: float
+    turn: float
+    reverse: bool
+    length_mm: float
+    clearance_mm: float
+    feasible: bool
+    reason: str = ""
+    segments: tuple[SetupSegment, ...] = ()
+
+
+def _slot_keepout(specs: dict[str, SlotSpec], exclude: str
+                  ) -> list[tuple[float, float, float, float]]:
+    """다른 슬롯의 사각 영역 (x0,y0,x1,y1). 기동이 남의 자리를 밟지 않게 한다."""
+    out = []
+    for sid, s in specs.items():
+        if sid == exclude:
+            continue
+        out.append((s.center_x - s.width / 2, s.center_y - s.length / 2,
+                    s.center_x + s.width / 2, s.center_y + s.length / 2))
+    return out
+
+
+def plan_setup_recovery(slot: SlotSpec, from_pose: tuple[float, float],
+                        from_heading_deg: float, *,
+                        radii_mm: tuple[float, ...] = REAR_RADIUS_CANDIDATES,
+                        step_deg: float = REAR_ARC_STEP_DEG,
+                        obstacle_poses: tuple[tuple[float, float, float], ...] = (),
+                        ) -> SetupRecovery | None:
+    """현재 자세에서 주차 계획이 가능해지는 **가장 짧은** 기동을 찾는다.
+
+    각 후보 기동을 실제로 굴려 끝 자세를 구하고, 그 자세에서
+    choose_rear_candidate 가 성립하는지로 판정한다 — 기동 자체가 목적이
+    아니라 "계획 가능한 자세"를 만드는 것이 목적이다.
+    """
+    specs = default_slot_specs()
+    keepout = _slot_keepout(specs, slot.slot_id)
+    start_pose = (from_pose[0], from_pose[1], from_heading_deg)
+    initial_keepout: dict[int, float] = {}
+    for index, (x0, y0, x1, y1) in enumerate(keepout):
+        if any(x0 <= px <= x1 and y0 <= py <= y1
+               for px, py in _car_footprint(*start_pose)):
+            cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            initial_keepout[index] = math.hypot(start_pose[0] - cx,
+                                                start_pose[1] - cy)
+
+    def overlaps_vehicle(x: float, y: float, h: float,
+                         obstacle: tuple[float, float, float]) -> bool:
+        """Return whether two oriented physical footprints overlap (SAT)."""
+        ca = _car_footprint(x, y, h)
+        cb = _car_footprint(*obstacle)
+        a = [ca[i] for i in (0, 1, 3, 2)]
+        b = [cb[i] for i in (0, 1, 3, 2)]
+        axes = []
+        for poly in (a, b):
+            for i in (0, 1):
+                dx = poly[i + 1][0] - poly[0][0]
+                dy = poly[i + 1][1] - poly[0][1]
+                norm = math.hypot(dx, dy)
+                axes.append((-dy / norm, dx / norm))
+        for ax, ay in axes:
+            pa = [px * ax + py * ay for px, py in a]
+            pb = [px * ax + py * ay for px, py in b]
+            if max(pa) < min(pb) or max(pb) < min(pa):
+                return False
+        return True
+
+    def blocked(poses) -> tuple[float, str]:
+        overflow, clearance = _path_clearance(poses)
+        if overflow > 0.0:
+            return clearance, f"맵 밖 {overflow:.0f}mm"
+        for x, y, h in poses:
+            if any(overlaps_vehicle(x, y, h, obstacle)
+                   for obstacle in obstacle_poses):
+                return clearance, "obstacle footprint"
+            for px, py in _car_footprint(x, y, h):
+                for index, (x0, y0, x1, y1) in enumerate(keepout):
+                    if x0 <= px <= x1 and y0 <= py <= y1:
+                        # 실차가 이미 빈 인접 슬롯 경계에 걸친 상태라면 탈출은
+                        # 허용하되, 해당 슬롯 중심 쪽으로 더 깊어지는 기동은 금지한다.
+                        if index in initial_keepout:
+                            cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+                            if math.hypot(x - cx, y - cy) + 1e-6 \
+                                    >= initial_keepout[index]:
+                                continue
+                        return clearance, "다른 슬롯 침범"
+        return clearance, ""
+
+    def primitives(start: tuple[float, float, float]):
+        for reverse in (True, False):      # 통로에서는 후진 후보를 먼저 본다
+            sign = -1.0 if reverse else 1.0
+            heading = math.radians(start[2])
+            for distance in SETUP_RECOVERY_STRAIGHTS_MM:
+                n = max(2, math.ceil(distance / 50.0))
+                poses = [(start[0] + sign * distance * i / n * math.cos(heading),
+                          start[1] + sign * distance * i / n * math.sin(heading),
+                          start[2]) for i in range(n + 1)]
+                yield SetupSegment(poses, float("inf"), 0.0, 0.0, reverse,
+                                   distance)
+            for radius in radii_mm:
+                for turn in (1.0, -1.0):
+                    for sweep in SETUP_RECOVERY_SWEEPS_DEG:
+                        length = math.radians(sweep) * radius
+                        if length > SETUP_RECOVERY_MAX_MM:
+                            continue
+                        signed = -sweep if reverse else sweep
+                        n = max(2, math.ceil(sweep / step_deg))
+                        poses = [_arc_pose(start[0], start[1], start[2],
+                                           signed * i / n, turn, radius)
+                                 for i in range(n + 1)]
+                        yield SetupSegment(poses, radius, sweep, turn, reverse,
+                                           length)
+
+    best: SetupRecovery | None = None
+
+    def consider(segments: tuple[SetupSegment, ...]) -> None:
+        nonlocal best
+        length = sum(s.length_mm for s in segments)
+        if length > SETUP_RECOVERY_MAX_MM:
+            return
+        if best is not None and length >= best.length_mm:
+            return
+        poses = list(segments[0].poses)
+        for seg in segments[1:]:
+            poses.extend(seg.poses[1:])
+        clearance, why = blocked(poses)
+        if why:
+            return
+        end = poses[-1]
+        cand, _ = choose_rear_candidate(slot, end[:2], end[2],
+                                        radii_mm=radii_mm, step_deg=step_deg)
+        if cand is None:
+            return
+        first = segments[0]
+        best = SetupRecovery(
+            slot_id=slot.slot_id, poses=poses, end_pose=end,
+            radius_mm=first.radius_mm, sweep_deg=first.sweep_deg,
+            turn=first.turn, reverse=first.reverse, length_mm=length,
+            clearance_mm=clearance, feasible=True, segments=segments)
+
+    # 1~3 segment bounded beam search. 각 terminal pose에서 기존 rear planner를
+    # 그대로 호출해 성공하는 pose만 goal로 인정한다.
+    start = start_pose
+    frontier: list[tuple[SetupSegment, ...]] = [()]
+    for _depth in range(SETUP_RECOVERY_MAX_SEGMENTS):
+        next_by_cell: dict[tuple[int, int, int, bool, int],
+                           tuple[float, tuple[SetupSegment, ...]]] = {}
+        for prefix in frontier:
+            terminal = start if not prefix else prefix[-1].poses[-1]
+            used = sum(s.length_mm for s in prefix)
+            for segment in primitives(terminal):
+                if used + segment.length_mm > SETUP_RECOVERY_MAX_MM:
+                    continue
+                if prefix:
+                    prev = prefix[-1]
+                    if (segment.reverse == prev.reverse
+                            and segment.turn == prev.turn
+                            and segment.radius_mm == prev.radius_mm):
+                        continue
+                candidate = (*prefix, segment)
+                consider(candidate)
+                end = segment.poses[-1]
+                clearance, why = blocked(segment.poses)
+                if why:
+                    continue
+                key = (round(end[0] / 50.0), round(end[1] / 50.0),
+                       round((end[2] % 360.0) / 10.0), segment.reverse,
+                       int(math.copysign(1, segment.turn)) if segment.turn else 0)
+                score = (math.hypot(end[0] - slot.center_x,
+                                    end[1] - AISLE_Y)
+                         + 0.15 * (used + segment.length_mm)
+                         - 0.05 * clearance)
+                old = next_by_cell.get(key)
+                if old is None or score < old[0]:
+                    next_by_cell[key] = (score, candidate)
+        if best is not None:
+            break
+        frontier = [item[1] for item in sorted(next_by_cell.values(),
+                                                key=lambda item: item[0])
+                    [:SETUP_RECOVERY_BEAM]]
+    return best
+
+
+def build_setup_recovery_waypoints(slot: SlotSpec, route_id: int, *,
+                                   from_pose: tuple[float, float],
+                                   from_heading_deg: float,
+                                   radii_mm: tuple[float, ...] = REAR_RADIUS_CANDIDATES,
+                                   obstacle_poses: tuple[tuple[float, float, float], ...] = (),
+                                   ) -> list[Waypoint]:
+    """setup recovery 기동을 waypoint 로. 없으면 빈 목록."""
+    rec = plan_setup_recovery(slot, from_pose, from_heading_deg,
+                              radii_mm=radii_mm,
+                              obstacle_poses=obstacle_poses)
+    if rec is None:
+        return []
+    phase = "RECOVERY"
+    wps: list[Waypoint] = []
+    segments = rec.segments or (
+        SetupSegment(rec.poses, rec.radius_mm, rec.sweep_deg, rec.turn,
+                     rec.reverse, rec.length_mm),)
+    wp_id = 1
+    for seg_idx, seg in enumerate(segments):
+        direction = "REVERSE" if seg.reverse else "FORWARD"
+        k = 0.0 if math.isinf(seg.radius_mm) else seg.turn / seg.radius_mm
+        for pose_idx, (x, y, h) in enumerate(seg.poses[1:], start=1):
+            last = (seg_idx == len(segments) - 1
+                    and pose_idx == len(seg.poses) - 1)
+            wps.append(_make(route_id, wp_id, phase, x, y, h,
+                             heading_required=last,
+                             motion_direction=direction, curvature=k,
+                             path_capture_tolerance_cm=(
+                                 REAR_ENTRY_CAPTURE_MM / 10.0 if k else None)))
+            wp_id += 1
+    return wps
+
+
+@dataclass(frozen=True)
+class RearCandidate:
+    """현재 자세에서 슬롯 FINAL 까지 가는 후보 하나.
+
+    구조는 (직진) → (전진 setup 원호 ψ) → (후진 원호 φ) → FINAL 로 고정이다.
+    자유 변수는 **반경 R, 후진 원호각 φ, 접근 side** 뿐인 bounded parametric
+    search 다. 연속 최적화나 그래프 탐색을 하지 않는다.
+    """
+
+    slot_id: str
+    radius_mm: float
+    phi_deg: float
+    psi_deg: float
+    side: int
+    setup_start: tuple[float, float, float]
+    reverse_start: tuple[float, float, float]
+    align_poses: list[tuple[float, float, float]]
+    entry_poses: list[tuple[float, float, float]]
+    final_pose: tuple[float, float, float]
+    turn_setup: float
+    turn_reverse: float
+    run_mm: float                # 현재 자세에서 setup 시작까지 직진 거리
+    lateral_mm: float            # 그 지점이 현재 heading 광선에서 벗어난 양
+    clearance_mm: float          # 맵 경계까지 최소 여유 (swept footprint)
+    maneuver_clearance_mm: float # ENTRY 전 APPROACH/ALIGN의 최소 경계 여유
+    overflow_mm: float
+    path_length_mm: float
+    steering_demand: float       # 원호 유지에 필요한 조향 (1.0 = 최대)
+    feasible: bool
+    reason: str = ""
+
+
+def plan_rear_candidate(slot: SlotSpec, from_pose: tuple[float, float],
+                        from_heading_deg: float, *, side: int, phi_deg: float,
+                        radius_mm: float,
+                        step_deg: float = REAR_ARC_STEP_DEG) -> RearCandidate:
+    """(R, φ, side) 조합 하나를 현재 자세 기준으로 평가한다.
+
+    통로를 전제하지 않는다 — **차의 현재 heading 이 곧 진입 직선**이다.
+    그래서 같은 슬롯이라도 Pose 가 달라지면 통과하는 조합이 달라진다.
+    """
+    rear = (slot.target_heading_deg + 180.0) % 360.0
+    turn_rev = -1.0 if side > 0 else 1.0
+    if slot.entry_side == "BOTTOM":
+        turn_rev = -turn_rev
+
+    def fail(reason: str, **kw) -> RearCandidate:
+        base = dict(slot_id=slot.slot_id, radius_mm=radius_mm, phi_deg=phi_deg,
+                    psi_deg=0.0, side=side,
+                    setup_start=(0.0, 0.0, 0.0), reverse_start=(0.0, 0.0, 0.0),
+                    align_poses=[], entry_poses=[],
+                    final_pose=(slot.center_x, slot.center_y, rear),
+                    turn_setup=0.0, turn_reverse=turn_rev, run_mm=0.0,
+                    lateral_mm=float("inf"), clearance_mm=0.0,
+                    maneuver_clearance_mm=0.0,
+                    overflow_mm=float("inf"), path_length_mm=float("inf"),
+                    steering_demand=1.0, feasible=False, reason=reason)
+        base.update(kw)
+        return RearCandidate(**base)
+
+    if radius_mm < MIN_TURN_RADIUS_MM:
+        return fail(f"계획 반경 {radius_mm:.0f}mm 가 최소 선회 반경 미만")
+
+    rs = _arc_pose(slot.center_x, slot.center_y, rear, phi_deg, turn_rev,
+                   radius_mm)
+
+    # 전진 setup 원호: 현재 heading → REVERSE_START heading
+    dh = (rs[2] - from_heading_deg + 180.0) % 360.0 - 180.0
+    psi = abs(dh)
+    turn_setup = 1.0 if dh > 0 else -1.0
+    if psi < 1e-6:
+        start = (rs[0], rs[1], from_heading_deg)
+        align = [rs]
+    else:
+        # 두 원호가 같은 방향이면 왔던 길을 되짚는 퇴화 경로가 된다.
+        if turn_setup * turn_rev > 0:
+            return fail("setup 과 후진 원호가 같은 방향 (경로가 겹친다)")
+        start = _arc_pose(rs[0], rs[1], rs[2], -psi, turn_setup, radius_mm)
+        n_align = max(1, math.ceil(psi / step_deg))
+        align = [_arc_pose(start[0], start[1], from_heading_deg,
+                           psi * i / n_align, turn_setup, radius_mm)
+                 for i in range(1, n_align + 1)]
+
+    # setup 시작점이 현재 heading 광선 위에 (앞쪽으로) 있는가
+    cx, cy = math.cos(math.radians(from_heading_deg)), \
+        math.sin(math.radians(from_heading_deg))
+    dx, dy = start[0] - from_pose[0], start[1] - from_pose[1]
+    run = dx * cx + dy * cy
+    lateral = abs(-dx * math.sin(math.radians(from_heading_deg))
+                  + dy * math.cos(math.radians(from_heading_deg)))
+    if run < REAR_MIN_RUN_MM:
+        return fail(f"setup 시작점이 뒤에 있거나 너무 가깝다 (전진 {run:.0f}mm)",
+                    run_mm=run, lateral_mm=lateral)
+    if lateral > REAR_LATERAL_TOLERANCE_MM:
+        return fail(f"setup 시작점이 진행선에서 {lateral:.0f}mm 벗어나 있다",
+                    run_mm=run, lateral_mm=lateral)
+    entry_heading_error = math.degrees(math.atan2(lateral, run))
+    if entry_heading_error > REVERSE_START_HEADING_TOLERANCE_DEG:
+        return fail(
+            f"setup 원호 진입 heading 오차 {entry_heading_error:.1f}deg가 "
+            f"허용 {REVERSE_START_HEADING_TOLERANCE_DEG:.0f}deg 초과",
+            run_mm=run, lateral_mm=lateral)
+
+    n_entry = max(1, round(phi_deg / step_deg))
+    entry = [_arc_pose(slot.center_x, slot.center_y, rear,
+                       phi_deg * (n_entry + 1 - i) / (n_entry + 1), turn_rev,
+                       radius_mm)
+             for i in range(1, n_entry + 1)]
+    final_pose = (slot.center_x, slot.center_y, rear)
+
+    # swept footprint — 직진 구간까지 포함해 촘촘히 훑는다
+    swept: list[tuple[float, float, float]] = []
+    n_run = max(2, int(run / 25.0))
+    for i in range(n_run + 1):
+        swept.append((from_pose[0] + cx * run * i / n_run,
+                      from_pose[1] + cy * run * i / n_run, from_heading_deg))
+    for sweep, turn, ox, oy, oh in ((psi, turn_setup, start[0], start[1],
+                                     from_heading_deg),):
+        m = max(2, int(math.radians(sweep) * radius_mm / 25.0))
+        for i in range(m + 1):
+            swept.append(_arc_pose(ox, oy, oh, sweep * i / m, turn, radius_mm))
+    _, maneuver_clearance = _path_clearance(swept)
+    m = max(2, int(math.radians(phi_deg) * radius_mm / 25.0))
+    for i in range(m + 1):
+        swept.append(_arc_pose(slot.center_x, slot.center_y, rear,
+                               phi_deg * i / m, turn_rev, radius_mm))
+    swept.append(final_pose)
+    overflow, clearance = _path_clearance(swept)
+
+    length = run + math.radians(psi + phi_deg) * radius_mm
+    demand = MIN_TURN_RADIUS_MM / radius_mm
+
+    ok, reason = True, ""
+    if overflow > 0.0:
+        ok, reason = False, f"경로가 맵 밖으로 {overflow:.0f}mm 나간다"
+    elif length > REAR_MAX_PATH_MM:
+        ok, reason = False, f"경로가 {length:.0f}mm 로 과도하다"
+
+    return RearCandidate(
+        slot_id=slot.slot_id, radius_mm=radius_mm, phi_deg=phi_deg,
+        psi_deg=psi, side=side, setup_start=start, reverse_start=rs,
+        align_poses=align, entry_poses=entry, final_pose=final_pose,
+        turn_setup=turn_setup, turn_reverse=turn_rev, run_mm=run,
+        lateral_mm=lateral, clearance_mm=clearance,
+        maneuver_clearance_mm=maneuver_clearance, overflow_mm=overflow,
+        path_length_mm=length, steering_demand=demand,
+        feasible=ok, reason=reason)
+
+
+def choose_rear_candidate(slot: SlotSpec, from_pose: tuple[float, float],
+                          from_heading_deg: float, *,
+                          radii_mm: tuple[float, ...] = REAR_RADIUS_CANDIDATES,
+                          step_deg: float = REAR_ARC_STEP_DEG,
+                          ) -> tuple[RearCandidate | None, list[RearCandidate]]:
+    """현재 자세에서 가능한 후보를 모두 만들고 하나를 고른다.
+
+    점수 순서 (앞이 우선):
+      1. 맵 경계 여유가 큰 것 (20mm 단위로 뭉쳐 비교 — 잡음으로 순서가 바뀌지 않게)
+      2. 최대 조향 의존이 적은 것 (반경이 큰 것) — 추종 여유가 곧 성공률이다
+      3. 경로가 짧은 것
+    """
+    cands = [plan_rear_candidate(slot, from_pose, from_heading_deg, side=side,
+                                 phi_deg=phi, radius_mm=r, step_deg=step_deg)
+             for r in radii_mm
+             for side in (1, -1)
+             for phi in REAR_PHI_CANDIDATES]
+    ok = [c for c in cands if c.feasible]
+    if not ok:
+        return None, cands
+    # Full-route clearance is always dominated by the target-slot FINAL pose
+    # (25 mm for the physical car), so it cannot distinguish candidates.  Rank
+    # the actually tracked forward maneuver independently.
+    ok.sort(key=lambda c: (-round(c.maneuver_clearance_mm / 20.0),
+                           c.steering_demand, c.path_length_mm))
+    return ok[0], cands
+
+
+def build_rear_candidate_waypoints(slot: SlotSpec, route_id: int, *,
+                                   from_pose: tuple[float, float],
+                                   from_heading_deg: float,
+                                   radii_mm: tuple[float, ...] = REAR_RADIUS_CANDIDATES,
+                                   step_deg: float = REAR_ARC_STEP_DEG,
+                                   strict: bool = True) -> list[Waypoint]:
+    """현재 자세 → 슬롯 FINAL 까지의 waypoint (candidate planner)."""
+    cand, all_c = choose_rear_candidate(slot, from_pose, from_heading_deg,
+                                        radii_mm=radii_mm, step_deg=step_deg)
+    if cand is None:
+        best = min(all_c, key=lambda c: (c.overflow_mm, c.lateral_mm))
+        if strict:
+            raise InfeasibleRouteError(slot.slot_id, best.reason)
+        return []
+
+    wps: list[Waypoint] = []
+    wp_id = 1
+
+    def add(phase: str, x: float, y: float, hdg: float | None, **kw) -> None:
+        nonlocal wp_id
+        wps.append(_make(route_id, wp_id, phase, x, y, hdg, **kw))
+        wp_id += 1
+
+    sx, sy, sh = cand.setup_start
+    # This point is the tangent entry to the planned setup arc.  Entering it
+    # with endpoint/chord heading (as the two real runs did) starts the next arc
+    # one whole sample ahead in heading and makes its feedforward fight the
+    # endpoint-bearing correction.  A mismatch is a replan, not permission to
+    # execute a different physical arc.
+    add("APPROACH", sx, sy, sh, heading_required=True,
+        heading_tolerance_deg=REVERSE_START_HEADING_TOLERANCE_DEG,
+        capture_tolerance_cm=PHASE_DEFAULTS["APPROACH"]["position_tolerance_cm"] + 4.0)
+
+    k_setup = cand.turn_setup / cand.radius_mm
+    for i, (x, y, h) in enumerate(cand.align_poses):
+        last = i == len(cand.align_poses) - 1
+        add("ALIGN", x, y, h, heading_required=last, curvature=k_setup,
+            path_capture_tolerance_cm=REAR_ENTRY_CAPTURE_MM / 10.0,
+            position_tolerance_cm=(REVERSE_START_TOLERANCE_CM if last else None),
+            heading_tolerance_deg=(REVERSE_START_HEADING_TOLERANCE_DEG
+                                   if last else None))
+
+    k_entry = cand.turn_reverse / cand.radius_mm
+    for x, y, h in cand.entry_poses:
+        add("ENTRY", x, y, h, heading_required=False,
+            motion_direction="REVERSE", curvature=k_entry,
+            path_capture_tolerance_cm=REAR_ENTRY_CAPTURE_MM / 10.0)
+
+    fx, fy, fh = cand.final_pose
+    add("FINAL", fx, fy, fh, is_final=True, motion_direction="REVERSE")
+    return wps
+
+
+@dataclass(frozen=True)
+class RearEntryPlan:
+    """현재 자세에서 곧바로 후진 원호에 올라타는 계획 (ALIGN 없음)."""
+
+    slot_id: str
+    phi_deg: float
+    entry_poses: list[tuple[float, float, float]]
+    final_pose: tuple[float, float, float]
+    turn_reverse: float
+    radius_mm: float
+    offset_mm: float                 # 현재 위치 ↔ 그 φ 의 진입점 거리
+    overflow_mm: float
+    feasible: bool
+    reason: str = ""
+
+
+def plan_rear_entry_from_pose(slot: SlotSpec, pose_mm: tuple[float, float],
+                              heading_deg: float, *,
+                              min_radius_mm: float = MIN_TURN_RADIUS_MM,
+                              step_deg: float = REAR_ARC_STEP_DEG,
+                              max_offset_mm: float = REAR_ENTRY_CAPTURE_MM,
+                              ) -> RearEntryPlan:
+    """지금 자세에서 후진 원호에 바로 올라탈 수 있는지 본다.
+
+    후진 원호는 **원**이고 φ 는 "그 원의 어디로 들어가느냐"일 뿐이다. 그래서
+    계획해 둔 REVERSE_START 를 고집할 이유가 없다 — 차의 **현재 heading 이
+    접선이 되는 지점**을 φ 로 역산하고, 위치가 그 지점에서 얼마나 떨어졌는지만
+    본다. 가까우면 ALIGN 없이 ENTRY 부터 시작하는 새 경로를 만든다.
+
+    이 방식이라 특정 heading 오차값(예: 8.8°)을 코드에 박지 않는다 —
+    오차가 곧 φ 의 차이로 흡수된다.
+    """
+    rear = (slot.target_heading_deg + 180.0) % 360.0
+    best: RearEntryPlan | None = None
+    for side in (1, -1):
+        turn_rev = -1.0 if side > 0 else 1.0
+        if slot.entry_side == "BOTTOM":
+            turn_rev = -turn_rev
+
+        # 후진 원호의 중심. FINAL 에서 rear heading 기준 turn 쪽 90°, 거리 R.
+        cdir = math.radians(rear + 90.0 * turn_rev)
+        cx = slot.center_x + min_radius_mm * math.cos(cdir)
+        cy = slot.center_y + min_radius_mm * math.sin(cdir)
+
+        # 차를 그 원에 **투영**한다. φ 를 heading 에서 역산하면 반경 오차와
+        # 원호상 위치가 뒤섞여 실제보다 훨씬 멀어 보인다.
+        dx, dy = pose_mm[0] - cx, pose_mm[1] - cy
+        d = math.hypot(dx, dy)
+        if d < 1e-6:
+            continue
+        radial_err = abs(d - min_radius_mm)
+        a_car = math.degrees(math.atan2(dy, dx))
+        a_final = math.degrees(math.atan2(slot.center_y - cy,
+                                          slot.center_x - cx))
+        phi = turn_rev * ((a_car - a_final + 180.0) % 360.0 - 180.0)
+        # 그 지점에서의 접선 heading (후진 진행 기준)
+        tangent = (a_car + 90.0 * turn_rev) % 360.0
+        heading_err = abs((heading_deg - tangent + 180.0) % 360.0 - 180.0)
+
+        if not (REAR_ENTRY_MIN_PHI_DEG <= phi <= REAR_ENTRY_MAX_PHI_DEG):
+            continue
+        rs = _arc_pose(slot.center_x, slot.center_y, rear, phi, turn_rev,
+                       min_radius_mm)
+        offset = radial_err
+
+        n_entry = max(1, round(phi / step_deg))
+        entry = [_arc_pose(slot.center_x, slot.center_y, rear,
+                           phi * (n_entry + 1 - i) / (n_entry + 1), turn_rev,
+                           min_radius_mm)
+                 for i in range(1, n_entry + 1)]
+        final_pose = (slot.center_x, slot.center_y, rear)
+        overflow, _ = _path_clearance(entry + [final_pose, rs])
+
+        ok, reason = True, ""
+        if overflow > 0.0:
+            ok, reason = False, f"후진 원호가 맵 밖으로 {overflow:.0f}mm 나간다"
+        elif offset > max_offset_mm:
+            ok, reason = False, (f"후진 원호에서 반경으로 {offset:.0f}mm 벗어나 있다 "
+                                 f"(허용 {max_offset_mm:.0f}mm)")
+        elif heading_err > REAR_ENTRY_HEADING_TOLERANCE_DEG:
+            ok, reason = False, (f"접선 대비 heading 이 {heading_err:.0f}° 틀어져 있다 "
+                                 f"(허용 {REAR_ENTRY_HEADING_TOLERANCE_DEG:.0f}°)")
+        cand = RearEntryPlan(
+            slot_id=slot.slot_id, phi_deg=phi, entry_poses=entry,
+            final_pose=final_pose, turn_reverse=turn_rev,
+            radius_mm=min_radius_mm, offset_mm=offset, overflow_mm=overflow,
+            feasible=ok, reason=reason)
+        if best is None or (cand.feasible, -cand.offset_mm) > (best.feasible,
+                                                               -best.offset_mm):
+            best = cand
+    if best is None:
+        return RearEntryPlan(slot.slot_id, 0.0, [], (slot.center_x, slot.center_y,
+                                                     rear), 0.0, min_radius_mm,
+                             float("inf"), 0.0, False,
+                             f"heading {heading_deg:.0f}° 로는 후진 원호에 못 올라탄다")
+    return best
+
+
+def build_rear_entry_waypoints(slot: SlotSpec, route_id: int, *,
+                               from_pose: tuple[float, float],
+                               from_heading_deg: float,
+                               min_radius_mm: float = MIN_TURN_RADIUS_MM,
+                               step_deg: float = REAR_ARC_STEP_DEG,
+                               strict: bool = True) -> list[Waypoint]:
+    """현재 자세에서 ENTRY → FINAL 만으로 이루어진 경로를 만든다.
+
+    ALIGN 이 없다 — 이미 후진 시작 자세에 있다고 보고 바로 원호를 탄다.
+    REVERSE_START 에서 heading 이 어긋났을 때 "옛 waypoint 로 되돌아가는" 대신
+    쓰는 경로다.
+    """
+    plan = plan_rear_entry_from_pose(slot, from_pose, from_heading_deg,
+                                     min_radius_mm=min_radius_mm,
+                                     step_deg=step_deg)
+    if not plan.feasible:
+        if strict:
+            raise InfeasibleRouteError(slot.slot_id, plan.reason)
+        return []
+
+    wps: list[Waypoint] = []
+    wp_id = 1
+    k_entry = plan.turn_reverse / plan.radius_mm
+    for x, y, h in plan.entry_poses:
+        wps.append(_make(route_id, wp_id, "ENTRY", x, y, h,
+                         heading_required=False,
+                         motion_direction="REVERSE", curvature=k_entry,
+                         path_capture_tolerance_cm=REAR_ENTRY_CAPTURE_MM / 10.0))
+        wp_id += 1
+    fx, fy, fh = plan.final_pose
+    wps.append(_make(route_id, wp_id, "FINAL", fx, fy, fh, is_final=True,
+                     motion_direction="REVERSE"))
+    return wps
+
+
+def build_rear_parking_waypoints(
+    slot: SlotSpec,
+    route_id: int,
+    *,
+    from_pose: tuple[float, float] | None = None,
+    from_heading_deg: float | None = None,
+    aisle_y: float = AISLE_Y,
+    min_radius_mm: float = MIN_TURN_RADIUS_MM,
+    step_deg: float = REAR_ARC_STEP_DEG,
+    strict: bool = True,
+) -> list[Waypoint]:
+    """슬롯 → 후면주차 waypoint 목록 (슬롯 안까지 후진으로 넣는다).
+
+    phase 는 기존 것만 쓴다 (`CRUISE/APPROACH/ALIGN/ENTRY/FINAL`).
+    펌웨어 `parse_phase` 가 아는 이름이 이 다섯뿐이라 새 phase 를 만들면
+    wire 에서 거절된다.
+
+    heading 요구는 **REVERSE_START 와 FINAL 에만** 건다. 중간 원호점까지
+    heading 을 요구하면, 도착 반경 안에서 각도가 안 맞을 때 제어기가
+    HEADING_OUT_OF_TOLERANCE 로 정지해 원호 중간에 서 버린다.
+
+    Raises:
+        InfeasibleRouteError: strict 이고 실현 가능한 후보가 없을 때.
+    """
+    plan, cands = choose_rear_parking_plan(
+        slot, aisle_y=aisle_y, min_radius_mm=min_radius_mm, from_pose=from_pose,
+        step_deg=step_deg)
+    if plan is None:
+        best = min(cands, key=lambda c: (c.overflow_mm, c.aisle_offset_mm))
+        if strict:
+            raise InfeasibleRouteError(slot.slot_id, best.reason)
+        return []
+
+    wps: list[Waypoint] = []
+    wp_id = 1
+
+    def add(phase: str, x: float, y: float, hdg: float | None, **kw) -> None:
+        nonlocal wp_id
+        wps.append(_make(route_id, wp_id, phase, x, y, hdg, **kw))
+        wp_id += 1
+
+    sx, sy, setup_heading = plan.setup_start
+    direction = 1.0 if plan.side > 0 else -1.0
+
+    # 주행 차선은 통로 중심이 아니라 **setup 시작점의 y** 다. 이 값이 통로에서
+    # 얼마나 벗어나는지는 plan_rear_parking 이 이미 걸러 놨다(ON_AISLE_TOLERANCE_MM).
+    lane_y = sy
+
+    # ─ CRUISE: 현재 위치에서 차선을 따라 setup 시작점까지 ─
+    start_x = from_pose[0] if from_pose is not None else None
+    if start_x is not None and (sx - start_x) * direction <= 0.0:
+        # setup 시작점을 이미 지나쳤다. 전진으로는 되돌아올 수 없다.
+        if strict:
+            raise InfeasibleRouteError(
+                slot.slot_id,
+                f"setup 시작점 x={sx:.0f} 을 이미 지나쳤다 (현재 x={start_x:.0f})")
+        start_x = None
+
+    # APPROACH 는 **선회 시작점 자체**다. 인계 모델처럼 목표 앞에 따로 감속점을
+    # 두지 않는다 — 여기서 감속이 끝나야 원호에 올라탈 수 있고, 활주로가
+    # 300mm 남짓이라 감속점을 더 앞에 두면 출발과 겹쳐 단계가 건너뛰어진다.
+    if start_x is not None:
+        cruise_run = sx - start_x
+        n = int(abs(cruise_run) // AISLE_SEGMENT_MM)
+        for i in range(1, n + 1):
+            # 차선 구간도 APPROACH 로 낸다. CRUISE 로 두면 그 구간만 일반 주행
+            # 상한(+정지마찰 예외)이 걸려 선회 시작 직전에 throttle 이 0.70 까지
+            # 튄다. 후면주차 경로는 전 구간이 정밀 주차 상한 아래에 있어야 한다.
+            add("APPROACH", start_x + cruise_run * (i / (n + 1)), lane_y, None)
+
+    add("APPROACH", sx, lane_y, setup_heading, heading_required=True,
+        heading_tolerance_deg=REVERSE_START_HEADING_TOLERANCE_DEG,
+        capture_tolerance_cm=PHASE_DEFAULTS["APPROACH"]["position_tolerance_cm"] + 4.0)
+
+    # ─ ALIGN: 전진 setup 원호. 마지막이 REVERSE_START (heading 필수) ─
+    # 곡률 부호는 원호를 만들 때 쓴 회전방향 그대로다 (+1 = 좌회전).
+    k_setup = plan.turn_setup / plan.radius_mm
+    for i, (x, y, h) in enumerate(plan.align_poses):
+        last = i == len(plan.align_poses) - 1
+        # REVERSE_START 는 뒤따르는 후진 원호 전체의 기준점이다. 여기서 남긴
+        # 오차는 원호 내내 줄일 수 없다 — 계획 반경(R)과 물리 최소 반경의
+        # 차이(약 13%)보다 큰 오차로 들어가면 되잡을 방법이 없기 때문이다.
+        # 그래서 일반 ALIGN 보다 훨씬 좁게 잡고, 못 맞추면 여기서 선다.
+        add("ALIGN", x, y, h, heading_required=last, curvature=k_setup,
+            path_capture_tolerance_cm=REAR_ENTRY_CAPTURE_MM / 10.0,
+            position_tolerance_cm=(REVERSE_START_TOLERANCE_CM if last else None),
+            heading_tolerance_deg=(REVERSE_START_HEADING_TOLERANCE_DEG
+                                   if last else None))
+
+    # ─ ENTRY: 후진 원호 ─
+    # 후진에서도 dθ = curvature × ds 정의를 그대로 쓴다. ds 가 음수라
+    # 부호가 자동으로 맞으므로 전진과 같은 turn 부호를 그대로 싣는다.
+    k_entry = plan.turn_reverse / plan.radius_mm
+    for x, y, h in plan.entry_poses:
+        add("ENTRY", x, y, h, heading_required=False,
+            motion_direction="REVERSE", curvature=k_entry,
+            path_capture_tolerance_cm=REAR_ENTRY_CAPTURE_MM / 10.0)
+
+    # ─ FINAL: 슬롯 중심 + rear heading, 후진 ─
+    # 곡률 0 — 원호가 끝나는 지점이라 feedforward 가 남으면 과회전한다.
+    # 여기서는 위치/heading 되먹임만으로 자세를 맞춘다.
+    fx, fy, fh = plan.final_pose
+    add("FINAL", fx, fy, fh, is_final=True, motion_direction="REVERSE")
     return wps
 
 

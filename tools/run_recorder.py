@@ -37,6 +37,35 @@ __all__ = ["RunRecorder", "servo_angle_for", "motor_duty_for"]
 _FW = FirmwareConstants()
 
 
+def _execution_gate_reason(sess: Any, authority: str | None,
+                           fault_reason: str | None,
+                           mission_status: str | None,
+                           throttle_cmd: float | None,
+                           applied_throttle: float | None,
+                           controller_reason: str | None) -> str:
+    """Return the first owner that explains why execution is or is not moving."""
+    if sess is None:
+        return "NO_SESSION"
+    if not getattr(sess, "alive", False):
+        return "SESSION_CLOSED"
+    if getattr(sess, "comm_failed", False):
+        return "COMM_FAILED"
+    if getattr(sess, "control_held", False):
+        return "COMM_ZERO_LATCH"
+    if authority == "FAULTED":
+        return f"HOST_FAULT:{fault_reason}"
+    if mission_status != "RUNNING":
+        return f"MISSION_{mission_status or 'NONE'}"
+    if throttle_cmd is not None and abs(float(throttle_cmd)) < 1e-9:
+        return controller_reason or "CONTROLLER_ZERO"
+    if (applied_throttle is not None
+            and abs(float(applied_throttle)) < 1e-9
+            and throttle_cmd is not None
+            and abs(float(throttle_cmd)) >= 1e-9):
+        return "ESP_APPLIED_ZERO"
+    return "EXECUTING"
+
+
 def _lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
@@ -103,6 +132,8 @@ def _wp_dict(wp: Any) -> dict[str, Any]:
         "heading_tolerance_deg": g("heading_tolerance_deg"),
         "heading_required": g("heading_required"),
         "motion_direction": g("motion_direction", default="FORWARD"),
+        "curvature": g("curvature", default=0.0),
+        "path_capture_tolerance_cm": g("path_capture_tolerance_cm"),
         "is_final": g("is_final"),
     }
 
@@ -125,6 +156,7 @@ class RunRecorder:
     def __init__(self, base_dir: str | Path, server: Any, car_id: int = 1, *,
                  pose_provider: Callable[[], dict | None] | None = None,
                  runner_provider: Callable[[], Any] | None = None,
+                 lifecycle_provider: Callable[[], dict | None] | None = None,
                  control_period_s: float = 0.1,
                  params: dict[str, Any] | None = None,
                  calibration: dict[str, Any] | None = None) -> None:
@@ -132,6 +164,7 @@ class RunRecorder:
         self.car_id = car_id
         self.pose_provider = pose_provider
         self.runner_provider = runner_provider
+        self.lifecycle_provider = lifecycle_provider
         self.control_period_s = control_period_s
 
         stamp = datetime.now().strftime("run_%Y%m%d_%H%M%S")
@@ -154,6 +187,7 @@ class RunRecorder:
         self._prev_phase: str | None = None
         self._prev_stage: str | None = None
         self._prev_state: str | None = None
+        self._prev_authority: str | None = None
         self._prev_confirm = 0
         self._sat_ticks = 0
         self._thr: list[float] = []
@@ -274,11 +308,18 @@ class RunRecorder:
         ctrl = (sess.latest_control if sess is not None else None) or {}
         runner = self.runner_provider() if self.runner_provider else None
         pose = self.pose_provider() if self.pose_provider else None
+        lifecycle = self.lifecycle_provider() if self.lifecycle_provider else {}
+        lifecycle = lifecycle or {}
 
         target = getattr(runner, "current_target", None) if runner else None
         mission = getattr(runner, "mission", None) if runner else None
         guard = getattr(getattr(runner, "host", None), "approach_guard", None)
         fguard = getattr(getattr(runner, "host", None), "final_pose_guard", None)
+        authority_obj = getattr(getattr(runner, "host", None), "authority", None)
+        reverse_observation_state = getattr(
+            getattr(runner, "host", None), "reverse_observation_state", None)
+        authority = getattr(authority_obj, "state", None)
+        authority = authority.value if hasattr(authority, "value") else authority
 
         px = py = ph = None
         pose_age_ms = None
@@ -288,7 +329,7 @@ class RunRecorder:
                 pose_age_ms = round((now - pose["obs_time"]) * 1000, 1)
 
         tx = ty = th = None
-        dist_cm = head_err = None
+        dist_cm = endpoint_head_err = None
         if target is not None:
             tx, ty = getattr(target, "x_mm", None), getattr(target, "y_mm", None)
             th = getattr(target, "target_heading_deg", None)
@@ -296,10 +337,30 @@ class RunRecorder:
                 dist_cm = round(math.hypot(tx - px, ty - py) / 10.0, 2)
                 if ph is not None:
                     bearing = math.degrees(math.atan2(ty - py, tx - px))
-                    head_err = round((bearing - ph + 180.0) % 360.0 - 180.0, 1)
+                    endpoint_head_err = round(
+                        (bearing - ph + 180.0) % 360.0 - 180.0, 1)
+
+        tick = getattr(runner, "last_tick_result", None) if runner else None
+        command = getattr(tick, "command", None)
+        head_err = (getattr(command, "heading_error_deg", None)
+                    if command is not None else endpoint_head_err)
+        logical = (getattr(command, "logical_steering", None)
+                   if command is not None else None)
+        curvature = float(getattr(target, "curvature", 0.0) or 0.0)
+        raw_direction = getattr(target, "motion_direction", "")
+        direction = getattr(raw_direction, "value", raw_direction)
+        reverse = str(direction).upper() == "REVERSE"
+        feedforward = None
+        if runner is not None and target is not None:
+            feedforward = runner.config.feedforward_steering(
+                getattr(target, "phase", None), curvature, reverse=reverse)
+        feedback = (None if logical is None or feedforward is None
+                    else round(float(logical) - float(feedforward), 4))
 
         thr = ctrl.get("throttle")
         wire_str = ctrl.get("steering")
+        desired_thr = getattr(command, "throttle", None)
+        desired_str = getattr(command, "steering", None)
         a_thr, a_str = status.get("applied_throttle"), status.get("applied_steering")
         base_t = a_thr if a_thr is not None else thr
         base_s = a_str if a_str is not None else wire_str
@@ -320,32 +381,61 @@ class RunRecorder:
         mstatus = mstatus.value if hasattr(mstatus, "value") else mstatus
         phase = getattr(mission, "current_phase", None)
         confirm = getattr(fguard, "count", None)
+        controller_reason = getattr(command, "reason", None)
+        execution_gate = _execution_gate_reason(
+            sess, authority, getattr(authority_obj, "fault_reason", None),
+            mstatus, thr, a_thr, controller_reason)
 
         row = {
             "t_s": round(now - self.t0, 3),
             "wall": datetime.now().isoformat(timespec="milliseconds"),
             "car_id": self.car_id,
             "pose_x_mm": px, "pose_y_mm": py, "pose_heading_deg": ph,
+            "pose_heading_source": (pose.get("heading_source") if pose else None),
             "pose_age_ms": pose_age_ms,
-            "route_id": getattr(target, "route_id", None),
+            "route_id": (getattr(target, "route_id", None)
+                         or lifecycle.get("owned_route_id")),
             "waypoint_id": getattr(target, "waypoint_id", None),
             "phase": phase,
             "motion_direction": (lambda v: v.value if hasattr(v, "value") else v)(
                 getattr(target, "motion_direction", None)),
             "target_x_mm": tx, "target_y_mm": ty, "target_heading_deg": th,
+            "curvature": getattr(target, "curvature", None),
+            "path_capture_tolerance_cm": getattr(
+                target, "path_capture_tolerance_cm", None),
             "distance_error_cm": dist_cm, "heading_error_deg": head_err,
+            "endpoint_heading_error_deg": endpoint_head_err,
+            "curvature_feedforward": feedforward,
+            "steering_feedback": feedback,
             "approach_stage": stage,
             "approach_best_distance_cm": getattr(guard, "best_distance_cm", None),
             "capture_tolerance_cm": getattr(target, "capture_tolerance_cm", None),
             "position_tolerance_cm": getattr(target, "position_tolerance_cm", None),
             "heading_tolerance_deg": getattr(target, "heading_tolerance_deg", None),
             "mission_status": mstatus,
+            "route_mission_status": mstatus,
+            "workflow_status": lifecycle.get("workflow_status"),
+            "parking_stage": lifecycle.get("parking_stage"),
+            "allocation_state": lifecycle.get("allocation_state"),
+            "comm_recovery_state": lifecycle.get("comm_recovery_state"),
+            "authority": authority,
+            "fault_reason": getattr(authority_obj, "fault_reason", None),
+            "controller_reason": controller_reason,
+            "command_reason": controller_reason or execution_gate,
+            "execution_gate": execution_gate,
+            "direct_zero_latch": (None if sess is None else bool(
+                getattr(sess, "control_held", False))),
+            "comm_failed": (None if sess is None else bool(
+                getattr(sess, "comm_failed", False))),
+            "reverse_observation_state": reverse_observation_state,
             "replan_reason": getattr(mission, "replan_reason", None),
             "recovery_attempt": getattr(mission, "recovery_attempts", None),
             "final_confirm_count": confirm,
+            "desired_throttle": desired_thr,
+            "desired_steering": desired_str,
             "throttle_cmd": thr, "steering_cmd": wire_str,
             "wire_steering": wire_str,
-            "logical_steering": (None if wire_str is None else
+            "logical_steering": logical if logical is not None else (None if wire_str is None else
                                  round(-float(wire_str), 4)),   # wire 음수=좌 → 논리 양수=좌
             "applied_throttle": a_thr, "applied_steering": a_str,
             "servo_deg_calc": (None if base_s is None
@@ -392,7 +482,14 @@ class RunRecorder:
         if mstatus != self._prev_status:
             self.event("MISSION", frm=self._prev_status, to=mstatus,
                        reason=row.get("replan_reason"))
+            if mstatus == "REPLAN_REQUIRED":
+                self.event("REPLAN_REQUIRED", reason=row.get("replan_reason"))
             self._prev_status = mstatus
+        authority = row.get("authority")
+        if authority != self._prev_authority:
+            if authority == "FAULTED":
+                self.event("FAULT", reason=row.get("fault_reason"))
+            self._prev_authority = authority
         st = status.get("state")
         if st != self._prev_state:
             self.event("ESP_STATE", frm=self._prev_state, to=st,

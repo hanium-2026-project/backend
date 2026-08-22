@@ -130,6 +130,13 @@ class HostWaypointMission:
             return self._waypoints[self._index]
         return None
 
+    @property
+    def current_is_terminal(self) -> bool:
+        """Whether the active target is the route's actual completion boundary."""
+        return (self._status is MissionStatus.RUNNING
+                and 0 <= self._index < len(self._waypoints)
+                and self._is_final_index())
+
     def _is_final_index(self) -> bool:
         wp = self._waypoints[self._index]
         # is_final 플래그가 명시됐으면 우선, 아니면 마지막 index 로 판정

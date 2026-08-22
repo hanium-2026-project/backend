@@ -66,7 +66,11 @@ class RCCarTracker:
 
         camera = CameraCapture(self._source)
         self._running = True
-        prev_time = time.perf_counter()
+        # TrackState.timestamp is consumed by controller freshness checks which
+        # use time.monotonic().  Keep the observation and consumer in the same
+        # clock domain; mixing perf_counter()/monotonic() produced a ~2.25 s
+        # negative pose age in the 2026-08-14 production run.
+        prev_time = time.monotonic()
 
         try:
             while self._running:
@@ -75,7 +79,7 @@ class RCCarTracker:
                     break
 
                 detections = self._detector.detect_and_track(frame.image)
-                now = time.perf_counter()
+                now = time.monotonic()
                 elapsed = now - prev_time
                 fps = 1.0 / elapsed if elapsed > 0 else 0.0
                 prev_time = now
@@ -106,7 +110,7 @@ class RCCarTracker:
                     break
 
                 # FPS 상한 적용
-                sleep_time = self._frame_interval - (time.perf_counter() - now)
+                sleep_time = self._frame_interval - (time.monotonic() - now)
                 if sleep_time > 0:
                     time.sleep(sleep_time)
         finally:

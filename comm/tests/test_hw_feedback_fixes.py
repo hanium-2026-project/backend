@@ -140,6 +140,50 @@ class TestCommFailDebounce(ServerTestBase):
         self.assertTrue(wait_until(lambda: sender.outstanding is None, timeout=4.0),
                         "장애 통지 후에도 pending 이 남아 있다")
 
+    def test_timeout_latches_zero_until_explicit_safe_release(self):
+        """RX recovery alone must never revive the pre-timeout command."""
+        self.server.direct_control_enabled = True
+        self.server.start()
+        esp = self.connect(status_interval=0)
+        self.assertTrue(wait_until(lambda: esp.state == "READY"))
+
+        self.server.push_control(1, 0.25, -0.3)
+        self.assertTrue(wait_until(
+            lambda: (esp.last_direct_control or {}).get("throttle") == 0.25))
+        sess = self.server._session(1)
+        self.server._comm_fail(1, {"type": "COMM_TIMEOUT"},
+                               expected_session=sess)
+        self.assertTrue(sess.control_held)
+        self.assertEqual(sess.latest_control["throttle"], 0.0)
+
+        # A producer racing with the fault cannot overwrite the zero latch.
+        self.server.push_control(1, 0.4, 0.4)
+        self.assertEqual(sess.latest_control["throttle"], 0.0)
+        esp.send_periodic_status()
+        self.assertTrue(wait_until(lambda: not sess.comm_failed))
+        self.assertTrue(sess.control_held, "RX 재개만으로 latch가 풀렸다")
+        self.server.push_control(1, 0.4, 0.4)
+        self.assertEqual(sess.latest_control["throttle"], 0.0)
+
+        self.assertTrue(self.server.release_control(1))
+        self.server.push_control(1, 0.2, 0.1)
+        self.assertEqual(sess.latest_control["throttle"], 0.2)
+
+    def test_wrong_session_packet_does_not_refresh_or_recover(self):
+        self.server.start()
+        esp = self.connect(status_interval=0)
+        self.assertTrue(wait_until(lambda: esp.state == "READY"))
+        sess = self.server._session(1)
+        self.server._comm_fail(1, {"type": "COMM_TIMEOUT"},
+                               expected_session=sess)
+        before = sess.last_rx_ms
+        self.server._dispatch(sess, {
+            "version": 1, "type": "STATUS", "car_id": 1,
+            "session_id": "STALE_SESSION", "status_seq": 999,
+        })
+        self.assertEqual(sess.last_rx_ms, before)
+        self.assertTrue(sess.comm_failed)
+
 
 # ─── ④ STOP > WAIT 선점 우선순위 ─────────────────────────────────────────────
 

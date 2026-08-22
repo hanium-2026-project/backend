@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest.mock import patch
 
 from comm import MissionState
 from comm.tests.mock_firmware import MockFirmware
 from control import VehicleLimits
 from cv.tracker import TrackState
 from pipeline import ParkingPipeline, PipelineConfig
-from pipeline.tests.test_pipeline_integration import detection_at, wait_until
+from pipeline.tests.test_pipeline_integration import (
+    detection_at, detections_with_heading, wait_until,
+)
 
 FRAME = 1200
 
@@ -26,11 +29,17 @@ class DirectControlTestBase(unittest.TestCase):
     direct_control = True
 
     def setUp(self) -> None:
+        self.policy_patch = patch(
+            "rl.bridge.select_action",
+            side_effect=lambda obs, masks, **kw: next(
+                i for i, allowed in enumerate(masks[:8]) if allowed))
+        self.policy_patch.start()
         self.config = PipelineConfig(
             server_port=0,
             lot_width_mm=FRAME, lot_height_mm=FRAME,
             policy_path="models/sb3_parking_policy.zip",
             stationary_window=3,
+            initial_pose_observations=1,
             direct_control=self.direct_control,
             vehicle_limits=VehicleLimits(),
         )
@@ -43,6 +52,7 @@ class DirectControlTestBase(unittest.TestCase):
         for e in self.esps:
             e.close()
         self.pipeline.stop()
+        self.policy_patch.stop()
 
     def connect(self, car_id: int = 1) -> MockFirmware:
         esp = MockFirmware(self.pipeline.server.bound_port,
@@ -51,9 +61,12 @@ class DirectControlTestBase(unittest.TestCase):
         self.esps.append(esp)
         return esp
 
-    def feed(self, *positions, settle: float = 0.12) -> None:
+    def feed(self, *positions, settle: float = 0.12,
+             with_heading: bool = True) -> None:
         self.frame_no += 1
-        dets = [detection_at(pos, tid) for tid, pos in positions]
+        dets = [det for tid, pos in positions
+                for det in (detections_with_heading(pos, tid)
+                            if with_heading else [detection_at(pos, tid)])]
         self.pipeline.on_frame(TrackState(
             frame_index=self.frame_no, timestamp=time.monotonic(),
             detections=dets, fps=30.0, frame_size=(FRAME, FRAME),
@@ -71,6 +84,7 @@ class TestControlStream(DirectControlTestBase):
         esp = self.connect()
         self.assertTrue(wait_until(lambda: esp.state == "READY"))
         self.feed((7, (150.0, 600.0)))            # 진입 → 슬롯 배정 → 미션 시작
+        self.feed((7, (150.0, 600.0)))            # binding 뒤 fresh heading
 
         orch = self.pipeline.orchestrator
         self.assertTrue(wait_until(
@@ -97,7 +111,7 @@ class TestControlStream(DirectControlTestBase):
     def test_control_seq_increases(self):
         esp = self.connect()
         self.assertTrue(wait_until(lambda: esp.state == "READY"))
-        self.feed((7, (150.0, 600.0)))
+        self.feed((7, (150.0, 600.0)), with_heading=False)
         for pos in [(150.0, 140.0), (150.0, 190.0), (150.0, 240.0)]:
             self.feed((7, pos))
         self.assertTrue(wait_until(lambda: esp.direct_controls >= 2))
@@ -109,7 +123,7 @@ class TestControlStream(DirectControlTestBase):
         """heading 을 모르는 첫 프레임에서 차를 밀면 안 된다."""
         esp = self.connect()
         self.assertTrue(wait_until(lambda: esp.state == "READY"))
-        self.feed((7, (150.0, 600.0)))
+        self.feed((7, (150.0, 600.0)), with_heading=False)
         out = self.pipeline.last_control.get(1)
         if out is not None and self.pipeline.views[7].heading_deg is None:
             self.assertEqual(out.throttle, 0.0)
@@ -118,6 +132,7 @@ class TestControlStream(DirectControlTestBase):
     def test_zero_control_when_mission_not_driving(self):
         esp = self.connect()
         self.assertTrue(wait_until(lambda: esp.state == "READY"))
+        self.feed((7, (150.0, 600.0)))
         self.feed((7, (150.0, 600.0)))
         orch = self.pipeline.orchestrator
         self.assertTrue(wait_until(lambda: 1 in orch.missions))
@@ -136,12 +151,15 @@ class TestControlStream(DirectControlTestBase):
         esp = self.connect()
         self.assertTrue(wait_until(lambda: esp.state == "READY"))
         self.feed((7, (150.0, 600.0)))
+        self.feed((7, (150.0, 600.0)))
         self.feed((7, (150.0, 160.0)))
         self.assertIn(1, self.pipeline.controllers)
 
         self.pipeline._on_resync(1, {"boot_id": "B0000002"})
         self.assertNotIn(1, self.pipeline.controllers)
         self.assertNotIn(1, self.pipeline.last_control)
+        self.assertIsNone(self.pipeline.views[7].heading_deg)
+        self.assertIsNone(self.pipeline.views[7].heading_source)
 
 
 class TestControlDisabledByDefault(DirectControlTestBase):

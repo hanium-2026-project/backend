@@ -15,12 +15,15 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest.mock import patch
 
 from comm.tests.mock_firmware import MockFirmware
 from control.auto_host_runner import MissionStatus
 from cv.tracker import TrackState
 from pipeline import ParkingPipeline, PipelineConfig
-from pipeline.tests.test_pipeline_integration import detection_at, wait_until
+from pipeline.tests.test_pipeline_integration import (
+    detection_at, detections_with_heading, wait_until,
+)
 from rl.parking_env import SLOT_NAMES
 
 FRAME = 1200
@@ -28,11 +31,17 @@ FRAME = 1200
 
 class AutoHostTestBase(unittest.TestCase):
     def setUp(self) -> None:
+        self.policy_patch = patch(
+            "rl.bridge.select_action",
+            side_effect=lambda obs, masks, **kw: next(
+                i for i, allowed in enumerate(masks[:8]) if allowed))
+        self.policy_patch.start()
         self.config = PipelineConfig(
             server_port=0,
             lot_width_mm=FRAME, lot_height_mm=FRAME,
             policy_path="models/sb3_parking_policy.zip",
             stationary_window=3,
+            initial_pose_observations=1,
             control_mode="auto-host",
             direct_control=True,
             auto_host_period_s=0.02,          # 테스트는 빠르게 돌린다
@@ -47,6 +56,7 @@ class AutoHostTestBase(unittest.TestCase):
         for e in self.esps:
             e.close()
         self.pipeline.stop()
+        self.policy_patch.stop()
 
     def connect(self, car_id: int = 1) -> MockFirmware:
         esp = MockFirmware(self.pipeline.server.bound_port,
@@ -57,7 +67,8 @@ class AutoHostTestBase(unittest.TestCase):
 
     def feed(self, *positions, settle: float = 0.08) -> None:
         self.frame_no += 1
-        dets = [detection_at(pos, tid) for tid, pos in positions]
+        dets = [det for tid, pos in positions
+                for det in detections_with_heading(pos, tid)]
         self.pipeline.on_frame(TrackState(
             frame_index=self.frame_no, timestamp=time.monotonic(),
             detections=dets, fps=30.0, frame_size=(FRAME, FRAME),
@@ -335,3 +346,142 @@ class TestRecoverPhases(AutoHostTestBase):
     def test_empty_tuple_disables_recovery(self):
         self.pipeline.config.recover_phases = ()
         self.assertFalse(self.pipeline._recoverable(self._wp("FINAL", True)))
+
+
+class TestCommRecoveryContract(AutoHostTestBase):
+    """COMM loss: zero -> session -> fresh pose -> replan, never stale resume."""
+
+    def _arm_route(self):
+        esp = self.connect()
+        slot = self.wait_slot()
+        self.assertIsNotNone(slot, "초기 AUTO_HOST route 미적재")
+        return esp, slot
+
+    def test_175307_comm_before_mission_allows_only_new_validated_activation(self):
+        esp = self.connect()
+        self.assertTrue(wait_until(lambda: self.runner() is not None),
+                        "manual REMOTE_DIRECT shell not ready")
+        sess = self.pipeline.server._session(1)
+
+        self.pipeline.server._comm_fail(
+            1, {"type": "COMM_TIMEOUT"}, expected_session=sess)
+        self.assertTrue(sess.control_held)
+        self.assertIsNone(self.pipeline._auto_host_slot.get(1))
+
+        esp.send_periodic_status()
+        self.assertTrue(wait_until(
+            lambda: (self.pipeline._comm_recovery_context.get(1) or {}).get("state")
+                    == "WAIT_FRESH_POSE", timeout=5.0))
+
+        # Mission allocation is forbidden while recovery owns the lifecycle.
+        for _ in range(self.config.stationary_window):
+            self.feed((7, (150.0, 600.0)), settle=0.08)
+            if 1 in self.pipeline._comm_recovery_context:
+                self.assertIsNone(self.pipeline._auto_host_slot.get(1))
+
+        self.assertNotIn(1, self.pipeline._comm_recovery_context)
+        self.assertTrue(sess.control_held,
+                        "session recovery alone released the transport latch")
+
+        slot = self.wait_slot(tries=30)
+        self.assertIsNotNone(slot, "fresh safe GLOBAL route was not activated")
+        self.assertFalse(sess.control_held)
+        self.assertIn(self.pipeline.hybrid_controls[1].mode,
+                      {"AUTO_PENDING", "AUTO_HOST"})
+
+        # AUTO_PENDING still needs a distinct camera observation.  Only the
+        # new route may produce the first non-zero command; no old command ran.
+        for _ in range(8):
+            self.feed((7, (150.0, 600.0)), settle=0.06)
+            if abs(float(sess.latest_control.get("throttle", 0.0))) > 0.0:
+                break
+        self.assertGreater(abs(float(sess.latest_control["throttle"])), 0.0)
+
+    def test_route_done_is_not_parking_workflow_done(self):
+        self.connect()
+        slot = self.wait_slot()
+        self.assertIsNotNone(slot)
+        runner = self.pipeline.auto_hosts[1]
+        runner.mission._status = MissionStatus.DONE
+        self.pipeline._parking_stage[1] = "PARKING_AFTER_SETUP_PENDING"
+        self.assertEqual(self.pipeline.workflow_status(1),
+                         "SETUP_DONE_WAIT_STOP")
+        self.assertNotEqual(self.pipeline.workflow_status(1), "PARKED")
+
+    def test_175219_175349_new_route_resets_route_local_replan_state(self):
+        self.connect()
+        self.assertIsNotNone(self.wait_slot())
+        runner = self.pipeline.auto_hosts[1]
+        route = list(self.pipeline._auto_host_route[1])
+        runner.mission.request_replan("PATH_DEVIATION")
+        self.assertIs(runner.status, MissionStatus.REPLAN_REQUIRED)
+
+        runner.load_route(route)
+
+        self.assertIs(runner.status, MissionStatus.RUNNING)
+        self.assertIsNone(runner.replan_reason)
+        self.assertEqual(runner.mission.recovery_attempts, 0)
+        self.assertIsNone(runner.last_tick_result)
+
+    def test_same_session_recovery_keeps_slot_and_requires_fresh_pose(self):
+        esp, slot = self._arm_route()
+        sess = self.pipeline.server._session(1)
+        old_route = self.pipeline.auto_hosts[1].current_target.route_id
+
+        self.pipeline.server._comm_fail(
+            1, {"type": "COMM_TIMEOUT"}, expected_session=sess)
+        self.assertTrue(sess.control_held)
+        self.assertEqual(sess.latest_control["throttle"], 0.0)
+        self.assertEqual(self.pipeline._auto_host_slot[1], slot)
+        self.assertEqual(self.pipeline.views[7].slot_id, slot)
+
+        # Periodic STATUS recovers transport, but must not release motion.
+        esp.send_periodic_status()
+        self.assertTrue(wait_until(
+            lambda: (self.pipeline._comm_recovery_context.get(1) or {}).get("state")
+                    == "WAIT_FRESH_POSE", timeout=5.0))
+        self.pipeline.server.push_control(1, 0.5, 0.5)
+        self.assertEqual(sess.latest_control["throttle"], 0.0)
+        self.assertTrue(sess.control_held)
+
+        pos = self.pipeline.views[7].position_mm
+        self.feed((7, pos), settle=0.12)
+        self.assertNotIn(1, self.pipeline._comm_recovery_context)
+        self.assertEqual(self.pipeline._auto_host_slot[1], slot)
+        self.assertGreater(self.pipeline.auto_hosts[1].current_target.route_id,
+                           old_route)
+        self.assertEqual(self.pipeline.hybrid_controls[1].mode, "AUTO_PENDING")
+        self.assertFalse(sess.control_held)
+        self.assertEqual(sess.latest_control["throttle"], 0.0,
+                         "planning frame에서 즉시 stale route가 움직였다")
+
+    def test_replacement_session_same_boot_preserves_context_and_replans(self):
+        esp, slot = self._arm_route()
+        old_session_id = self.pipeline.server._session(1).session_id
+        esp2 = MockFirmware(
+            self.pipeline.server.bound_port, car_id="CAR_01",
+            boot_id=esp.boot_id)
+        self.esps.append(esp2)
+
+        self.assertTrue(wait_until(
+            lambda: self.pipeline.server._session(1).session_id != old_session_id,
+            timeout=5.0))
+        new_sess = self.pipeline.server._session(1)
+        self.assertEqual(new_sess.boot_id, esp.boot_id)
+        self.assertTrue(new_sess.control_held)
+        self.assertEqual(self.pipeline._auto_host_slot[1], slot)
+        self.assertEqual(self.pipeline.track_of_car[1], 7)
+        self.assertTrue(wait_until(
+            lambda: (self.pipeline._comm_recovery_context.get(1) or {}).get("state")
+                    == "WAIT_FRESH_POSE", timeout=5.0))
+
+        pos = self.pipeline.views[7].position_mm
+        self.feed((7, pos), settle=0.12)
+        self.assertNotIn(1, self.pipeline._comm_recovery_context)
+        self.assertEqual(self.pipeline._auto_host_slot[1], slot)
+        self.assertEqual(self.pipeline.track_of_car[1], 7)
+        self.assertEqual(self.pipeline.hybrid_controls[1].mode, "AUTO_PENDING")
+        self.assertFalse(new_sess.control_held)
+        sent = [m["type"] for m in esp2.received]
+        self.assertNotIn("WAYPOINT", sent)
+        self.assertNotIn("GO", sent)

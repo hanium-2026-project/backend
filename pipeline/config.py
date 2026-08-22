@@ -65,6 +65,18 @@ class PipelineConfig:
     entry_nodes: tuple[str, ...] = ("junction", "entrance")
     # RL 이 WAIT 을 반환했을 때 슬롯 배정을 다시 시도하는 간격 (프레임)
     alloc_retry_frames: int = 10
+    # 최초 allocation 전에 손으로 차량을 놓는 transient pose를 거른다.
+    initial_pose_observations: int = 3
+    initial_pose_stability_mm: float = 30.0
+    initial_heading_stability_deg: float = 5.0
+    # Parking recovery가 fresh pose를 기다리는 동안 detector track_id가
+    # 바뀌었을 때만 쓰는 보수적 재결합 조건. 현재 production은 1대 전용이다.
+    track_rebind_stale_frames: int = 8
+    track_rebind_max_distance_mm: float = 150.0
+    # Rebind itself takes about 8 frames (~2 s at the measured 4 FPS).  Allow
+    # another ten fresh frames for a physical/trajectory heading, then enter an
+    # explicit zero-control fault instead of an unbounded silent wait.
+    critical_heading_wait_timeout_s: float = 2.5
 
     # ─── B안 주행 제어 (DIRECT_CONTROL) ──────────────────────────────────────
     # 노트북이 throttle/steering 을 계산해 내려준다. 실차 안전을 위해 기본은
@@ -95,6 +107,7 @@ class PipelineConfig:
     # 같은 슬롯으로 경로를 다시 만드는 최대 횟수. 초과하면 정지한다 —
     # 기하가 같으면 같은 지점에서 계속 실패해 무한 루프가 된다.
     max_replan_attempts: int = 3
+    max_parking_recovery_attempts: int = 3
     # 후진 복구를 걸 waypoint phase.
     #
     # 통로 중간(CRUISE)은 허용오차가 넓고 다음 점이 이어지므로, 조금 밀려도
@@ -107,6 +120,39 @@ class PipelineConfig:
     # 목표가 전진 사각지대에 들어간 상태로 이만큼 연속 관측되면 경로 이탈로
     # 보고 후진 복구를 건다. 1프레임으로 판단하면 pose 잡음에 걸린다.
     deviation_frames: int = 3
+    # 후진 주차(ENTRY/FINAL) 전용 이탈 감시.
+    #
+    # 기존 이탈 감시는 "목표를 전진으로 잡을 수 있나"라서 후진 목표에는 의미가
+    # 없다. 그래서 후진은 통째로 건너뛰고 있었는데, 후면주차 ENTRY 가 발산하면
+    # 아무도 멈추지 않아 차가 맵 밖 1m 까지 나간다(closed-loop 확인).
+    # 대신 **목표까지 거리가 다시 멀어지는지**를 본다 — 후진이든 전진이든
+    # 수렴하지 않으면 경로가 틀린 것이다.
+    reverse_divergence_mm: float = 150.0
+    # 차체 4모서리가 맵 경계를 이만큼 넘어서면 즉시 정지시킨다.
+    # 후진 발산은 몇 초 만에 수백 mm 를 벌리므로 마지막 물리적 방어선이 필요하다.
+    # Safety 판정 전용 측정 불확실성 허용치. 맵/planner geometry는 확장하지 않는다.
+    # footprint 초과가 이 값 이하이면 pose/calibration/heading 오차로 취급한다.
+    boundary_hard_margin_mm: float = 20.0
+    # RUNNING에서도 20--30mm는 카메라/기준점 불확실성 band로 분리한다.
+    # 단일 fresh frame은 hard fault가 아니며, 연속 증가 또는 predictive
+    # guard가 진행을 인정하면 즉시 zero/replan한다. Planner geometry는
+    # 이 값으로 확장하지 않는다.
+    boundary_measurement_uncertainty_mm: float = 10.0
+    boundary_uncertain_confirm_frames: int = 2
+    boundary_uncertain_increase_mm: float = 1.0
+    # DONE/PARKED는 controller가 이미 zero를 고정한다. 이 terminal-zero
+    # 상태의 30mm 초과 단발 spike만 연속 관측로 확정한다.
+    boundary_terminal_confirm_frames: int = 2
+    # Five 100 ms control ticks, equal to the controller's 0.5 s pose-freshness
+    # deadline.  Prediction stops parking before the unchanged hard boundary is
+    # crossed; it does not enlarge map geometry or tolerance.
+    boundary_prediction_horizon_s: float = 0.5
+    # 주차 모델.
+    #   "handoff" — 슬롯 앞 통로에 가로로 세우고 끝낸다. 08-12 실차 성공 경로.
+    #   "rear"    — 후진으로 슬롯 안까지 넣는다 (build_rear_parking_waypoints).
+    # 후면주차가 실차에서 안 되면 돌아갈 길이 필요하므로 기존 모델을 지우지
+    # 않고 스위치로 둔다. **rear 는 현재 B1 만 검증됐다.**
+    parking_mode: str = "handoff"
     # 경로 계획에 쓸 최소 선회 반경(mm). None 이면 실측값(610mm).
     # 진입 우회전 실험용으로 낮춰 잡을 수 있다 — 차가 실제로 그 반경을 못 돌면
     # 원호 바깥으로 밀리므로, 제어값을 맞춘 뒤에만 의미가 있다.

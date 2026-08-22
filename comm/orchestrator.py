@@ -197,14 +197,25 @@ class MissionOrchestrator:
             if m.current is None:
                 m.state = MissionState.DONE   # 방어적 처리 (FINAL은 보통 위에서 분기)
                 return
-            self._load_current(m)
+            try:
+                self._load_current(m)
+            except RuntimeError as exc:
+                m.state = MissionState.HELD
+                log.warning("car %d: waypoint load deferred after session loss (%s)",
+                            car_id, exc)
 
         elif m.state is MissionState.LOADING and state == "WAITING" \
                 and status.get("target_loaded") \
                 and status.get("route_id") == m.route_id \
                 and status.get("waypoint_id") == (m.current.waypoint_id if m.current else -1):
-            self.server.send_go(car_id, m.route_id, m.current.waypoint_id)
-            m.state = MissionState.RESUMING
+            try:
+                self.server.send_go(car_id, m.route_id, m.current.waypoint_id)
+            except RuntimeError as exc:
+                m.state = MissionState.HELD
+                log.warning("car %d: GO deferred after session loss (%s)",
+                            car_id, exc)
+            else:
+                m.state = MissionState.RESUMING
 
         elif m.state is MissionState.RESUMING and state == "MOVING":
             m.state = MissionState.DRIVING

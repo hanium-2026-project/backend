@@ -23,12 +23,14 @@ def pose_from_backend(obj: Any, *, obs_time: float) -> Pose:
     ★ obs_time 은 **카메라 관측이 발생한 시각**이어야 한다(현재 tick 시각이 아님).
       이 값이 stale 판정의 기준이 되므로, 새 프레임이 없으면 갱신하지 말 것.
     """
+    source = getattr(obj, "heading_source", None)
     return Pose(
         x_mm=float(getattr(obj, "x_mm")),
         y_mm=float(getattr(obj, "y_mm")),
         heading_deg=_opt_float(getattr(obj, "heading_deg", None)),
         timestamp=float(obs_time),
         valid=bool(getattr(obj, "valid", True)),
+        heading_source=None if source is None else str(source),
     )
 
 
@@ -56,6 +58,9 @@ def waypoint_from_backend(obj: Any) -> Waypoint:
         heading_tolerance_deg=float(getattr(obj, "heading_tolerance_deg", 30.0)),
         heading_required=bool(getattr(obj, "heading_required", False)),
         is_final=bool(getattr(obj, "is_final", False)),
+        curvature=float(getattr(obj, "curvature", 0.0) or 0.0),
+        path_capture_tolerance_cm=_opt_float(
+            getattr(obj, "path_capture_tolerance_cm", None)),
         route_id=getattr(obj, "route_id", None),
         waypoint_id=getattr(obj, "waypoint_id", None),
         phase=getattr(obj, "phase", None),

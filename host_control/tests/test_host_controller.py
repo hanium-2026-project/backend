@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import unittest
 
-from controller.models import ControlCommand, ControlMode, Pose, Waypoint
+from controller.config import ControllerConfig
+from controller.models import (ControlCommand, ControlMode, MotionDirection,
+                               Pose, Waypoint)
 from host_control import (
     Authority,
     HostController,
@@ -119,6 +121,210 @@ class TestStaleAndFault(unittest.TestCase):
 
 
 class TestRecoveryHold(unittest.TestCase):
+    @staticmethod
+    def _reverse_host(*, timeout: float = 0.5) -> HostController:
+        mission = HostWaypointMission([
+            Waypoint(
+                -500.0, 200.0, target_heading_deg=10.0,
+                position_tolerance_cm=4.0, phase="ENTRY",
+                motion_direction=MotionDirection.REVERSE,
+                curvature=1.0 / 800.0,
+            )
+        ])
+        host = HostController(
+            mission=mission,
+            config=ControllerConfig(
+                allow_reverse=True,
+                reverse_heading_wait_timeout_s=timeout,
+            ),
+        )
+        host.arm_auto()
+        return host
+
+    def test_fresh_unsafe_reverse_heading_has_bounded_replan_timeout(self) -> None:
+        mission = HostWaypointMission([
+            Waypoint(
+                500.0, 0.0, target_heading_deg=0.0,
+                position_tolerance_cm=4.0, phase="ENTRY",
+                motion_direction=MotionDirection.REVERSE,
+                curvature=1.0 / 800.0,
+            )
+        ])
+        hc = HostController(
+            mission=mission,
+            config=ControllerConfig(
+                allow_reverse=True, reverse_heading_wait_timeout_s=0.5))
+        hc.arm_auto()
+
+        def trajectory_pose(t: float) -> Pose:
+            return Pose(0.0, 0.0, 0.0, timestamp=t,
+                        heading_source="TRAJECTORY")
+
+        first = hc.tick(100.0, observation=trajectory_pose(100.0))
+        waiting = hc.tick(100.4, observation=trajectory_pose(100.4))
+        timed_out = hc.tick(100.5, observation=trajectory_pose(100.5))
+        self.assertEqual(first.command.reason, "REVERSE_HEADING_UNSAFE")
+        self.assertEqual(waiting.command.reason, "REVERSE_HEADING_UNSAFE")
+        self.assertEqual(timed_out.command.reason, "REVERSE_HEADING_TIMEOUT")
+        self.assertIs(timed_out.mission_status, MissionStatus.REPLAN_REQUIRED)
+        self.assertEqual(timed_out.command.throttle, 0.0)
+
+    def test_reverse_last_valid_holds_zero_then_fresh_heading_resumes(self) -> None:
+        hc = self._reverse_host()
+
+        moving = hc.tick(
+            100.0,
+            observation=Pose(
+                0.0, 0.0, 0.0, timestamp=100.0,
+                heading_source="FRONT_CUSHION"),
+        )
+        held = hc.tick(
+            100.1,
+            observation=Pose(
+                -10.0, 3.0, 0.0, timestamp=100.1,
+                heading_source="LAST_VALID"),
+        )
+        resumed = hc.tick(
+            100.2,
+            observation=Pose(
+                -20.0, 6.0, 1.0, timestamp=100.2,
+                heading_source="FRONT_CUSHION"),
+        )
+
+        self.assertLess(moving.command.throttle, 0.0)
+        self.assertEqual(held.command.reason, "REVERSE_HEADING_UNSAFE")
+        self.assertEqual(held.command.throttle, 0.0)
+        self.assertLess(resumed.command.throttle, 0.0)
+        self.assertIs(resumed.authority, Authority.AUTO_HOST)
+        self.assertIs(resumed.mission_status, MissionStatus.RUNNING)
+
+    def test_reverse_pose_gap_holds_zero_without_latching_then_resumes(self) -> None:
+        hc = self._reverse_host(timeout=0.5)
+        hc.tick(
+            100.0,
+            observation=Pose(
+                0.0, 0.0, 0.0, timestamp=100.0,
+                heading_source="FRONT_CUSHION"),
+        )
+
+        stale = hc.tick(100.6)
+        resumed = hc.tick(
+            100.7,
+            observation=Pose(
+                -20.0, 6.0, 1.0, timestamp=100.7,
+                heading_source="FRONT_CUSHION"),
+        )
+
+        self.assertEqual(stale.command.reason, "POSE_STALE")
+        self.assertEqual(stale.command.throttle, 0.0)
+        self.assertIs(stale.authority, Authority.AUTO_HOST)
+        self.assertIs(stale.mission_status, MissionStatus.RUNNING)
+        self.assertLess(resumed.command.throttle, 0.0)
+
+    def test_reverse_pose_gap_times_out_to_replan_not_silent_fault(self) -> None:
+        hc = self._reverse_host(timeout=0.3)
+        hc.tick(
+            100.0,
+            observation=Pose(
+                0.0, 0.0, 0.0, timestamp=100.0,
+                heading_source="FRONT_CUSHION"),
+        )
+        held = hc.tick(100.6)
+        timed_out = hc.tick(100.9)
+
+        self.assertEqual(held.command.reason, "POSE_STALE")
+        self.assertEqual(timed_out.command.reason, "REVERSE_HEADING_TIMEOUT")
+        self.assertEqual(timed_out.command.throttle, 0.0)
+        self.assertIs(timed_out.authority, Authority.AUTO_HOST)
+        self.assertIs(timed_out.mission_status, MissionStatus.REPLAN_REQUIRED)
+
+    def test_reverse_no_pose_after_direction_interlock_is_bounded(self) -> None:
+        align = Waypoint(
+            60.0, 0.0, target_heading_deg=0.0,
+            position_tolerance_cm=2.0, heading_required=True,
+            heading_tolerance_deg=5.0, route_id=8, waypoint_id=1,
+            phase="ALIGN", motion_direction=MotionDirection.FORWARD,
+            curvature=1.0 / 1000.0, path_capture_tolerance_cm=10.0,
+        )
+        entry = Waypoint(
+            -500.0, 0.0, route_id=8, waypoint_id=2, phase="ENTRY",
+            motion_direction=MotionDirection.REVERSE,
+            curvature=1.0 / 800.0,
+        )
+        hc = HostController(
+            mission=HostWaypointMission([align, entry]),
+            config=ControllerConfig(
+                allow_reverse=True, reverse_heading_wait_timeout_s=0.3),
+        )
+        hc.arm_auto()
+        for i, x in enumerate((0.0, 15.0, 30.0, 60.0)):
+            t = 10.0 + i * 0.1
+            hc.tick(
+                t, observation=Pose(
+                    x, 0.0, 0.0, timestamp=t,
+                    heading_source="TRAJECTORY"),
+            )
+        interlock = hc.tick(10.4)
+        no_pose = hc.tick(10.5)
+        timed_out = hc.tick(10.81)
+
+        self.assertEqual(interlock.command.reason, "DIRECTION_CHANGE_STOP")
+        self.assertEqual(no_pose.command.reason, "NO_POSE")
+        self.assertEqual(timed_out.command.reason, "REVERSE_HEADING_TIMEOUT")
+        self.assertIs(timed_out.mission_status, MissionStatus.REPLAN_REQUIRED)
+
+    def test_reverse_continue_uses_direction_corrected_quality_trajectory(self) -> None:
+        """161237: fresh centres remain usable after a short cushion dropout."""
+        hc = self._reverse_host(timeout=2.5)
+        primary = hc.tick(
+            15.09,
+            observation=Pose(
+                476.1, 586.0, 349.9, timestamp=15.09,
+                heading_source="FRONT_CUSHION"),
+        )
+        acquiring = hc.tick(
+            15.31,
+            observation=Pose(
+                457.9, 589.0, 349.9, timestamp=15.31,
+                heading_source="LAST_VALID"),
+        )
+        fallback = hc.tick(
+            15.53,
+            observation=Pose(
+                432.9, 592.0, 349.9, timestamp=15.53,
+                heading_source="LAST_VALID"),
+        )
+
+        self.assertLess(primary.command.throttle, 0.0)
+        self.assertEqual(acquiring.command.throttle, 0.0)
+        self.assertLess(fallback.command.throttle, 0.0)
+        self.assertEqual(
+            hc.reverse_observation_state,
+            "REVERSE_TRACK_TRAJECTORY_FALLBACK",
+        )
+
+    def test_reverse_continue_rejects_jittering_last_valid(self) -> None:
+        hc = self._reverse_host(timeout=2.5)
+        hc.tick(
+            10.0,
+            observation=Pose(
+                0.0, 0.0, 0.0, timestamp=10.0,
+                heading_source="FRONT_CUSHION"),
+        )
+        held = None
+        for i, (x, y) in enumerate(((2.0, 1.0), (-1.0, 2.0), (1.0, -1.0)), 1):
+            held = hc.tick(
+                10.0 + i * 0.2,
+                observation=Pose(
+                    x, y, 0.0, timestamp=10.0 + i * 0.2,
+                    heading_source="LAST_VALID"),
+            )
+        self.assertIsNotNone(held)
+        self.assertEqual(held.command.throttle, 0.0)
+        self.assertEqual(held.command.reason, "REVERSE_HEADING_UNSAFE")
+        self.assertEqual(
+            hc.reverse_observation_state, "REVERSE_OBSERVATION_LOST")
+
     def test_replan_required_holds_zero_until_recovery_and_fresh_pose(self) -> None:
         mission = HostWaypointMission([
             Waypoint(
