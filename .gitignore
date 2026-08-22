@@ -30,3 +30,12 @@ videos/
 # 주행 로그 원본은 용량이 커서 제외. 인수인계용으로 추린 것만 커밋한다.
 logs/*.csv
 !logs/handoff_*/
+
+# ─── 로컬 전용 (2026-08-22) ────────────────────────────────────────────────
+# 개발 PC 별 가상환경 / 에이전트 설정
+.venv/
+.claude/
+# 카메라를 다시 달 때마다 새로 만든다 (tools/calibrate_camera.py --out)
+calibration_new.json
+# 편집 전 수동 백업본 (예: *.py.before_stiction)
+*.before_*
