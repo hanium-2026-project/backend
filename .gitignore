@@ -39,3 +39,6 @@ logs/*.csv
 calibration_new.json
 # 편집 전 수동 백업본 (예: *.py.before_stiction)
 *.before_*
+
+# 촬영 원본/라벨 (수 GB). 데이터셋은 Roboflow 에 올리고 저장소엔 두지 않는다.
+data/

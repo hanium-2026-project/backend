@@ -111,6 +111,29 @@ def norm_label(name: str) -> str:
     return aliases.get(k, k)
 
 
+def camera_backend() -> int:
+    """플랫폼별 OpenCV 카메라 백엔드를 고른다.
+
+    CAP_DSHOW 는 Windows 전용(DirectShow)이다. 이 도구는 Windows 개발 PC 에서
+    작성돼 CAP_DSHOW 가 하드코딩돼 있었고, 그 상태로는 macOS 에서 카메라가
+    아예 열리지 않는다. 같은 CSV 를 두 OS 에서 뽑을 수 있어야 하므로
+    OS 별 기본 백엔드를 쓴다.
+    """
+    if _sys.platform.startswith("win"):
+        return cv2.CAP_DSHOW
+    if _sys.platform == "darwin":
+        return cv2.CAP_AVFOUNDATION
+    return cv2.CAP_ANY
+
+
+def require_file(path: str, what: str, hint: str) -> Path:
+    """필수 입력 파일을 검사한다 — 없으면 traceback 대신 할 일을 알려준다."""
+    p = Path(path)
+    if not p.is_file():
+        raise SystemExit(f"[ERROR] {what}: 파일을 찾을 수 없습니다 — {p}\n        {hint}")
+    return p
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--camera", type=int, default=1)
@@ -128,8 +151,22 @@ def main() -> int:
                     help="정적 진단 조건 라벨 순서 (n 키로 다음 조건 + 상태 reset)")
     ap.add_argument("--sidecar", default=SIDECAR_DEFAULT,
                     help="bridge 가 쓰는 현재 명령 JSON (없어도 동작)")
+    # 재학습 데이터 수집용. CSV 만으로는 라벨링할 이미지가 남지 않는다.
+    ap.add_argument("--save-frames", default="",
+                    help="원본 프레임을 저장할 디렉토리 (비우면 저장 안 함). "
+                         "오버레이 없는 원본을 저장하므로 그대로 라벨링에 쓸 수 있다")
+    ap.add_argument("--save-every", type=int, default=1,
+                    help="N 프레임마다 1장 저장 (연속 프레임은 거의 중복이다)")
+    ap.add_argument("--save-miss-only", action="store_true",
+                    help="FRONT_CUSHION 미검출 프레임만 저장 — 하드 포지티브 수집용. "
+                         "쿠션은 실제로 있는데 모델이 놓친 프레임이므로 라벨을 달아 학습시킨다")
     a = ap.parse_args()
 
+    require_file(a.calibration, "캘리브레이션 파일",
+                 "카메라를 다시 달았다면 tools/calibrate_camera.py --out 으로 새로 만들고, "
+                 "아니면 --calibration 으로 경로를 지정하세요.")
+    require_file(a.weights, "YOLO 가중치",
+                 "--weights 로 경로를 지정하세요 (예: ~/Downloads/best.pt).")
     calib = json.loads(Path(a.calibration).read_text(encoding="utf-8"))
     src = np.asarray(calib["homography_src"], dtype=np.float32)
     W = float(calib.get("lot_width_mm", 1200.0))
@@ -142,6 +179,13 @@ def main() -> int:
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    frames_dir: Path | None = None
+    if a.save_frames:
+        frames_dir = Path(a.save_frames)
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] 프레임 저장: {frames_dir} (every {a.save_every}, "
+              f"{'쿠션 미검출만' if a.save_miss_only else '전부'})")
+
     print("[INFO] camera-only logger: NO vehicle control")
     print("[INFO] CSV:", out)
     print("[INFO] keys:  n = 다음 조건 10s 측정 시작   r = 현재 조건 재측정   q = 종료")
@@ -152,9 +196,25 @@ def main() -> int:
                                    custom_model=True, imgsz=a.imgsz,
                                    device=a.device)
     heading_est = HeadingEstimator()
-    cap = cv2.VideoCapture(a.camera, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(a.camera, camera_backend())
     if not cap.isOpened():
-        raise SystemExit(f"cannot open camera {a.camera}")
+        raise SystemExit(
+            f"[ERROR] 카메라 {a.camera} 를 열 수 없습니다.\n"
+            "        --camera 인덱스를 바꿔보세요 (0, 1, 2 …). macOS 는 내장캠이나 "
+            "연속성 카메라가 앞 인덱스를 가져가는 경우가 있습니다.")
+
+    # 캘리브레이션은 특정 해상도의 픽셀 좌표다. 캡처 해상도가 다르면 homography
+    # 가 통째로 어긋나는데, 화면상으로는 멀쩡해 보여서 알아채기 어렵다.
+    expect = calib.get("frame_size")
+    ok, probe = cap.read()
+    if ok and expect:
+        got = [int(probe.shape[1]), int(probe.shape[0])]
+        if got != [int(expect[0]), int(expect[1])]:
+            raise SystemExit(
+                f"[ERROR] 캡처 해상도({got[0]}x{got[1]})가 캘리브레이션 기준"
+                f"({int(expect[0])}x{int(expect[1])})과 다릅니다.\n"
+                "        이 상태의 좌표는 전부 틀립니다. 같은 해상도로 맞추거나 "
+                "해당 해상도에서 캘리브레이션을 다시 하세요.")
 
     sidecar = CommandSidecar(a.sidecar)
     print("[INFO] sidecar:", sidecar.path, "(없으면 명령 컬럼만 빈다)")
@@ -168,6 +228,8 @@ def main() -> int:
         "assoc_unpaired_cars",
         # 조건 간 estimator 상태 carry-over 를 막기 위한 구간 표식.
         "condition","frames_since_reset","analysis_valid",
+        # 저장한 원본 프레임 파일명 — 라벨링 후 CSV 의 검출 수치와 대조한다.
+        "frame_file",
     ] + CommandSidecar.FIELDS
     t0 = time.monotonic()
     frame_idx = rows = 0
@@ -239,6 +301,21 @@ def main() -> int:
                     "assoc_unpaired_cars": len(unpaired),
                 }
 
+                # 재학습용 원본 프레임 저장.
+                # - 오버레이(rectangle/putText)는 frame 을 제자리에서 바꾸므로
+                #   반드시 그리기 **전에** 저장해야 라벨링 가능한 이미지가 남는다.
+                # - rc_car 미검출이면 아래에서 CSV 행 자체가 안 써지므로,
+                #   저장은 car_det 블록 밖에서 한다 (완전 미검출 프레임도 필요하다).
+                frame_file = ""
+                if (frames_dir is not None
+                        and frame_idx % a.save_every == 0
+                        and not (a.save_miss_only
+                                 and perception["det_front_cushion"] > 0)):
+                    save_cond = (conditions[cond_idx]
+                                 if 0 <= cond_idx < len(conditions) else "idle")
+                    frame_file = f"{save_cond}_{frame_idx:06d}.jpg"
+                    cv2.imwrite(str(frames_dir / frame_file), frame)
+
                 # 차체가 잡힌 프레임은 쿠션 유무와 무관하게 기록한다.
                 car_det = front_px = None
                 cushion_conf = cushion_tid = None
@@ -274,6 +351,7 @@ def main() -> int:
                                       if 0 <= cond_idx < len(conditions) else ""),
                         "frames_since_reset": frames_since_reset,
                         "analysis_valid": 1 if measuring else 0,
+                        "frame_file": frame_file,
                         "wall_time": datetime.now().isoformat(timespec="milliseconds"),
                         "t_s": f"{ts:.4f}", "frame_idx": frame_idx,
                         "x_mm": f"{x:.2f}", "y_mm": f"{y:.2f}",
