@@ -61,10 +61,31 @@ class CameraSerializer(serializers.ModelSerializer):
 
     lot_id = serializers.PrimaryKeyRelatedField(source="lot", queryset=ParkingLot.objects.all())
     spot_id = serializers.PrimaryKeyRelatedField(source="spot", queryset=ParkingSpot.objects.all(), allow_null=True, required=False)
+    # 실시간 영상이 지금 들어오고 있는지. 프론트가 카메라 ID 로 추측하면
+    # 파이프라인 설정이 바뀔 때마다 화면이 거짓말을 하므로 서버가 알려준다.
+    has_stream = serializers.SerializerMethodField()
 
     class Meta:
         model = Camera
-        fields = ["camera_id", "lot_id", "spot_id", "location_desc", "status", "last_heartbeat"]
+        fields = ["camera_id", "lot_id", "spot_id", "location_desc", "status",
+                  "last_heartbeat", "has_stream"]
+
+    def get_has_stream(self, obj) -> bool:
+        """Redis 에 최신 프레임 키가 살아 있는지 본다 (TTL 이 곧 신선도)."""
+        from django.conf import settings
+
+        url = getattr(settings, "REDIS_URL", "") or ""
+        if not url:
+            return False
+        try:
+            import redis
+
+            from pipeline.camera_stream import frame_key
+
+            client = redis.Redis.from_url(url, socket_timeout=0.3)
+            return bool(client.exists(frame_key(obj.camera_id)))
+        except Exception:
+            return False
 
 
 class EntryExitSerializer(serializers.ModelSerializer):
