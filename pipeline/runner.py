@@ -1163,23 +1163,28 @@ class ParkingPipeline:
 
     def _push_to_vehicle(self, view: VehicleView) -> None:
         """도착 판정 + POSE 스트림 갱신."""
-        if view.car_id is None:
-            return
-        mission = self.orchestrator.missions.get(view.car_id)
+        mission = (self.orchestrator.missions.get(view.car_id)
+                   if view.car_id is not None else None)
         # PARKED 재검증은 실제 정지를 함께 확인한다 (§11)
         if mission is not None and mission.state is MissionState.PARKED_CHECK:
             if not view.is_stationary(self.config.stationary_tolerance_mm,
                                       self.config.stationary_window):
                 return
-        mission = self.orchestrator.missions.get(view.car_id)
+        # 대시보드에는 바인딩 전(car_id 없음) 차량도 올린다. 카메라가 보고 있는데
+        # 화면에 없으면 관제에서 "인식 실패"와 "제어 미연결"을 구분할 수 없다.
+        status = "tracked" if view.car_id is None else (
+            "parked" if mission and mission.state is MissionState.DONE else "moving")
         self.dashboard.push_pose(
-            car_id=view.car_id, position_mm=view.position_mm,
-            status="parked" if mission and mission.state is MissionState.DONE else "moving",
+            car_id=view.car_id, track_id=view.track_id, position_mm=view.position_mm,
+            status=status,
             heading_deg=view.heading_deg, heading_source=view.heading_source,
             parking_phase=mission.current.phase if mission and mission.current else None,
             route_id=mission.route_id if mission else None,
             waypoint_id=mission.current.waypoint_id if mission and mission.current else None,
         )
+        # 제어·미션 경로는 바인딩된 차량만 — 여기서부터는 car_id 가 필수다.
+        if view.car_id is None:
+            return
         if self.auto_host_mode:
             self._feed_auto_host(view)
         else:
