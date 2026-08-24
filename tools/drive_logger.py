@@ -85,7 +85,10 @@ def motor_duty_for(throttle: float, steering: float) -> int:
         hi = _lerp(_FW.pwm_forward_default, _FW.pwm_turn_default, t)
     else:
         t = (a - 0.5) / 0.5
-        lo = _lerp(_FW.pwm_turn_min, _FW.pwm_strong_turn_default, t)
+        # HW 7fc17c6: 강회전 최소 duty 를 기본값과 분리했다. 예전에는 min=default
+        # 라 최대 조향에서 throttle 이 무시됐다.
+        strong_min = getattr(_FW, "pwm_strong_turn_min", _FW.pwm_turn_min)
+        lo = _lerp(_FW.pwm_turn_min, strong_min, t)
         hi = _lerp(_FW.pwm_turn_default, _FW.pwm_strong_turn_default, t)
     return max(0, min(_FW.motor_pwm_max_duty, round(_lerp(lo, hi, mag))))
 

@@ -88,7 +88,18 @@ class ControlScheduler:
         self._thread.start()
 
     def stop(self) -> None:
+        """루프를 세운다. **제어 루프 안에서 호출해도 안전하다.**
+
+        on_tick 콜백은 이 스레드 위에서 돈다. 거기서 stop() 을 부르면
+        자기 자신을 join 하게 되어 RuntimeError 로 터지고, 그 예외가 콜백
+        경로를 타고 올라가 상태 전이가 통째로 유실된다(실차 확인).
+        같은 스레드면 정지 신호만 세우고 회수는 루프가 빠져나온 뒤에 한다.
+        """
         self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=2.0)
-            self._thread = None
+        t = self._thread
+        if t is None:
+            return
+        if t is threading.current_thread():
+            return                      # 루프가 다음 반복에서 스스로 빠져나온다
+        t.join(timeout=2.0)
+        self._thread = None

@@ -118,9 +118,13 @@ class RemoteDirectSession:
         self._enable_direct_stream()
         self.host.arm_auto()
 
-    def _enable_direct_stream(self) -> None:
+    def _enable_direct_stream(self, *, release_control: bool = True) -> None:
         try:
             self._server.direct_control_enabled = True
+            if release_control:
+                release = getattr(self._server, "release_control", None)
+                if release is not None:
+                    release(self._car_id)
         except Exception:
             pass
 

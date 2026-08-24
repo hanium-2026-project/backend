@@ -79,12 +79,27 @@ class HybridControlMux:
         y_mm: float,
         heading_deg: float,
         obs_time: float,
+        heading_source: str | None = None,
     ) -> None:
         # Always keep the pose source current, including while in MANUAL.
-        self.runner.on_camera_pose(x_mm, y_mm, heading_deg, obs_time)
+        self.runner.on_camera_pose(x_mm, y_mm, heading_deg, obs_time,
+                                   heading_source)
 
         # AUTO resume is deliberately gated by a genuinely new CV observation.
         if self.mode == "AUTO_PENDING":
+            # "새 관측"은 도착 자체가 아니라 **아직 신선한** 관측이어야 한다.
+            #
+            # obs_time 은 프레임을 찍은 시각인데, 그 프레임을 처리하는 동안
+            # 느린 작업(RL 정책 첫 추론 등)이 끼면 여기 도달했을 땐 이미
+            # max_pose_age_s 를 넘겨 있다. 그대로 스케줄러를 켜면 첫 tick 이
+            # POSE_STALE 을 보고 FAULTED 로 latch 되고, 자동 복구 경로가 없어
+            # 차가 슬롯을 배정받자마자 영구 정지한다 (실측: allocate 1.2s).
+            #
+            # 만료된 관측이면 켜지 않고 AUTO_PENDING 을 유지한다 — 다음
+            # 프레임이 오면 그때 출발한다. stale 판정 자체는 그대로 살린다.
+            age_s = time.monotonic() - obs_time
+            if age_s > self.host.config.max_pose_age_s:
+                return
             # 기존 스케줄러를 재시작한다 (새로 만들면 on_tick 콜백이 날아간다)
             self.runner.scheduler.start()
             self.mode = "AUTO_HOST"
@@ -138,6 +153,13 @@ class HybridControlMux:
         if self.mode in ("AUTO_HOST", "AUTO_PENDING"):
             return
 
+        if self.mode == "COMM_RECOVERY_HOLD":
+            self._send_zero_now()
+            self._safe_disarm()
+            self.host.arm_auto()
+            self.mode = "AUTO_PENDING"
+            return
+
         neutral = ManualInput(0.0, 0.0)
         with self._lock:
             self._manual = neutral
@@ -153,6 +175,14 @@ class HybridControlMux:
         # IMPORTANT: do not start scheduler here.
         # Starting before a new camera frame can latch STALE_POSE -> FAULTED.
         self.mode = "AUTO_PENDING"
+
+    def hold_for_comm_recovery(self, reason: str = "COMM_TIMEOUT") -> None:
+        """Stop both owners and latch authority until a fresh route is loaded."""
+        self._stop_manual_loop()
+        self.runner.scheduler.stop()
+        self._send_zero_now()
+        self.host.fault(reason)
+        self.mode = "COMM_RECOVERY_HOLD"
 
     def stop(self) -> None:
         if self.mode == "MANUAL_WASD":

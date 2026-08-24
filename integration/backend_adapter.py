@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
 
-from controller.models import Pose, Waypoint
+from controller.models import MotionDirection, Pose, Waypoint
 
 
 # --------------------------------------------------------------------- mapping
@@ -23,12 +23,14 @@ def pose_from_backend(obj: Any, *, obs_time: float) -> Pose:
     ★ obs_time 은 **카메라 관측이 발생한 시각**이어야 한다(현재 tick 시각이 아님).
       이 값이 stale 판정의 기준이 되므로, 새 프레임이 없으면 갱신하지 말 것.
     """
+    source = getattr(obj, "heading_source", None)
     return Pose(
         x_mm=float(getattr(obj, "x_mm")),
         y_mm=float(getattr(obj, "y_mm")),
         heading_deg=_opt_float(getattr(obj, "heading_deg", None)),
         timestamp=float(obs_time),
         valid=bool(getattr(obj, "valid", True)),
+        heading_source=None if source is None else str(source),
     )
 
 
@@ -40,18 +42,29 @@ def waypoint_from_backend(obj: Any) -> Waypoint:
     y_mm = getattr(obj, "y_mm", None)
     if y_mm is None:
         y_mm = getattr(obj, "y")
+    raw_direction = getattr(obj, "motion_direction", MotionDirection.FORWARD)
+    try:
+        direction = (raw_direction if isinstance(raw_direction, MotionDirection)
+                     else MotionDirection(str(raw_direction).upper()))
+    except ValueError as exc:
+        raise ValueError(f"invalid motion_direction: {raw_direction!r}") from exc
     return Waypoint(
         x_mm=float(x_mm),
         y_mm=float(y_mm),
         target_heading_deg=_opt_float(getattr(obj, "target_heading_deg", None)),
         speed_cm_s=float(getattr(obj, "speed_cm_s", 12.0)),
         position_tolerance_cm=float(getattr(obj, "position_tolerance_cm", 8.0)),
+        capture_tolerance_cm=_opt_float(getattr(obj, "capture_tolerance_cm", None)),
         heading_tolerance_deg=float(getattr(obj, "heading_tolerance_deg", 30.0)),
         heading_required=bool(getattr(obj, "heading_required", False)),
         is_final=bool(getattr(obj, "is_final", False)),
+        curvature=float(getattr(obj, "curvature", 0.0) or 0.0),
+        path_capture_tolerance_cm=_opt_float(
+            getattr(obj, "path_capture_tolerance_cm", None)),
         route_id=getattr(obj, "route_id", None),
         waypoint_id=getattr(obj, "waypoint_id", None),
         phase=getattr(obj, "phase", None),
+        motion_direction=direction,
     )
 
 

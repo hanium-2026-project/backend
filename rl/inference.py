@@ -16,6 +16,7 @@ Public API
 from __future__ import annotations
 
 import math
+import logging
 import os
 from typing import Any
 
@@ -24,6 +25,9 @@ import numpy as np
 # Module-level cache — avoids reloading the model on every inference call
 _loaded_model: Any | None = None
 _model_path_cache: str = ""
+_dependency_warning_emitted = False
+
+log = logging.getLogger(__name__)
 
 
 # ─── Unified Entry Point ──────────────────────────────────────────────────────
@@ -71,9 +75,9 @@ def load_policy(model_path: str = "models/sb3_parking_policy.zip") -> Any | None
     The loaded model is cached in a module-level variable; subsequent calls
     with the same path skip the disk read.
 
-    Raises
-    ------
-    ImportError if sb3-contrib is not installed and a model file is present.
+    If the optional inference dependency is unavailable, return ``None`` so
+    the caller uses the deterministic heuristic instead of killing the camera
+    and control pipeline.
     """
     global _loaded_model, _model_path_cache
 
@@ -86,11 +90,14 @@ def load_policy(model_path: str = "models/sb3_parking_policy.zip") -> Any | None
 
     try:
         from sb3_contrib import MaskablePPO
-    except ImportError as exc:
-        raise ImportError(
-            "sb3-contrib is required to load a trained policy. "
-            "Install with: pip install stable-baselines3 sb3-contrib"
-        ) from exc
+    except ImportError:
+        global _dependency_warning_emitted
+        if not _dependency_warning_emitted:
+            log.warning(
+                "sb3-contrib is unavailable; using deterministic slot "
+                "heuristic (trajectory safety validation remains active)")
+            _dependency_warning_emitted = True
+        return None
 
     _loaded_model = MaskablePPO.load(model_path)
     _model_path_cache = model_path

@@ -52,6 +52,7 @@ class AutoHostRunner:
         self.scheduler = ControlScheduler(self.host, period_s=period_s,
                                           on_tick=self._on_tick)
         self._last_status = self.mission.status
+        self.last_tick_result = None
         # (car_id, 이전 상태, 새 상태) — 파이프라인이 슬롯 점유·재계획을 처리한다
         self.on_status_change: Callable[[int, MissionStatus, MissionStatus], None] | None = None
         self.session.attach()
@@ -84,7 +85,8 @@ class AutoHostRunner:
             f"car {self.car_id}: REMOTE_DIRECT 협상 실패 "
             f"({self.session._rejected_reason or 'ACCEPTED 미도착'})")
 
-    def arm_session(self, *, wait_s: float = 2.0) -> None:
+    def arm_session(self, *, wait_s: float = 2.0,
+                    release_control: bool = True) -> None:
         """REMOTE_DIRECT 협상만 하고 자동 주행은 시작하지 않는다.
 
         카메라 없이 수동(WASD)만 쓸 때 필요하다. 세션·모드는 열어두되
@@ -101,7 +103,7 @@ class AutoHostRunner:
             raise ModeHandshakeError(
                 f"car {self.car_id}: REMOTE_DIRECT 협상 실패 "
                 f"({self.session._rejected_reason or 'ACCEPTED 미도착'})")
-        self.session._enable_direct_stream()
+        self.session._enable_direct_stream(release_control=release_control)
         log.info("car %d: REMOTE_DIRECT 세션 확보 (자동 주행은 미시작)", self.car_id)
 
     # ─── 협상 세부 ───────────────────────────────────────────────────────────
@@ -194,19 +196,44 @@ class AutoHostRunner:
     # ─── 파이프라인 연동 ─────────────────────────────────────────────────────
 
     def on_camera_pose(self, x_mm: float, y_mm: float,
-                       heading_deg: float | None, obs_time: float) -> None:
+                       heading_deg: float | None, obs_time: float,
+                       heading_source: str | None = None) -> None:
         """새 카메라 프레임에서만 호출. 제어 계산은 스케줄러가 한다.
 
         obs_time 은 **관측 시각**이어야 한다. tick 시각을 넣으면 카메라가 멈춰도
         pose 가 계속 신선해 보여서 stale 판정이 무력화된다.
         """
-        self.host.pose_source.observe(x_mm, y_mm, heading_deg, obs_time)
+        self.host.pose_source.observe(x_mm, y_mm, heading_deg, obs_time,
+                                      heading_source=heading_source)
 
     def load_route(self, backend_waypoints: Sequence[Any]) -> None:
-        """재계획된 경로로 교체한다."""
+        """새 route 로 교체한다. 새 카메라 pose 가 올 때까지 zero 를 유지한다.
+
+        HW 7fc17c6: route 를 갈아끼우는 순간 기존 pose·제어값을 재사용하면
+        옛 관측으로 출발할 수 있다. prepare_route_switch() 가 즉시 zero 를
+        내보내고 pose_source 를 비운다.
+        """
+        self.host.prepare_route_switch()
         self.mission.load(waypoints_from_backend(backend_waypoints))
-        self.host.auto_producer.reset()
         self._last_status = self.mission.status
+        self.last_tick_result = None
+
+    def prepare_route_switch(self) -> None:
+        """Hold zero and invalidate the current pose before a staged replan."""
+        self.host.prepare_route_switch()
+        self.last_tick_result = None
+
+    def load_recovery_waypoints(self, backend_waypoints: Sequence[Any]):
+        """REPLAN_REQUIRED 에서 복구 경로를 끼워 넣는다 (HW 7fc17c6).
+
+        복구 waypoint 를 마치면 실패했던 기존 target 과 남은 route 로 자동
+        복귀한다. 복구 경로 생성 자체는 상위(파이프라인) 몫이다.
+        """
+        self.host.prepare_route_switch()
+        status = self.mission.load_recovery(waypoints_from_backend(backend_waypoints))
+        self._last_status = self.mission.status
+        self.last_tick_result = None
+        return status
 
     def confirm_parked(self) -> None:
         self.mission.confirm_parked()
@@ -215,6 +242,37 @@ class AutoHostRunner:
     @property
     def current_target(self):
         return self.mission.current_target()
+
+    @property
+    def failed_target(self):
+        """REPLAN_REQUIRED 를 일으킨 target.
+
+        `current_target` 은 RUNNING 이 아니면 None 을 돌려주므로 재계획
+        시점에는 쓸 수 없다. 실패한 target 은 미션이 복귀용 snapshot 의
+        맨 앞에 보존해 두는데 공개 접근자가 없어 직접 읽는다.
+        """
+        resume = getattr(self.mission, "_resume_waypoints", None)
+        return resume[0] if resume else None
+
+    @property
+    def replan_reason(self) -> str | None:
+        return self.mission.replan_reason
+
+    @property
+    def current_phase(self):
+        return self.mission.current_phase
+
+    @property
+    def current_is_terminal(self) -> bool:
+        return self.mission.current_is_terminal
+
+    @property
+    def parking_active(self) -> bool:
+        return self.mission.parking_active
+
+    @property
+    def approach_stage(self) -> str:
+        return self.host.approach_guard.stage
 
     @property
     def status(self) -> MissionStatus:
@@ -228,6 +286,7 @@ class AutoHostRunner:
 
     def _on_tick(self, result) -> None:
         """제어 루프가 매 tick 부른다. 상태가 바뀐 순간만 위로 올린다."""
+        self.last_tick_result = result
         status = result.mission_status
         if status is self._last_status:
             return

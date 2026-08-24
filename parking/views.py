@@ -168,3 +168,81 @@ def recommend_spot_view(request) -> Response:
 def dashboard_view(request) -> Response:
     """Return full parking lot, camera, and recent transaction state."""
     return Response(dashboard_state())
+
+
+import time  # noqa: E402  (CCTV 스트림 유휴 판정용)
+
+
+# ─── CCTV MJPEG 중계 ──────────────────────────────────────────────────────
+# 카메라는 한 프로세스만 열 수 있어서 웹서버가 장치를 직접 못 읽는다.
+# run_pipeline 이 주석 그린 프레임을 Redis 에 올리고, 여기서 그걸 꺼내
+# multipart/x-mixed-replace 로 흘린다. 프론트는 <img src> 하나면 된다.
+
+_MJPEG_BOUNDARY = "frame"
+# 이만큼 새 프레임이 없으면 파이프라인이 멈춘 것으로 보고 스트림을 끝낸다.
+# 계속 붙들고 있으면 <img> 가 옛 화면을 띄운 채 굳는다.
+_STREAM_IDLE_TIMEOUT_S = 5.0
+# 폴링 간격. 퍼블리셔가 기본 8fps 이므로 그보다 촘촘하게 본다.
+_STREAM_POLL_S = 0.04
+
+
+async def _mjpeg_frames(camera_id: int):
+    """Redis 의 최신 프레임을 multipart 청크로 흘린다.
+
+    **비동기 제너레이터여야 한다.** Django 의 ASGI 핸들러는 동기 이터레이터를
+    받으면 끝까지 소비한 뒤에야 응답을 내보내는데, 이 스트림은 끝이 없으므로
+    응답이 영원히 나가지 않는다 (실제로 그렇게 타임아웃났다).
+    """
+    import asyncio
+
+    from django.conf import settings
+    from redis import asyncio as aioredis
+
+    from pipeline.camera_stream import frame_key
+
+    url = getattr(settings, "REDIS_URL", "") or ""
+    if not url:
+        return
+    try:
+        client = aioredis.from_url(url)
+    except Exception:
+        return
+
+    key = frame_key(camera_id)
+    last = None
+    idle_since = time.monotonic()
+    try:
+        while True:
+            try:
+                data = await client.get(key)
+            except Exception:
+                return                              # Redis 끊김 → 스트림 종료
+            if data and data != last:
+                last = data
+                idle_since = time.monotonic()
+                yield (b"--" + _MJPEG_BOUNDARY.encode() + b"\r\n"
+                       b"Content-Type: image/jpeg\r\n"
+                       b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n"
+                       + data + b"\r\n")
+            elif time.monotonic() - idle_since > _STREAM_IDLE_TIMEOUT_S:
+                return                              # 파이프라인 정지로 판단
+            await asyncio.sleep(_STREAM_POLL_S)
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+
+def camera_stream_view(request, camera_id: int):
+    """실시간 카메라 프레임을 MJPEG 로 중계한다 (탐지 박스가 그려진 화면)."""
+    from django.http import StreamingHttpResponse
+
+    response = StreamingHttpResponse(
+        _mjpeg_frames(camera_id),
+        content_type=f"multipart/x-mixed-replace; boundary={_MJPEG_BOUNDARY}",
+    )
+    # 프록시·브라우저가 스트림을 버퍼링하거나 캐시하면 화면이 밀린다.
+    response["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response["X-Accel-Buffering"] = "no"
+    return response

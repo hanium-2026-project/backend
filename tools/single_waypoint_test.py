@@ -51,6 +51,7 @@ from cv.tracker import RCCarTracker, TrackState                   # noqa: E402
 from cv.vehicle_detector import YoloVehicleDetector               # noqa: E402
 from parking.waypoints import Waypoint                            # noqa: E402
 from tools.drive_logger import DriveLogger                        # noqa: E402
+from tools.run_recorder import RunRecorder                        # noqa: E402
 
 log = logging.getLogger("single_wp")
 
@@ -98,6 +99,32 @@ class SingleWaypointTest:
         self.server.start()
         print(f"차량 서버 :{self.server.bound_port} — ESP32 접속 대기")
 
+        self.recorder: RunRecorder | None = None
+        self._frame_id = 0
+        self._last_frame_idx = None
+        self._dropped = 0
+        self._last_pose_rec: dict | None = None
+        if args.record:
+            self.recorder = RunRecorder(
+                args.record, self.server, car_id=args.car,
+                pose_provider=lambda: self._last_pose_rec,
+                runner_provider=lambda: self.runner,
+                params={
+                    "steer_kp": args.steer_kp,
+                    "steer_normalize_deg": args.steer_normalize,
+                    "max_wire_steering": args.max_steering,
+                    "wire_steering_sign": args.steering_sign,
+                    "max_throttle": args.max_throttle,
+                    "speed_cm_s": args.speed,
+                    "position_tolerance_cm": args.tolerance,
+                    "control_period_s": 0.1,
+                    "imgsz": args.imgsz, "conf": args.conf,
+                },
+                calibration=self._calibration_meta(),
+            )
+            self.recorder.start()
+            print(f"Run 기록: {self.recorder.dir}")
+
         self.logger: DriveLogger | None = None
         if args.log:
             self.logger = DriveLogger(
@@ -110,6 +137,17 @@ class SingleWaypointTest:
             )
             self.logger.start()
             print(f"주행 로그: {args.log}")
+
+    def _calibration_meta(self) -> dict:
+        """metadata.json 에 넣을 캘리브레이션 원본 (homography 는 첫 프레임에 채운다)."""
+        meta = {"source": self.args.calibration or "full-frame",
+                "lot_width_mm": self.lot_w, "lot_height_mm": self.lot_h}
+        if self.args.calibration:
+            try:
+                meta["file"] = json.loads(Path(self.args.calibration).read_text())
+            except Exception:                            # noqa: BLE001
+                pass
+        return meta
 
     # ─── 통신 ────────────────────────────────────────────────────────────────
 
@@ -152,6 +190,8 @@ class SingleWaypointTest:
             print(f"✗ AUTO_HOST 무장 실패: {exc}")
             self.armed = False
             return False
+        if self.recorder is not None:
+            self.recorder.write_route([wp])
         self._peak_steer = 0.0
         self.armed = True
         self.runner.scheduler.start()   # 이미 돌고 있으면 무시된다
@@ -205,6 +245,13 @@ class SingleWaypointTest:
             import numpy as np
             self.inv = np.linalg.inv(np.asarray(self.homography, dtype=float))
             print(f"homography 준비 (프레임 {w}x{h} → {self.lot_w:.0f}x{self.lot_h:.0f}mm)")
+            if self.recorder is not None:
+                mp = self.recorder.dir / "metadata.json"
+                m = json.loads(mp.read_text())
+                m["calibration"]["homography_matrix"] = [
+                    [float(v) for v in r] for r in self.homography]
+                m["calibration"]["frame_size"] = [w, h]
+                mp.write_text(json.dumps(m, ensure_ascii=False, indent=2))
 
         # 클릭 반영은 차량 탐지보다 먼저 한다 — 미탐지 상태에서 찍어둘 수 있어야 한다
         with self._lock:
@@ -230,14 +277,49 @@ class SingleWaypointTest:
         front_px = pairs[0].cushion_center_px if pairs else None
         if det is None:
             self.pose_mm = None
+            if self.recorder is not None:
+                self._frame_id += 1
+                self.recorder.log_pose({
+                    "frame_id": self._frame_id,
+                    "tracker_frame_index": state.frame_index,
+                    "capture_ts": state.timestamp, "valid": False,
+                    "reason": "NO_DETECTION", "fps": round(state.fps, 1),
+                })
             return
 
+        t_recv = time.monotonic()
         x1, y1, x2, y2 = det.bbox
-        mx, my = warp_point(((x1 + x2) / 2.0, (y1 + y2) / 2.0), self.homography)
+        cx_px, cy_px = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        mx, my = warp_point((cx_px, cy_px), self.homography)
         self.pose_mm = (mx, my)
         front_mm = warp_point(front_px, self.homography) if front_px else None
         hr = self.heading.update(0, (mx, my), front_point=front_mm)
         self.heading_deg, self.heading_source = hr.heading_deg, hr.source
+
+        self._frame_id += 1
+        if self._last_frame_idx is not None and state.frame_index - self._last_frame_idx > 1:
+            self._dropped += state.frame_index - self._last_frame_idx - 1
+        self._last_frame_idx = state.frame_index
+        self._last_pose_rec = {
+            "frame_id": self._frame_id, "tracker_frame_index": state.frame_index,
+            "capture_ts": state.timestamp,          # 프레임 취득 시각 (tracker 기준)
+            "pose_ts": time.monotonic(),            # pose 산출 완료 시각
+            "obs_time": state.timestamp,            # Host 에 넘긴 관측 시각
+            "track_id": det.track_id,
+            "pixel_x": round(cx_px, 1), "pixel_y": round(cy_px, 1),
+            "bbox": [int(x1), int(y1), int(x2), int(y2)],
+            "x_mm": round(mx, 1), "y_mm": round(my, 1),
+            "heading_deg": (None if self.heading_deg is None
+                            else round(self.heading_deg, 1)),
+            "heading_source": self.heading_source,
+            "valid": True,
+            "confidence": det.confidence,
+            "latency_ms": round((time.monotonic() - t_recv) * 1000, 2),
+            "fps": round(state.fps, 1),
+            "dropped_total": self._dropped,
+        }
+        if self.recorder is not None:
+            self.recorder.log_pose(self._last_pose_rec)
 
         if self.runner is not None:
             self.runner.on_camera_pose(mx, my, self.heading_deg, state.timestamp)
@@ -410,6 +492,16 @@ class SingleWaypointTest:
             if self.logger is not None:
                 self.logger.stop()
                 print(f"로그 {self.logger.rows}행 기록: {self.args.log}")
+            if self.recorder is not None:
+                outcome = "ARRIVED" if (self.runner is not None and
+                                        str(getattr(self.runner.status, "value",
+                                                    "")) in ("DONE", "PARKED")
+                                        ) else "STOPPED"
+                sm = self.recorder.stop(outcome=outcome)
+                print(f"Run 기록 완료: {self.recorder.dir}")
+                print(f"  pose {sm['pose_rows']}행 / control {sm['control_rows']}행 / "
+                      f"{sm['duration_s']}초, 최소접근 {sm['approach_min_distance_cm']}cm, "
+                      f"overshoot {sm['approach_overshoot_cm']}cm")
             self.server.stop()
             print("종료")
 
@@ -440,6 +532,9 @@ def main() -> None:
     p.add_argument("--heading-min-move", type=float, default=30.0)
     p.add_argument("--log", default=None,
                    help="주행 로그 CSV 경로 (예: logs/run1.csv)")
+    p.add_argument("--record", default=None,
+                   help="Run 기록 디렉터리 루트 (예: runs). run_YYYYMMDD_HHMMSS/ 가 "
+                        "생기고 metadata/route/pose/control/events/summary 가 쌓인다")
     p.add_argument("--steer-kp", type=float, default=1.6,
                    help="조향 비례 게인 (크면 급하게 꺾는다)")
     p.add_argument("--steer-normalize", type=float, default=30.0,

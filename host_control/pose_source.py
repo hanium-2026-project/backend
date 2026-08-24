@@ -37,12 +37,15 @@ class CameraPoseSource:
         obs_time: float,
         *,
         valid: bool = True,
+        heading_source: Optional[str] = None,
     ) -> None:
         """새 카메라 관측을 기록한다.
 
         obs_time 은 **관측이 발생한 monotonic 시각**이어야 한다(현재 tick 시각이 아님).
+        heading_source 는 heading 을 무엇으로 쟀는지다 — 후진 안전 판정에 쓴다.
         """
         self._pose = Pose(
+            heading_source=heading_source,
             x_mm=float(x_mm),
             y_mm=float(y_mm),
             heading_deg=None if heading_deg is None else float(heading_deg),

@@ -39,27 +39,35 @@ class DashboardBridge:
 
     def __init__(self, pose_interval_s: float = 0.2) -> None:
         self.pose_interval_s = pose_interval_s
-        self._last_pose_at: dict[int, float] = {}
+        self._last_pose_at: dict[tuple[str, int | None], float] = {}
 
-    def push_pose(self, car_id: int, position_mm: tuple[float, float],
+    def push_pose(self, car_id: int | None, position_mm: tuple[float, float],
                   status: str = "moving", heading_deg: float | None = None,
                   heading_source: str | None = None, parking_phase: str | None = None,
                   route_id: int | None = None, waypoint_id: int | None = None,
-                  target_spot_id: int | None = None) -> None:
-        """실시간 위치를 보낸다. 화면 갱신에 필요한 정도로만 솎아낸다."""
+                  target_spot_id: int | None = None,
+                  track_id: int | None = None) -> None:
+        """실시간 위치를 보낸다. 화면 갱신에 필요한 정도로만 솎아낸다.
+
+        car_id 가 없는(=아직 ESP32 와 바인딩되지 않은) 차량도 보낸다. 카메라가
+        보고 있는데 화면에 없으면 관제 입장에서 인식 실패와 구분할 수 없다.
+        """
+        # 바인딩 전에는 track_id 가 유일한 키다. 두 키 공간이 섞이면 서로를
+        # 덮어써서 한 대가 사라진다.
+        key = ("car", car_id) if car_id is not None else ("track", track_id)
         now = time.monotonic()
-        if now - self._last_pose_at.get(car_id, 0.0) < self.pose_interval_s:
+        if now - self._last_pose_at.get(key, 0.0) < self.pose_interval_s:
             return
         services = _services()
         if services is None:
             return
-        self._last_pose_at[car_id] = now
+        self._last_pose_at[key] = now
         from parking.protocol import VehicleTelemetryMessage
         services.broadcast_vehicle_pose(VehicleTelemetryMessage(
             car_id=car_id, license_plate="", pos=position_mm, status=status,
             target_spot_id=target_spot_id, heading_deg=heading_deg,
             heading_source=heading_source, parking_phase=parking_phase,
-            route_id=route_id, waypoint_id=waypoint_id,
+            route_id=route_id, waypoint_id=waypoint_id, track_id=track_id,
         ))
 
     def push_event(self, event: str, **payload) -> None:

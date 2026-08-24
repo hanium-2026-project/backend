@@ -17,6 +17,13 @@ from enum import Enum
 from typing import Optional
 
 
+class MotionDirection(str, Enum):
+    """Waypoint가 요구하는 실제 이동 방향."""
+
+    FORWARD = "FORWARD"
+    REVERSE = "REVERSE"
+
+
 class ControlMode(str, Enum):
     """제어기 상태 라벨.
 
@@ -43,6 +50,11 @@ class Pose:
     heading_deg: Optional[float]  # None 이면 heading 미관측 → 안전상 정지
     timestamp: float              # monotonic 초. 신선도 판정 기준.
     valid: bool = True            # 트래킹 실패/로스트 시 False → 안전상 정지
+    # heading 을 무엇으로 쟀는가. "FRONT_CUSHION" | "TRAJECTORY" | "LAST_VALID".
+    # 궤적 기반(TRAJECTORY)은 **후진하면 진행방향이 뒤집혀 heading 이 180° 틀린다.**
+    # 후진 정밀 구간에서 그 값을 믿고 조향하면 상황을 악화시키므로 제어기가 막는다.
+    # None 이면 판단 불가로 보고 막지 않는다 (기존 호출부 호환).
+    heading_source: Optional[str] = None
 
     @property
     def has_heading(self) -> bool:
@@ -62,13 +74,29 @@ class Waypoint:
     target_heading_deg: Optional[float] = None
     speed_cm_s: float = 12.0
     position_tolerance_cm: float = 8.0
+    # APPROACH 1차 capture 반경. None이면 ControllerConfig 기본값 사용.
+    # position_tolerance_cm은 2차 정밀 완료 반경으로 유지한다.
+    capture_tolerance_cm: Optional[float] = None
     heading_tolerance_deg: float = 30.0
     heading_required: bool = False
     is_final: bool = False
+    # 이 waypoint 로 향하는 **경로 구간의 곡률** (1/mm, 부호 있음).
+    #
+    #   dθ = curvature × ds      (ds = 차체 heading 방향 부호 있는 이동량)
+    #   + = 좌회전(heading 증가),  0 = 직선
+    #
+    # 후진 구간에서도 같은 정의를 쓴다 — ds 가 음수라 부호가 자동으로 맞는다.
+    # planner 가 채워 넣고 제어기는 이 값으로 steering feedforward 를 만든다.
+    # 제어기에 특정 반경(예: 700mm)을 박지 않기 위한 통로다.
+    curvature: float = 0.0
+    # 곡선의 중간 표본점을 이미 지나친 경우 사용할 경로 corridor 반경(cm).
+    # None이면 기존의 점 도착 판정만 사용한다. FINAL에는 설정하지 않는다.
+    path_capture_tolerance_cm: Optional[float] = None
     # 아래는 라우팅/디버깅용 메타. 제어 계산에는 직접 쓰지 않음.
     route_id: Optional[int] = None
     waypoint_id: Optional[int] = None
     phase: Optional[str] = None
+    motion_direction: MotionDirection = MotionDirection.FORWARD
 
 
 @dataclass(frozen=True)
@@ -79,7 +107,7 @@ class ControlCommand:
     그대로 넣을 수 있다.
 
     steering  : [-1, 1], **ESP32 실제 wire 부호** — 음수 = LEFT, 0 = CENTER, 양수 = RIGHT.
-    throttle  : [-1, 1], 양수 = 전진. (1차 controller 는 기본 전진 전용)
+    throttle  : [-1, 1], 양수 = 전진, 음수 = 후진.
     """
 
     throttle: float

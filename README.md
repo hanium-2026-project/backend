@@ -59,6 +59,55 @@ docker compose up --build -d
 - `GET /api/dashboard/`
 - `WS /ws/dashboard/`
 
+## 자율주차 제어 경로 (실차)
+
+REST/WS API 와 별개로, RC카 자동주차는 아래 경로로 동작한다.
+
+```
+천장 고정 카메라
+  → YOLO / OpenCV / Homography          (cv/)
+  → Vehicle Pose (x, y, heading)        (cv/heading.py, cv/association.py)
+  → 슬롯 배정                            (rl/, parking/)
+  → GLOBAL route                        (parking/waypoints.py)
+  → parking setup / recovery
+  → 후면주차 route (ALIGN/ENTRY/FINAL)
+  → 실행 전 경로 안전 검증               (parking/trajectory_safety.py)
+  → 노트북 AUTO_HOST                    (control/, controller/, host_control/)
+  → TCP / NDJSON                        (comm/)
+  → ESP32 REMOTE_DIRECT
+  → DC 모터 / 서보 / 엔코더
+  → 카메라 재관측 (closed loop)
+```
+
+핵심 계약 두 가지:
+
+- **production wire 는 `AUTO_HOST → REMOTE_DIRECT` 다.** throttle/steering 은
+  노트북이 계산해서 내려주고 ESP32 는 `DIRECT_CONTROL` 을 실행만 한다.
+  ESP32 의 `WAYPOINT_AUTO` 는 이 경로와 배타적이며 production 이 아니다.
+- **waypoint 는 목표 자체가 아니다.** 최종 slot pose 가 목표다. 작은 추종
+  오차는 피드백으로 흡수하고, 오차가 크거나 경로가 불가능해지면 정지 →
+  fresh pose → 재계획한다 (과거 waypoint 로 무조건 되돌아가지 않는다).
+
+파이프라인 실행 (production 경로는 `--control-mode auto-host` 를 명시해야 한다 —
+기본값은 `waypoint-auto` 다):
+
+```bash
+python manage.py run_pipeline --control-mode auto-host --calibration calibration.json --weights <best.pt> --show
+```
+
+제어/주차 관련 테스트는 Django 없이도 돌아간다:
+
+```bash
+python -m unittest discover -s . -p "test_*.py" -t .
+python tools/run_auto_parking_tests.py
+```
+
+### 현재 개발 상태
+
+현재 SW팀에서 RC카 및 `FRONT_CUSHION` 인식 안정화를 위해 카메라/YOLO 재학습과
+perception 개선을 진행 중이다. 해당 작업이 끝나면 실차 E2E 자동주차 테스트를
+재개할 예정이며, 그때까지 후면주차 경로·복구 로직은 안정화 진행 중으로 본다.
+
 ## Live Viz Demo
 
 차량 라우팅을 시각화하는 standalone HTML 데모는 별도 프론트 레포에 있다:
