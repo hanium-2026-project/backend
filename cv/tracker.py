@@ -48,6 +48,9 @@ class RCCarTracker:
         self._running = False
         # show=True 일 때 화면에 추가로 그릴 것을 상위가 주입한다 (image, state) -> image
         self.overlay: Callable[[object, TrackState], object] | None = None
+        # 주석 그려진 프레임을 밖으로 흘리는 훅 (MJPEG 스트림용).
+        # show 와 독립이다 — 시연 때는 GUI 창 없이 웹 대시보드로만 보기 때문.
+        self.frame_sink: Callable[[object, TrackState], None] | None = None
 
     def run(
         self,
@@ -98,13 +101,22 @@ class RCCarTracker:
                 else:
                     _default_log(state)
 
-                if show:
+                # 주석 프레임은 show 나 frame_sink 중 하나라도 있으면 만든다.
+                # 둘 다 없으면 복사·드로잉 비용을 아예 치르지 않는다.
+                if show or self.frame_sink is not None:
                     vis = _draw_detections(frame.image.copy(), state)
                     if self.overlay is not None:
                         vis = self.overlay(vis, state)
-                    cv2.imshow("RC Car Tracker", vis)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
+                    if self.frame_sink is not None:
+                        # 스트리밍 실패가 제어 루프를 멈추면 안 된다.
+                        try:
+                            self.frame_sink(vis, state)
+                        except Exception:
+                            pass
+                    if show:
+                        cv2.imshow("RC Car Tracker", vis)
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            break
 
                 if max_frames and frame.frame_index >= max_frames:
                     break

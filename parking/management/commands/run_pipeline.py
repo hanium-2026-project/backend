@@ -28,6 +28,28 @@ from tools.run_recorder import RunRecorder
 class Command(BaseCommand):
     help = "Run the camera → detection → RL → vehicle-control pipeline."
 
+    def _make_frame_sink(self, options):
+        """대시보드 스트리밍 퍼블리셔. 못 만들면 None (스트림만 꺼진다)."""
+        if options["stream_fps"] <= 0:
+            return None
+        import os
+        redis_url = os.getenv("REDIS_URL", "")
+        if not redis_url:
+            self.stdout.write(self.style.WARNING(
+                "REDIS_URL 이 없어 CCTV 스트리밍을 끕니다 "
+                "(웹 대시보드 영상이 안 나옵니다)"))
+            return None
+        from pipeline.camera_stream import FramePublisher
+        pub = FramePublisher(redis_url, camera_id=options["stream_camera_id"],
+                             fps=options["stream_fps"],
+                             max_width=options["stream_width"])
+        if not pub.enabled:
+            self.stdout.write(self.style.WARNING("Redis 연결 실패 — CCTV 스트리밍 끔"))
+            return None
+        self.stdout.write(f"CCTV 스트리밍 → camera {options['stream_camera_id']} "
+                          f"@{options['stream_fps']:g}fps, 최대 {options['stream_width']}px")
+        return pub.publish
+
     def add_arguments(self, parser) -> None:
         parser.add_argument("--camera", default="0",
                             help="카메라 인덱스 또는 영상 파일 경로 (기본 0)")
@@ -37,6 +59,14 @@ class Command(BaseCommand):
         parser.add_argument("--imgsz", type=int, default=1280, help="추론 해상도")
         parser.add_argument("--max-frames", type=int, default=None, help="처리할 최대 프레임")
         parser.add_argument("--show", action="store_true", help="탐지 화면 표시")
+        # 웹 대시보드 CCTV 패널용. 카메라는 한 프로세스만 열 수 있어서 웹서버가
+        # 직접 못 읽는다 — 여기서 Redis 로 흘려주고 웹서버가 MJPEG 로 중계한다.
+        parser.add_argument("--stream-fps", type=float, default=8.0,
+                            help="대시보드로 흘릴 프레임 수 (0 이면 스트리밍 끔)")
+        parser.add_argument("--stream-width", type=int, default=960,
+                            help="스트림 프레임 최대 가로 픽셀")
+        parser.add_argument("--stream-camera-id", type=int, default=1,
+                            help="대시보드 카메라 ID (프론트 CAM 번호와 맞춘다)")
         parser.add_argument("--calibration", default=None,
                             help="tools/calibrate_camera.py 로 저장한 JSON 경로")
         parser.add_argument("--control-mode", choices=["waypoint-auto", "auto-host"],
@@ -211,7 +241,8 @@ class Command(BaseCommand):
                 self._run_manual(pipeline, options)
             else:
                 pipeline.run_camera(max_frames=options["max_frames"],
-                                    show=options["show"])
+                                    show=options["show"],
+                                    frame_sink=self._make_frame_sink(options))
         except KeyboardInterrupt:
             outcome = "ABORTED"
             self.stdout.write("중단 요청 — 정리 중")

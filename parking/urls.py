@@ -12,6 +12,7 @@ from .views import (
     ParkingSpotViewSet,
     RoutePlanViewSet,
     VehicleViewSet,
+    camera_stream_view,
     dashboard_view,
     recommend_spot_view,
 )
@@ -31,4 +32,5 @@ urlpatterns = [
     path("exit/", ExitAPIView.as_view(), name="exit"),
     path("recommendations/spots/", recommend_spot_view, name="recommend-spot"),
     path("dashboard/", dashboard_view, name="dashboard"),
+    path("cameras/<int:camera_id>/stream/", camera_stream_view, name="camera-stream"),
 ]

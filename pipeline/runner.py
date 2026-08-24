@@ -226,8 +226,13 @@ class ParkingPipeline:
             self._tracker.stop()
         self.server.stop()
 
-    def run_camera(self, max_frames: int | None = None, show: bool = False) -> None:
-        """카메라 루프를 돈다 (블로킹). 프레임마다 on_frame 처리."""
+    def run_camera(self, max_frames: int | None = None, show: bool = False,
+                   frame_sink=None) -> None:
+        """카메라 루프를 돈다 (블로킹). 프레임마다 on_frame 처리.
+
+        frame_sink 를 주면 주석이 그려진 프레임을 그쪽으로도 흘린다 (MJPEG
+        스트림용). GUI 창(show)과 독립이다 — 시연은 웹 대시보드로만 본다.
+        """
         if self._detector is None:
             self._detector = YoloVehicleDetector(
                 weights_path=self.config.weights_path,
@@ -240,8 +245,11 @@ class ParkingPipeline:
             detector=self._detector,
             max_fps=self.config.max_fps,
         )
-        if show:
+        # 목표 waypoint 오버레이는 스트림에서도 보여야 의미가 있다.
+        if show or frame_sink is not None:
             self._tracker.overlay = self._draw_targets
+        if frame_sink is not None:
+            self._tracker.frame_sink = frame_sink
         self._tracker.run(on_frame=self.on_frame, max_frames=max_frames, show=show)
 
     def _draw_targets(self, image, state: TrackState):
