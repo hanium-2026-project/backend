@@ -913,10 +913,23 @@ class ParkingPipeline:
         — 실제로 auto-host 는 이 알림 전에 return 해서, 지도 경로도 입차 기록도
         누락돼 있었다. 반드시 여기 한 곳만 쓴다.
         """
-        self.dashboard.push_event(
-            "slot_assigned", car_id=car_id, slot=slot_id, route_id=route_id,
-            waypoints=[{"waypoint_id": w.waypoint_id, "phase": w.phase,
-                        "x": round(w.x, 1), "y": round(w.y, 1)} for w in wps])
+        # 화면 알림이 미션 생성을 막아서는 안 된다. waypoint 모양이 예상과
+        # 달라도(테스트 스텁 등) 좌표만 건너뛰고 배정 사실은 알린다.
+        points = []
+        for w in wps or []:
+            x, y = getattr(w, "x", None), getattr(w, "y", None)
+            if x is None or y is None:
+                continue
+            points.append({"waypoint_id": getattr(w, "waypoint_id", len(points) + 1),
+                           "phase": getattr(w, "phase", ""),
+                           "x": round(float(x), 1), "y": round(float(y), 1)})
+        try:
+            self.dashboard.push_event(
+                "slot_assigned", car_id=car_id, slot=slot_id,
+                route_id=route_id, waypoints=points)
+        except Exception as exc:
+            log.warning("slot_assigned 알림 실패 (car=%s slot=%s): %s",
+                        car_id, slot_id, exc)
 
     def _feasible_route(self, view: VehicleView, slot_id: str, route_id: int):
         """RL 이 고른 칸으로 경로를 만들되, 물리적으로 불가하면 대체한다.
