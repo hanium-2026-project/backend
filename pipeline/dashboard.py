@@ -102,4 +102,21 @@ class DashboardBridge:
         services = _services()
         if services is None:
             return
+        # 슬롯 배정은 DB 에도 남긴다. 파이프라인은 지금까지 이벤트만 쏘고
+        # 아무것도 기록하지 않아서, 화면은 차가 A2 로 가는데 출입차 기록은
+        # 비어 있는 상태가 됐다. 배정을 곧 입차로 본다.
+        if event == "slot_assigned":
+            self._record_entry(services, payload)
         services.broadcast_vehicle_event(event, payload)
+
+    def _record_entry(self, services, payload: dict) -> None:
+        """slot_assigned → 입차 기록. 실패해도 파이프라인을 막지 않는다."""
+        slot = payload.get("slot")
+        plate = self._plate_of(payload.get("car_id"))
+        if not slot or not plate:
+            return                     # 번호를 모르면 남길 기록도 없다
+        try:
+            services.record_pipeline_entry(plate, str(slot))
+        except Exception as exc:
+            log.warning("입차 기록 실패 (car=%s slot=%s): %s",
+                        payload.get("car_id"), slot, exc)

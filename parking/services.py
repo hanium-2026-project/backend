@@ -247,6 +247,52 @@ def process_entry(license_plate: str, vehicle_type: str = "sedan", lot_id: int |
 
 
 @transaction.atomic
+def record_pipeline_entry(license_plate: str, slot_label: str) -> EntryExit | None:
+    """카메라 파이프라인이 배정한 슬롯을 그대로 입차 기록으로 남긴다.
+
+    process_entry() 와 달리 **슬롯을 고르지 않는다.** 파이프라인이 이미 RL 로
+    골라서 차를 그리로 보내고 있는데 여기서 다시 recommend_spot() 을 부르면
+    화면이 가리키는 슬롯과 DB 기록이 어긋난다.
+
+    같은 이벤트가 여러 번 와도 안전해야 한다 — slot_assigned 는 재계획마다
+    다시 발생한다. 이미 열린 거래가 있으면 슬롯만 옮기고 새로 만들지 않는다.
+    """
+    spot = ParkingSpot.objects.filter(section=slot_label).first()
+    if spot is None:
+        logger.warning("pipeline entry: 슬롯 %r 을 DB 에서 못 찾음", slot_label)
+        return None
+    vehicle, _ = Vehicle.objects.get_or_create(
+        license_plate=license_plate,
+        defaults={"vehicle_type": "sedan", "is_registered": False,
+                  "discount_type": "none"},
+    )
+    open_tx = EntryExit.objects.filter(vehicle=vehicle, exit_time__isnull=True).first()
+    if open_tx is not None:
+        if open_tx.spot_id == spot.spot_id:
+            return open_tx                       # 같은 슬롯 재통보 — 할 일 없음
+        old_spot = open_tx.spot
+        old_spot.status = "vacant"               # 재배정: 이전 슬롯을 놓아준다
+        old_spot.save(update_fields=["status"])
+        open_tx.spot = spot
+        open_tx.save(update_fields=["spot"])
+        spot.status = "occupied"
+        spot.save(update_fields=["status"])
+        _broadcast_after_commit("slot_reassigned", {
+            "license_plate": license_plate, "spot_id": spot.spot_id,
+            "transaction_id": open_tx.transaction_id})
+        return open_tx
+
+    spot.status = "occupied"
+    spot.save(update_fields=["status"])
+    record = EntryExit.objects.create(vehicle=vehicle, spot=spot)
+    ParkingAssignment.objects.create(vehicle=vehicle, spot=spot, status="occupied")
+    _broadcast_after_commit("entry", {
+        "license_plate": license_plate, "spot_id": spot.spot_id,
+        "transaction_id": record.transaction_id})
+    return record
+
+
+@transaction.atomic
 def process_exit(license_plate: str) -> EntryExit:
     """Complete an active transaction and release the occupied spot."""
     try:
