@@ -16,6 +16,7 @@ RC_CAR 는 이미 잘 잡는 모델(best05 등)이 있으므로 자동으로 뽑
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -99,7 +100,7 @@ def main() -> int:
     from cv.vehicle_detector import (LABEL_CAR, LABEL_CUSHION,
                                      YoloVehicleDetector)
     from cv.association import _inside_or_adjacent
-    from tools.check_coverage import find_marker
+    from tools.check_coverage import find_markers
 
     # 판 밖 판정기. 캘리브레이션을 안 주면 필터를 걸지 않는다(기존 동작 유지).
     in_lot = None
@@ -157,12 +158,17 @@ def main() -> int:
             # 색으로 찾은 마커는 차량에 인접한 것만 채택한다 (association 과 같은
             # 기준). 배선·바닥 반사 같은 붉은 잡티가 라벨로 들어가지 않게 한다.
             cushions = []
-            found = find_marker(image)
-            if found is not None and cars:
-                (cx, cy), _, _, mbox = found
+            if cars:
                 car = max(cars, key=lambda d: d.confidence)
-                if _inside_or_adjacent((cx, cy), car.bbox):
-                    cushions = [mbox]
+                ccx, ccy = ((car.bbox[0] + car.bbox[2]) / 2.0,
+                            (car.bbox[1] + car.bbox[3]) / 2.0)
+                # 장면에 붉은 물체가 여럿일 수 있다. 가장 큰 것이 아니라
+                # 차량에 인접한 것 중 가장 가까운 것을 고른다.
+                near = [(math.hypot(c[0][0] - ccx, c[0][1] - ccy), c)
+                        for c in find_markers(image)
+                        if _inside_or_adjacent(c[0], car.bbox)]
+                if near:
+                    cushions = [min(near, key=lambda t: t[0])[1][3]]
         else:
             cushions = [d.bbox for d in dets if d.label == LABEL_CUSHION]
 
