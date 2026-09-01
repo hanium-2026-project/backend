@@ -902,8 +902,13 @@ class ParkingPipeline:
                          route_id=route_id)
         log.info("car %d → slot %s (route %d, %d waypoints)",
                  car_id, slot_id, route_id, len(wps))
-        self.dashboard.push_event("slot_assigned", car_id=car_id, slot=slot_id,
-                                  route_id=route_id)
+        # 경로 좌표를 함께 보낸다. 지금까지 route_id 만 보내서 화면은 "어느
+        # 슬롯인지"만 알고 "어디로 가는지"는 그릴 수 없었다. 좌표는 배정·재계획
+        # 때만 바뀌므로 pose 스트림에 매번 싣지 않고 이 이벤트에만 담는다.
+        self.dashboard.push_event(
+            "slot_assigned", car_id=car_id, slot=slot_id, route_id=route_id,
+            waypoints=[{"waypoint_id": w.waypoint_id, "phase": w.phase,
+                        "x": round(w.x, 1), "y": round(w.y, 1)} for w in wps])
 
     def _feasible_route(self, view: VehicleView, slot_id: str, route_id: int):
         """RL 이 고른 칸으로 경로를 만들되, 물리적으로 불가하면 대체한다.
