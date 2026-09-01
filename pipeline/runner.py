@@ -888,6 +888,7 @@ class ParkingPipeline:
             self._emit_route(wps, car_id=car_id)
             log.info("car %d → slot %s (route %d, %d waypoints)",
                      car_id, slot_id, route_id, len(wps))
+            self._announce_slot(car_id, slot_id, route_id, wps)
             return
         try:
             self.orchestrator.start_mission(car_id, wps, slot_id=slot_id)
@@ -902,9 +903,16 @@ class ParkingPipeline:
                          route_id=route_id)
         log.info("car %d → slot %s (route %d, %d waypoints)",
                  car_id, slot_id, route_id, len(wps))
-        # 경로 좌표를 함께 보낸다. 지금까지 route_id 만 보내서 화면은 "어느
-        # 슬롯인지"만 알고 "어디로 가는지"는 그릴 수 없었다. 좌표는 배정·재계획
-        # 때만 바뀌므로 pose 스트림에 매번 싣지 않고 이 이벤트에만 담는다.
+        self._announce_slot(car_id, slot_id, route_id, wps)
+
+    def _announce_slot(self, car_id: int, slot_id: str, route_id: int,
+                       wps: list[Any]) -> None:
+        """슬롯 배정을 화면·DB 로 알린다 (경로 좌표 포함).
+
+        auto-host 와 waypoint-auto 두 분기가 각자 만들면 한쪽만 고쳐져 어긋난다
+        — 실제로 auto-host 는 이 알림 전에 return 해서, 지도 경로도 입차 기록도
+        누락돼 있었다. 반드시 여기 한 곳만 쓴다.
+        """
         self.dashboard.push_event(
             "slot_assigned", car_id=car_id, slot=slot_id, route_id=route_id,
             waypoints=[{"waypoint_id": w.waypoint_id, "phase": w.phase,
