@@ -88,11 +88,11 @@ REST/WS API 와 별개로, RC카 자동주차는 아래 경로로 동작한다.
   오차는 피드백으로 흡수하고, 오차가 크거나 경로가 불가능해지면 정지 →
   fresh pose → 재계획한다 (과거 waypoint 로 무조건 되돌아가지 않는다).
 
-파이프라인 실행 (production 경로는 `--control-mode auto-host` 를 명시해야 한다 —
-기본값은 `waypoint-auto` 다):
+파이프라인 실행 (production 경로는 `--control-mode auto-host` 와 후면주차 모드를
+명시한다. 실제 실차에서는 검증된 calibration/weight 경로를 사용한다):
 
 ```bash
-python manage.py run_pipeline --control-mode auto-host --calibration calibration.json --weights <best.pt> --show
+python manage.py run_pipeline --control-mode auto-host --parking-mode rear --calibration <validated-calibration.json> --weights weights/best.pt --record runs --record-video --show
 ```
 
 제어/주차 관련 테스트는 Django 없이도 돌아간다:
@@ -104,9 +104,23 @@ python tools/run_auto_parking_tests.py
 
 ### 현재 개발 상태
 
-현재 SW팀에서 RC카 및 `FRONT_CUSHION` 인식 안정화를 위해 카메라/YOLO 재학습과
-perception 개선을 진행 중이다. 해당 작업이 끝나면 실차 E2E 자동주차 테스트를
-재개할 예정이며, 그때까지 후면주차 경로·복구 로직은 안정화 진행 중으로 본다.
+단일 자율주행 차량의 카메라 Pose 기반 후면주차 E2E는 실제 차량에서 완료 사례를
+확보했다. production 제어는 `AUTO_HOST → DIRECT_CONTROL → REMOTE_DIRECT`이며,
+통신 단절·stale Pose·전후진 전환·경계 위험에서는 먼저 zero command를 보낸 뒤
+fresh observation과 현재 Pose 기준 재계획을 요구한다.
+
+현재 구현 범위와 한계는 다음과 같다.
+
+- allocator의 슬롯 상태와 정상 `PARKED` 결과는 예약/장애물 정보로 반영된다.
+- 카메라에 보이는 임의의 정적 차량만으로 슬롯을 자동 `VISION_OCCUPIED` 처리하는
+  기능은 아직 구현되지 않았다.
+- 여러 차량이 연결될 수 있지만 `AUTO_HOST` 이동 권한은 한 번에 한 차량만 갖는다.
+  두 차량 동시 자율주행 완료로 해석하면 안 된다.
+- PPO 환경·정책 로딩 경로는 구현되어 있으나, 모델 또는 `sb3-contrib`가 없으면
+  deterministic nearest-slot heuristic을 사용한다. 개별 HIL run의 policy provenance는
+  현재 recorder만으로 확정할 수 없다.
+- Dashboard REST/WebSocket은 구현되어 있으며 Redis 설정이 없으면 in-memory channel
+  layer를 사용한다. Dashboard 전송 실패는 차량 제어와 안전정지를 막지 않는다.
 
 ## Live Viz Demo
 
