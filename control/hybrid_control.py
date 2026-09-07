@@ -33,6 +33,10 @@ from integration.control_scheduler import ControlScheduler
 
 class HybridControlMux:
     PERIOD_S = 0.10
+    # GUI/key events are not a durable motion command.  A lost KeyRelease or
+    # focus event must not leave the manual loop replaying non-zero forever.
+    # The GUI refreshes held keys every 100 ms; three missed refreshes stop.
+    MANUAL_INPUT_LEASE_S = 0.35
 
     def __init__(self, auto_runner) -> None:
         self.runner = auto_runner
@@ -42,6 +46,7 @@ class HybridControlMux:
 
         self._lock = threading.Lock()
         self._manual = ManualInput(0.0, 0.0)
+        self._manual_updated_at = time.monotonic()
         self._manual_stop = threading.Event()
         self._manual_thread: Optional[threading.Thread] = None
         self.mode = "AUTO_HOST"
@@ -68,10 +73,20 @@ class HybridControlMux:
 
     def _manual_loop(self) -> None:
         while not self._manual_stop.is_set():
-            with self._lock:
-                manual = self._manual
+            manual = self._manual_for_tick(time.monotonic())
             self.host.tick(time.monotonic(), manual_input=manual)
             self._manual_stop.wait(self.PERIOD_S)
+
+    def _manual_for_tick(self, now: float) -> ManualInput:
+        """Return current input, expiring a stale non-zero GUI intent to zero."""
+        with self._lock:
+            manual = self._manual
+            if now - self._manual_updated_at <= self.MANUAL_INPUT_LEASE_S:
+                return manual
+            if manual.throttle != 0.0 or manual.steering != 0.0:
+                manual = ManualInput(0.0, 0.0)
+                self._manual = manual
+            return manual
 
     def on_camera_pose(
         self,
@@ -125,6 +140,7 @@ class HybridControlMux:
 
         with self._lock:
             self._manual = ManualInput(0.0, 0.0)
+            self._manual_updated_at = time.monotonic()
 
         self._manual_stop.clear()
         self._manual_thread = threading.Thread(
@@ -148,6 +164,7 @@ class HybridControlMux:
 
         with self._lock:
             self._manual = ManualInput(throttle, logical_steering)
+            self._manual_updated_at = time.monotonic()
 
     def switch_to_auto(self) -> None:
         if self.mode in ("AUTO_HOST", "AUTO_PENDING"):
@@ -163,6 +180,7 @@ class HybridControlMux:
         neutral = ManualInput(0.0, 0.0)
         with self._lock:
             self._manual = neutral
+            self._manual_updated_at = time.monotonic()
 
         # Zero while manual still owns authority.
         self.host.tick(time.monotonic(), manual_input=neutral)
@@ -189,6 +207,7 @@ class HybridControlMux:
             neutral = ManualInput(0.0, 0.0)
             with self._lock:
                 self._manual = neutral
+                self._manual_updated_at = time.monotonic()
             try:
                 self.host.tick(time.monotonic(), manual_input=neutral)
             except Exception:

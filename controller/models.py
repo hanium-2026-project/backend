@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 
 class MotionDirection(str, Enum):
@@ -55,6 +55,12 @@ class Pose:
     # 후진 정밀 구간에서 그 값을 믿고 조향하면 상황을 악화시키므로 제어기가 막는다.
     # None 이면 판단 불가로 보고 막지 않는다 (기존 호출부 호환).
     heading_source: Optional[str] = None
+    # Optional observed direction of travel.  Body heading remains the source
+    # of truth for terminal orientation and safety; this separate value lets a
+    # path follower steer the tracked pose point by its measured tangent while
+    # reversing.  The two differed by 8--11 deg in the 2026-08-27/28 runs.
+    motion_heading_deg: Optional[float] = None
+    motion_heading_source: Optional[str] = None
 
     @property
     def has_heading(self) -> bool:
@@ -92,6 +98,10 @@ class Waypoint:
     # 곡선의 중간 표본점을 이미 지나친 경우 사용할 경로 corridor 반경(cm).
     # None이면 기존의 점 도착 판정만 사용한다. FINAL에는 설정하지 않는다.
     path_capture_tolerance_cm: Optional[float] = None
+    # rear FINAL 목표 자세에서 계획된 진행방향으로 더 이동할 수 있는 물리적
+    # 여유(mm). planner가 slot depth와 map footprint 중 작은 값을 넣는다.
+    # None이면 일반 waypoint이며 FINAL spatial guard의 대상이 아니다.
+    terminal_motion_clearance_mm: Optional[float] = None
     # 아래는 라우팅/디버깅용 메타. 제어 계산에는 직접 쓰지 않음.
     route_id: Optional[int] = None
     waypoint_id: Optional[int] = None
@@ -120,6 +130,11 @@ class ControlCommand:
     reason: str = ""
     # 디버그: wire 변환 전 논리 steering(양수 = LEFT 요구). 테스트/로그용.
     logical_steering: float = field(default=0.0)
+    # Read-only observability captured from this exact compute call.  It is
+    # excluded from command equality so enabling diagnostics cannot change
+    # controller behavior or existing deterministic comparisons.
+    telemetry: dict[str, Any] = field(default_factory=dict, compare=False,
+                                      repr=False)
 
     @property
     def is_stopped(self) -> bool:

@@ -86,6 +86,8 @@ class MockFirmware:
         self.hello_interval = 0.2
         self.hello_sent = 0
         self.link_up = True                    # 서버와의 TCP 링크 생존 여부
+        self.status_paused = False
+        self._send_lock = threading.Lock()
 
         self.sock = socket.create_connection((host, port))
         self._alive = True
@@ -100,7 +102,9 @@ class MockFirmware:
 
     def _send(self, msg: dict[str, Any]) -> None:
         try:
-            self.sock.sendall((json.dumps(msg, separators=(",", ":")) + "\n").encode())
+            payload = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+            with self._send_lock:
+                self.sock.sendall(payload)
         except OSError:
             self._alive = False
 
@@ -357,7 +361,8 @@ class MockFirmware:
         """세션이 열린 뒤 주기 STATUS 송신 (command_result 는 NONE)."""
         while self._alive:
             time.sleep(self.status_interval)
-            if self.hello_result == "READY_ALLOWED" and self._alive:
+            if self.hello_result == "READY_ALLOWED" and self._alive and \
+                    not self.status_paused:
                 try:
                     self._status()
                 except OSError:

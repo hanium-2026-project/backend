@@ -26,6 +26,8 @@ handshake 흐름:
 from __future__ import annotations
 
 import threading
+import time
+from enum import Enum
 from typing import Any, Callable, Optional
 
 from host_control.host_controller import HostController
@@ -33,6 +35,19 @@ from host_control.host_controller import HostController
 
 class ModeHandshakeError(RuntimeError):
     pass
+
+
+class NegotiationState(Enum):
+    WAIT_CONNECTION = "WAIT_CONNECTION"
+    WAIT_HELLO = "WAIT_HELLO"
+    WAIT_RESET_ACK = "WAIT_RESET_ACK"
+    WAIT_SET_MODE_ACK = "WAIT_SET_MODE_ACK"
+    READY_REMOTE_DIRECT = "READY_REMOTE_DIRECT"
+    FAULT = "FAULT"
+
+
+class _SessionChanged(RuntimeError):
+    """Internal control flow: continue negotiation on the replacement session."""
 
 
 def _chain(existing: Optional[Callable], new: Callable) -> Callable:
@@ -47,7 +62,15 @@ def _chain(existing: Optional[Callable], new: Callable) -> Callable:
 
 
 class RemoteDirectSession:
-    def __init__(self, host: HostController, server: Any, car_id: int) -> None:
+    """Single owner for RESET/SET_MODE negotiation for one physical car.
+
+    Callers only request the desired REMOTE_DIRECT state through
+    :meth:`ensure_remote_direct`.  The lock covers the complete reliable
+    transaction, so duplicate pipeline/recovery callbacks wait for the same
+    result instead of creating another command.
+    """
+
+    def __init__(self, host: HostController | None, server: Any, car_id: int) -> None:
         assert isinstance(car_id, int), "production car_id 는 int(1,2) 여야 함"
         self.host = host
         self._server = server
@@ -57,6 +80,15 @@ class RemoteDirectSession:
         self._rejected_reason: Optional[str] = None
         self._attached = False
         self._hs_lock = threading.Lock()   # begin_handshake seq 대입과 콜백 매칭 race 방지
+        self._session_identity: tuple[str, str] | None = None
+        self._transport_epoch = 0
+        self._transaction_key: tuple[str, str, int] | None = None
+        self._negotiation_lock = threading.Lock()
+        self._negotiation_state = NegotiationState.WAIT_CONNECTION
+        self._negotiation_identity: tuple[str, str] | None = None
+        self._negotiation_key: tuple[str, str, int] | None = None
+        self._negotiation_generation = 0
+        self._negotiation_error: BaseException | None = None
 
     @property
     def car_id(self) -> int:
@@ -65,6 +97,29 @@ class RemoteDirectSession:
     @property
     def accepted(self) -> bool:
         return self._accepted.is_set()
+
+    @property
+    def negotiation_state(self) -> NegotiationState:
+        return self._negotiation_state
+
+    @property
+    def negotiation_generation(self) -> int:
+        return self._negotiation_generation
+
+    @property
+    def negotiation_identity(self) -> tuple[str, str] | None:
+        return self._negotiation_identity
+
+    def _current_identity(self) -> tuple[str, str] | None:
+        getter = getattr(self._server, "session_identity", None)
+        if getter is not None:
+            return getter(self._car_id)
+        # Compatibility for the older integration contract double.  Production
+        # VehicleServer always provides session_identity().
+        cars = getattr(self._server, "_cars", None)
+        state = cars.get(self._car_id) if isinstance(cars, dict) else None
+        session_id = getattr(state, "session_id", None)
+        return (str(session_id), "LEGACY_SPEC") if session_id else None
 
     # -------------------------------------------------- callback fan-out (수정 4)
     def attach(self) -> None:
@@ -90,32 +145,171 @@ class RemoteDirectSession:
         ACCEPTED STATUS 를 보내면 대입 전에 콜백이 올 수 있음).
         """
         with self._hs_lock:
+            identity = self._current_identity()
+            if identity is None:
+                raise ModeHandshakeError(
+                    f"car {self._car_id}: no active session for SET_MODE")
+            key = (identity[0], identity[1], self._transport_epoch)
+            # A logical SET_MODE transaction belongs to a session generation.
+            # Re-entrant desired-state requests must share it, regardless of
+            # whether its ACK is pending or has just arrived.
+            if key == self._transaction_key and self._set_mode_seq is not None:
+                return self._set_mode_seq
             self._accepted.clear()
             self._rejected_reason = None
             self._set_mode_seq = None
+            self._session_identity = identity
+            self._transaction_key = key
             seq = self._server.send_set_mode(self._car_id, "REMOTE_DIRECT")  # → int
             self._set_mode_seq = int(seq)
             return self._set_mode_seq
+
+    def ensure_remote_direct(self, *, wait_s: float = 2.0) -> None:
+        """Idempotently converge the current physical session to REMOTE_DIRECT.
+
+        RESET is emitted only for firmware states that accept it.  A session
+        replacement invalidates the old transaction and starts one transaction
+        for the new identity.  Calls arriving while SET_MODE is pending block
+        on this owner and never submit a second reliable command.
+        """
+        deadline = time.monotonic() + max(0.0, float(wait_s))
+        with self._negotiation_lock:
+            while time.monotonic() < deadline:
+                identity = self._current_identity()
+                if identity is None:
+                    self._negotiation_state = NegotiationState.WAIT_CONNECTION
+                    time.sleep(0.01)
+                    continue
+                with self._hs_lock:
+                    epoch = self._transport_epoch
+                key = (identity[0], identity[1], epoch)
+                if key != self._negotiation_key:
+                    with self._hs_lock:
+                        if key != self._transaction_key:
+                            self._session_identity = identity
+                            self._transaction_key = None
+                            self._set_mode_seq = None
+                            self._accepted.clear()
+                            self._rejected_reason = None
+                    self._negotiation_identity = identity
+                    self._negotiation_key = key
+                    self._negotiation_generation += 1
+                    self._negotiation_error = None
+                if (self._negotiation_state is NegotiationState.READY_REMOTE_DIRECT
+                        and self._accepted.is_set()
+                        and key == self._negotiation_key):
+                    return
+                if (self._negotiation_state is NegotiationState.FAULT
+                        and self._negotiation_error is not None
+                        and key == self._negotiation_key):
+                    raise self._negotiation_error
+                self._negotiation_state = NegotiationState.WAIT_HELLO
+                try:
+                    status = self._wait_current_status(identity, epoch, deadline)
+                    state = str(status.get("state", ""))
+                    if state in ("EMERGENCY_STOP", "ERROR"):
+                        self._reset_exact(identity, epoch, deadline)
+                        self._wait_ready(identity, epoch, deadline)
+                    elif state == "COMM_TIMEOUT":
+                        raise ModeHandshakeError(
+                            f"car {self._car_id}: COMM_TIMEOUT requires reconnect")
+                    self._set_mode_exact(identity, epoch, deadline)
+                except _SessionChanged:
+                    continue
+                except BaseException as exc:
+                    self._negotiation_state = NegotiationState.FAULT
+                    self._negotiation_error = exc
+                    raise
+                self._negotiation_state = NegotiationState.READY_REMOTE_DIRECT
+                self._negotiation_error = None
+                return
+        error = ModeHandshakeError(
+            f"car {self._car_id}: REMOTE_DIRECT negotiation timeout")
+        self._negotiation_state = NegotiationState.FAULT
+        self._negotiation_error = error
+        raise error
+
+    def _wait_current_status(self, identity: tuple[str, str], epoch: int,
+                             deadline: float) -> dict[str, Any]:
+        while time.monotonic() < deadline:
+            if (self._current_identity() != identity
+                    or self._transport_epoch != epoch):
+                raise _SessionChanged
+            status = self._server.last_status(self._car_id)
+            if status.get("state"):
+                return status
+            time.sleep(0.01)
+        raise ModeHandshakeError(f"car {self._car_id}: STATUS unavailable")
+
+    def _wait_ready(self, identity: tuple[str, str], epoch: int,
+                    deadline: float) -> None:
+        while time.monotonic() < deadline:
+            status = self._wait_current_status(identity, epoch, deadline)
+            if str(status.get("state", "")) == "READY":
+                return
+            time.sleep(0.01)
+        raise ModeHandshakeError(f"car {self._car_id}: RESET ACK without READY")
+
+    def _wait_exact_result(self, identity: tuple[str, str], epoch: int, seq: int,
+                           deadline: float, command: str) -> str:
+        remaining = max(0.0, deadline - time.monotonic())
+        result = self._server.wait_reliable_result(
+            self._car_id, identity[0], seq, remaining)
+        if (self._current_identity() != identity
+                or self._transport_epoch != epoch):
+            raise _SessionChanged
+        if result is None:
+            raise ModeHandshakeError(
+                f"car {self._car_id}: {command} terminal ACK timeout")
+        return str(result)
+
+    def _reset_exact(self, identity: tuple[str, str], epoch: int,
+                     deadline: float) -> None:
+        self._negotiation_state = NegotiationState.WAIT_RESET_ACK
+        seq = self._server.send_reset(self._car_id)
+        result = self._wait_exact_result(identity, epoch, seq, deadline, "RESET")
+        if result != "ACCEPTED":
+            raise ModeHandshakeError(
+                f"car {self._car_id}: RESET rejected ({result})")
+
+    def _set_mode_exact(self, identity: tuple[str, str], epoch: int,
+                        deadline: float) -> None:
+        self._negotiation_state = NegotiationState.WAIT_SET_MODE_ACK
+        seq = self.begin_handshake()
+        result = self._wait_exact_result(identity, epoch, seq, deadline, "SET_MODE")
+        with self._hs_lock:
+            if identity != self._session_identity:
+                raise _SessionChanged
+            if result == "ACCEPTED":
+                self._accepted.set()
+            else:
+                self._rejected_reason = result
+        if result != "ACCEPTED" or self._rejected_reason is not None:
+            raise ModeHandshakeError(
+                f"car {self._car_id}: REMOTE_DIRECT rejected "
+                f"({self._rejected_reason or result})")
 
     def wait_accepted(self, timeout_s: float = 1.0) -> bool:
         """ACCEPTED 도착까지 대기(테스트/동기 실행용). 실서비스는 콜백 기반으로도 가능."""
         ok = self._accepted.wait(timeout_s)
         if not ok:
-            self.host.fault("SET_MODE_TIMEOUT")   # timeout → FAULTED + zero
+            if self.host is not None:
+                self.host.fault("SET_MODE_TIMEOUT")   # timeout → FAULTED + zero
         return ok
 
     def arm_auto(self, *, wait_s: float = 1.0) -> None:
         """ACCEPTED 확인 후에만 AUTO_HOST 무장. 미확인이면 FAULTED (non-zero 금지)."""
         if not self._attached:
             self.attach()
-        self.begin_handshake()
-        if not self.wait_accepted(wait_s):
-            raise ModeHandshakeError("REMOTE_DIRECT ACCEPTED 미도착 → FAULTED")
+        self.ensure_remote_direct(wait_s=wait_s)
         if self._rejected_reason is not None:
-            self.host.fault(f"SET_MODE_{self._rejected_reason}")
+            if self.host is not None:
+                self.host.fault(f"SET_MODE_{self._rejected_reason}")
             raise ModeHandshakeError(f"REMOTE_DIRECT 거절: {self._rejected_reason}")
         # ★ direct stream gate (수정 5)
         self._enable_direct_stream()
+        if self.host is None:
+            raise ModeHandshakeError("AUTO_HOST controller is unavailable")
         self.host.arm_auto()
 
     def _enable_direct_stream(self, *, release_control: bool = True) -> None:
@@ -129,15 +323,20 @@ class RemoteDirectSession:
             pass
 
     # -------------------------------------------------- 콜백 핸들러
-    def _on_command_result(self, car_id: int, seq: int, result: str, _status: dict) -> None:
+    def _on_command_result(self, car_id: int, seq: int, result: str, status: dict) -> None:
         with self._hs_lock:
             if car_id != self._car_id or seq != self._set_mode_seq:
+                return
+            if (self._session_identity is not None
+                    and status.get("session_id") not in
+                        (None, self._session_identity[0])):
                 return
             if result == "ACCEPTED":
                 self._accepted.set()
             else:
                 self._rejected_reason = result
-                self.host.fault(f"SET_MODE_{result}")
+                if self.host is not None:
+                    self.host.fault(f"SET_MODE_{result}")
                 self._accepted.set()  # 대기 해제(거절로)
 
     def _on_command_rejected(self, car_id: int, result: str, status: dict) -> None:
@@ -155,13 +354,21 @@ class RemoteDirectSession:
         if rejected is not None and rejected != self._set_mode_seq:
             return
         self._rejected_reason = result
-        self.host.fault(f"SET_MODE_{result}")
+        if self.host is not None:
+            self.host.fault(f"SET_MODE_{result}")
         self._accepted.set()
 
     def _on_comm_fail(self, car_id: int, _status: dict) -> None:
         if car_id != self._car_id:
             return
-        self.host.fault("COMM_TIMEOUT")
+        if self.host is not None:
+            self.host.fault("COMM_TIMEOUT")
+        with self._hs_lock:
+            self._transport_epoch += 1
+            self._accepted.clear()
+            self._transaction_key = None
+            self._set_mode_seq = None
+            self._rejected_reason = None
         # ★ 다중 차량 안전: server.direct_control_enabled 는 server-global 이므로 끄지 않는다.
         #   이 차량만 stop_control(car_id) 로 zero → 다른 AUTO_HOST 차량 stream 유지.
         stop = getattr(self._server, "stop_control", None)
@@ -177,21 +384,29 @@ class RemoteDirectSession:
         if car_id != self._car_id:
             return
         # 재접속 → 이전 host mission/control state 폐기, zero, mode 재협상 필요
-        self.host.fault("RESYNC")
+        if self.host is not None:
+            self.host.fault("RESYNC")
         stop = getattr(self._server, "stop_control", None)
         if stop is not None:
             stop(self._car_id)
-        self._accepted.clear()
-        self._set_mode_seq = None
+        identity = self._current_identity()
+        with self._hs_lock:
+            if identity is not None and identity == self._session_identity:
+                return
+            self._session_identity = identity
+            self._transaction_key = None
+            self._accepted.clear()
+            self._set_mode_seq = None
+            self._rejected_reason = None
 
     # -------------------------------------------------- explicit re-arm
     def re_arm_auto(self, *, wait_s: float = 1.0) -> None:
         """stale/comm/resync fault 후 사용자 명시적 재출발. mode 재협상 후 복귀."""
         # FAULTED → clear 후 재 handshake
+        if self.host is None:
+            raise ModeHandshakeError("AUTO_HOST controller is unavailable")
         self.host.authority.clear_fault() if self.host.authority.is_faulted else None
-        self.begin_handshake()
-        if not self.wait_accepted(wait_s):
-            raise ModeHandshakeError("re-arm 중 ACCEPTED 미도착")
+        self.ensure_remote_direct(wait_s=wait_s)
         if self._rejected_reason is not None:
             self.host.fault(f"SET_MODE_{self._rejected_reason}")
             raise ModeHandshakeError(f"re-arm 거절: {self._rejected_reason}")

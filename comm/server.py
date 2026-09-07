@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import select
 import secrets
 import socket
 import threading
@@ -34,6 +35,7 @@ class VehicleSession:
     boot_id: str
     conn: socket.socket
     sender: ReliableSender
+    firmware_version: str = ""
     last_status: dict[str, Any] = field(default_factory=dict)
     last_rx_ms: float = field(default_factory=lambda: time.monotonic() * 1000)
     pose_seq: int = 0
@@ -50,6 +52,23 @@ class VehicleSession:
     last_rx_type: str | None = None
     last_tx_ms: float = 0.0
     last_tx_type: str | None = None
+    # Every writer for one TCP stream must share this lock.  HEARTBEAT,
+    # DIRECT_CONTROL and ReliableSender run on different threads; concurrent
+    # sendall() calls are not an NDJSON framing guarantee.
+    send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # If the kernel already has bytes waiting when the liveness tick runs, let
+    # the dedicated RX thread drain them before declaring a timeout.  This is
+    # bounded and does not turn arbitrary/partial bytes into liveness.
+    rx_ready_since_ms: float | None = None
+    last_rx_gap_ms: float = 0.0
+    max_rx_gap_ms: float = 0.0
+    # Reliable command completion belongs to one physical TCP session.  Keep a
+    # short result history so a fast ACK received before the waiter starts is
+    # still observable without allowing an old-session ACK to satisfy a new
+    # session's command.
+    command_results: dict[int, str] = field(default_factory=dict, repr=False)
+    command_condition: threading.Condition = field(
+        default_factory=threading.Condition, repr=False)
 
 
 class VehicleServer:
@@ -102,6 +121,17 @@ class VehicleServer:
         # 재접속 HELLO 의 previous_state=EMERGENCY_STOP 을 HOLD 로 볼지.
         # 기본 False — 켜면 복구 불가 고리에 빠진다 (_judge_hello 주석 참고).
         self.hold_on_estop_history = False
+        # A scheduler race can run the timeout tick just before the RX thread
+        # processes bytes already queued by the kernel.  One short, evidence-
+        # based drain window prevents that false edge without relaxing the
+        # 1000 ms wire-silence safety threshold.
+        self.rx_drain_grace_ms = 100.0
+        # HEARTBEAT and DIRECT_CONTROL share one tick thread.  An unbounded
+        # sendall() can therefore delay the next heartbeat past the firmware's
+        # 1000 ms watchdog even while the RX side remains healthy.  Keep each
+        # socket operation bounded well below that safety budget; idle recv
+        # timeouts are normal and the RX loop simply continues.
+        self.socket_io_timeout_s = 0.2
 
     # ─── 라이프사이클 ────────────────────────────────────────────────────────
 
@@ -119,6 +149,9 @@ class VehicleServer:
         with self._lock:
             for s in self.sessions.values():
                 s.alive = False
+                s.sender.clear_pending()
+                with s.command_condition:
+                    s.command_condition.notify_all()
                 try: s.conn.close()
                 except OSError: pass
             self.sessions.clear()
@@ -225,6 +258,42 @@ class VehicleServer:
         if sess is not None:
             sess.sender.clear_pending()
 
+    def session_identity(self, car_id: int) -> tuple[str, str] | None:
+        """Return the active ``(session_id, boot_id)`` recovery identity."""
+        with self._lock:
+            sess = self.sessions.get(car_id)
+            if sess is None or not sess.alive:
+                return None
+            return sess.session_id, sess.boot_id
+
+    def wait_reliable_result(self, car_id: int, session_id: str, seq: int,
+                             timeout_s: float) -> str | None:
+        """Wait for one exact reliable-command result in one exact session.
+
+        ``None`` means either timeout or session retirement.  Callers compare
+        :meth:`session_identity` with ``session_id`` to distinguish the two and
+        restart negotiation only for a replacement session.
+        """
+        with self._lock:
+            sess = self.sessions.get(car_id)
+            if (sess is None or not sess.alive
+                    or sess.session_id != session_id):
+                return None
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with sess.command_condition:
+            while True:
+                result = sess.command_results.pop(int(seq), None)
+                if result is not None:
+                    return result
+                if not sess.alive:
+                    return None
+                if sess.sender.outstanding is None:
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return None
+                sess.command_condition.wait(min(remaining, 0.05))
+
     def push_pose(self, car_id: int, x_cm: float, y_cm: float,
                   heading_deg: float | None, heading_source: str | None,
                   position_confidence: float = 1.0, heading_confidence: float = 0.0,
@@ -261,6 +330,11 @@ class VehicleServer:
                 conn, _ = self._srv_sock.accept()
             except OSError:
                 break
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except OSError:
+                pass
             threading.Thread(target=self._handshake, args=(conn,), daemon=True).start()
 
     def _handshake(self, conn: socket.socket) -> None:
@@ -274,18 +348,31 @@ class VehicleServer:
         buf = b""
         rest = b""
         hold_count = 0
+        send_lock = threading.Lock()
+        hold_stop = threading.Event()
+        hold_thread: threading.Thread | None = None
 
         while True:
             try:
                 while b"\n" not in buf:
                     chunk = conn.recv(1024)
                     if not chunk:
+                        hold_stop.set()
                         conn.close(); return
                     buf += chunk
+                    # A recv may coalesce HELLO plus later frames; cap only the
+                    # unfinished first line, not the aggregate TCP chunk.
+                    if b"\n" not in buf and \
+                            len(buf) > protocol.MAX_MESSAGE_BYTES:
+                        hold_stop.set()
+                        conn.close(); return
                 line, rest = buf.split(b"\n", 1)
                 buf = rest
+                if len(line) + 1 > protocol.MAX_MESSAGE_BYTES:
+                    raise ValueError("HELLO exceeds NDJSON frame limit")
                 hello = parse_message(line)
             except (OSError, ValueError):
+                hold_stop.set()
                 conn.close(); return
 
             if hello.get("type") != "HELLO":
@@ -298,25 +385,34 @@ class VehicleServer:
                           if result == "READY_ALLOWED" else "")
             # 새 세션의 명령 seq 시작값 — 이전 세션 seq 와 겹치지 않게 1부터 새로 발급
             command_seq_start = 1
-            try:
-                conn.sendall(encode(protocol.make_hello_ack(
-                    car_id, session_id, result, reason,
-                    boot_id=boot_id, command_seq_start=command_seq_start)))
-            except OSError:
+            if not self._safe_send_conn(
+                    conn,
+                    protocol.make_hello_ack(
+                        car_id, session_id, result, reason,
+                        boot_id=boot_id, command_seq_start=command_seq_start),
+                    send_lock):
+                hold_stop.set()
                 conn.close(); return
 
             if result == "REJECTED":
+                hold_stop.set()
                 conn.close(); return
             if result == "HOLD":
                 hold_count += 1
                 # HOLD 중에도 링크는 살려둬야 한다. HEARTBEAT 가 끊기면 차량이
                 # 1초 뒤 COMM_TIMEOUT 으로 떨어져 나가 조건을 해소할 기회조차 없다.
-                threading.Thread(target=self._hold_heartbeat, args=(conn, car_id),
-                                 daemon=True).start()
+                if hold_thread is None:
+                    hold_thread = threading.Thread(
+                        target=self._hold_heartbeat,
+                        args=(conn, car_id, send_lock, hold_stop),
+                        daemon=True,
+                    )
+                    hold_thread.start()
                 if self.on_hold is not None:
                     self.on_hold(car_id, reason or "HOLD")
                 if hold_count >= self.max_hold_retries:
                     log_reason = reason or "HOLD"
+                    hold_stop.set()
                     self._safe_close(conn)
                     if self.on_comm_fail is not None:
                         self.on_comm_fail(car_id, {"type": "HOLD_EXHAUSTED",
@@ -325,26 +421,38 @@ class VehicleServer:
                 continue                     # 다음 HELLO 를 기다려 재판정
             break                            # READY_ALLOWED
 
+        hold_stop.set()
+
         # 기존 세션 무효화 (§26.5) 후 신규 등록
         with self._lock:
             old = self.sessions.get(car_id)
             if old is not None:
                 old.alive = False
+                old.sender.clear_pending()
+                with old.command_condition:
+                    old.command_condition.notify_all()
                 try: old.conn.close()
                 except OSError: pass
+            session_ref: dict[str, VehicleSession] = {}
             sender = ReliableSender(
                 car_id,
-                send_raw=lambda m, c=conn: self._safe_send(c, m),
-                on_fail=lambda m, cid=car_id: self._comm_fail(cid, m),
+                send_raw=lambda m, ref=session_ref: self._safe_send_session(
+                    ref.get("session"), m),
+                on_fail=lambda m, cid=car_id, ref=session_ref: self._comm_fail(
+                    cid, m, expected_session=ref.get("session")),
             )
             sender.set_seq_start(command_seq_start)
-            sess = VehicleSession(car_id, session_id, boot_id, conn, sender)
+            sess = VehicleSession(
+                car_id, session_id, boot_id, conn, sender,
+                firmware_version=str(hello.get("firmware_version", "")),
+                send_lock=send_lock)
+            session_ref["session"] = sess
             # A replacement session never inherits permission to move.  The
             # pipeline must re-negotiate mode and validate a fresh-pose route.
             sess.control_held = old is not None
             self.sessions[car_id] = sess
 
-        conn.settimeout(None)
+        conn.settimeout(self.socket_io_timeout_s)
         # 재접속/재부팅 공통: 자동 재개 금지 → 상위에 재계획 통지 (§21·26.3·26.4)
         if self.on_resync is not None:
             self.on_resync(car_id, hello)
@@ -352,20 +460,20 @@ class VehicleServer:
             self.on_ready(car_id)
         self._rx_loop(sess, rest)
 
-    def _hold_heartbeat(self, conn: socket.socket, car_id: int) -> None:
+    def _hold_heartbeat(self, conn: socket.socket, car_id: int,
+                        send_lock: threading.Lock,
+                        stop: threading.Event) -> None:
         """HOLD 대기 구간 전용 HEARTBEAT. 세션이 열리면 tick 루프가 이어받는다."""
         seq = 0
-        deadline = time.monotonic() + TIMING["COMM_TIMEOUT"] / 1000.0 * 4
-        while time.monotonic() < deadline:
+        while not stop.is_set():
             with self._lock:
                 if car_id in self.sessions:
                     return                      # 세션 생김 → tick 루프가 담당
             seq += 1
-            try:
-                conn.sendall(encode(protocol.make_heartbeat(car_id, "", seq)))
-            except OSError:
+            if not self._safe_send_conn(
+                    conn, protocol.make_heartbeat(car_id, "", seq), send_lock):
                 return
-            time.sleep(TIMING["HEARTBEAT_INTERVAL"] / 1000.0)
+            stop.wait(TIMING["HEARTBEAT_INTERVAL"] / 1000.0)
 
     def _judge_hello(self, hello: dict[str, Any]) -> tuple[str, str | None]:
         """HELLO_ACK 판정 초안 (REJECTED → HOLD → READY_ALLOWED)."""
@@ -400,6 +508,8 @@ class VehicleServer:
         while self._running and sess.alive:
             try:
                 chunk = sess.conn.recv(4096)
+            except socket.timeout:
+                continue
             except OSError:
                 break
             if not chunk:
@@ -409,51 +519,101 @@ class VehicleServer:
                 line, buf = buf.split(b"\n", 1)
                 if not line.strip():
                     continue
+                if len(line) + 1 > protocol.MAX_MESSAGE_BYTES:
+                    sess.alive = False
+                    break
                 try:
                     msg = parse_message(line)
                 except ValueError:
                     continue
                 self._dispatch(sess, msg)
+            if len(buf) > protocol.MAX_MESSAGE_BYTES:
+                sess.alive = False
+                break
         with self._lock:
             current = self.sessions.get(sess.car_id)
             is_current = current is sess
             sess.alive = False
+        sess.sender.clear_pending()
+        with sess.command_condition:
+            sess.command_condition.notify_all()
         if is_current and self._running:
             self._comm_fail(sess.car_id, {"type": "SOCKET_DISCONNECTED"},
                             expected_session=sess)
 
     def _dispatch(self, sess: VehicleSession, msg: dict[str, Any]) -> None:
+        # A retired socket may still have a buffered terminal ACK when a new
+        # session has already reused command seq=1.  Reject it before touching
+        # that old sender or invoking process-global command callbacks.
+        with self._lock:
+            if self.sessions.get(sess.car_id) is not sess or not sess.alive:
+                return
         # 이전 세션의 늦은 메시지 차단 (§13.3)
-        if msg.get("session_id") and msg["session_id"] != sess.session_id:
+        if msg.get("session_id") != sess.session_id:
             return
         # 소켓이 속한 차량과 다른 car_id 가 실려 오면 신뢰하지 않는다.
         # 정상 펌웨어는 자기 CAR_ID 만 보내므로, 불일치는 배선/설정 오류 신호다.
         if msg.get("car_id") != sess.car_id:
             return
+        if msg.get("version") != protocol.PROTOCOL_VERSION:
+            return
         mtype = msg.get("type")
+        if mtype not in ("STATUS", "COMMAND_RESULT", "ARRIVED"):
+            return
+        if mtype in ("STATUS", "COMMAND_RESULT") and \
+                msg.get("boot_id") != sess.boot_id:
+            return
+        # A duplicate/delayed STATUS is useful for idempotent command-result
+        # handling, but it is not proof of fresh vehicle state and therefore
+        # must not keep a dead link alive.
+        if mtype == "STATUS" and \
+                msg.get("status_seq", -1) <= sess.last_status.get("status_seq", -1):
+            self._consume_command_result(sess, msg)
+            return
+        command_result_consumed = False
+        if mtype == "COMMAND_RESULT":
+            command_result_consumed = self._consume_command_result(sess, msg)
+            if not command_result_consumed:
+                return
         # COMM freshness is based on a message belonging to this physical
         # session/car, not merely any parseable NDJSON received on the socket.
-        sess.last_rx_ms = time.monotonic() * 1000
-        sess.last_rx_type = str(mtype) if mtype is not None else None
-        self._comm_recovered(sess)
+        recovered = False
+        with self._lock:
+            if self.sessions.get(sess.car_id) is not sess or not sess.alive:
+                return
+            received_ms = time.monotonic() * 1000
+            sess.last_rx_gap_ms = max(0.0, received_ms - sess.last_rx_ms)
+            sess.max_rx_gap_ms = max(sess.max_rx_gap_ms, sess.last_rx_gap_ms)
+            sess.last_rx_ms = received_ms
+            sess.last_rx_type = str(mtype)
+            sess.rx_ready_since_ms = None
+            if sess.comm_failed:
+                sess.comm_failed = False
+                recovered = True
+        if recovered and self.on_comm_recovered is not None:
+            self.on_comm_recovered(sess.car_id)
         if mtype in ("STATUS", "COMMAND_RESULT"):
             # 오래된 스냅샷은 상태를 되돌리지 않는다. 단, 명령 응답은 여전히 유효할
             # 수 있으므로 ack 판정은 스냅샷 갱신과 분리해서 먼저 수행한다 (§13.6)
-            self._consume_command_result(sess, msg)
+            if not command_result_consumed:
+                self._consume_command_result(sess, msg)
             if mtype == "COMMAND_RESULT":
                 return
-            if msg.get("status_seq", -1) <= sess.last_status.get("status_seq", -1):
-                return
-            sess.last_status = msg
+            with self._lock:
+                if self.sessions.get(sess.car_id) is not sess or not sess.alive:
+                    return
+                sess.last_status = msg
             if self.on_status is not None:
                 self.on_status(sess.car_id, msg)
         elif mtype == "ARRIVED":
             # 하위호환 (§22.4): 판정은 노트북이 하므로 ACK만 응답하고 무시
             if "event_id" in msg:
                 self._safe_send(sess.conn, protocol.make_event_ack(
-                    sess.car_id, sess.session_id, int(msg["event_id"])))
+                    sess.car_id, sess.session_id, int(msg["event_id"])),
+                    sess.send_lock)
 
-    def _consume_command_result(self, sess: VehicleSession, msg: dict[str, Any]) -> None:
+    def _consume_command_result(self, sess: VehicleSession,
+                                msg: dict[str, Any]) -> bool:
         """신뢰성 명령의 최종 응답만 ack 로 인정한다.
 
         주기 STATUS 는 command_result=NONE 과 함께 last_processed_cmd_seq 를 계속
@@ -462,20 +622,28 @@ class VehicleServer:
         """
         pending = sess.sender.outstanding
         if pending is None:
-            return
+            return False
         result = str(msg.get("command_result", "NONE"))
         if result not in protocol.TERMINAL_RESULTS:
-            return
+            return False
         seq = pending.get("seq")
         acked = msg.get("last_processed_cmd_seq")
         rejected = msg.get("rejected_seq", msg.get("ack_seq"))
         if acked != seq and rejected != seq:
-            return
+            return False
         sess.sender.on_ack(int(seq))
+        with sess.command_condition:
+            sess.command_results[int(seq)] = result
+            # Bound history for normal commands that do not have a synchronous
+            # waiter (WAYPOINT/GO/etc.).
+            while len(sess.command_results) > 32:
+                sess.command_results.pop(next(iter(sess.command_results)))
+            sess.command_condition.notify_all()
         if self.on_command_result is not None:
             self.on_command_result(sess.car_id, int(seq), result, msg)
         if result in protocol.NEGATIVE_RESULTS and self.on_command_rejected is not None:
             self.on_command_rejected(sess.car_id, result, msg)
+        return True
 
     # ─── 주기 루프: 재전송 + POSE 스트림 + COMM 감시 ─────────────────────────
 
@@ -492,6 +660,8 @@ class VehicleServer:
                     continue
                 s.sender.tick()
                 if now_ms - s.last_rx_ms > TIMING["COMM_TIMEOUT"]:
+                    if self._defer_for_queued_rx(s, now_ms):
+                        continue
                     # 장애가 지속되는 동안 매 주기 통지하지 않는다 — 상위 미션 로직이
                     # 같은 장애로 반복 트리거되면 복구 처리가 계속 리셋된다.
                     self._comm_fail(s.car_id, {
@@ -507,7 +677,7 @@ class VehicleServer:
                     s.heartbeat_seq += 1
                     msg = protocol.make_heartbeat(
                         s.car_id, s.session_id, s.heartbeat_seq)
-                    if self._safe_send(s.conn, msg):
+                    if self._safe_send_session(s, msg):
                         s.last_tx_ms = now_ms
                         s.last_tx_type = "HEARTBEAT"
             # DIRECT_CONTROL — B안 제어값 스트림 (§18.2)
@@ -522,7 +692,7 @@ class VehicleServer:
                         s.latest_control = protocol.make_direct_control(
                             s.car_id, s.session_id, s.control_seq, 0.0, 0.0)
                         s.latest_control_at = now_ms
-                    if self._safe_send(s.conn, s.latest_control):
+                    if self._safe_send_session(s, s.latest_control):
                         s.last_tx_ms = now_ms
                         s.last_tx_type = "DIRECT_CONTROL"
             # POSE_UPDATE — 펌웨어 수신 enum 에 추가되기 전까지는 비활성
@@ -530,7 +700,7 @@ class VehicleServer:
                 last_pose_ms = now_ms
                 for s in sessions:
                     if s.alive and s.latest_pose is not None:
-                        self._safe_send(s.conn, s.latest_pose)
+                        self._safe_send_session(s, s.latest_pose)
             time.sleep(0.02)
 
     # ─── 내부 유틸 ───────────────────────────────────────────────────────────
@@ -542,12 +712,61 @@ class VehicleServer:
         except OSError:
             pass
 
-    def _safe_send(self, conn: socket.socket, msg: dict[str, Any]) -> bool:
+    def _safe_send(self, conn: socket.socket, msg: dict[str, Any],
+                   send_lock: threading.Lock | None = None) -> bool:
+        return self._safe_send_conn(conn, msg, send_lock or threading.Lock())
+
+    @staticmethod
+    def _safe_send_conn(conn: socket.socket, msg: dict[str, Any],
+                        send_lock: threading.Lock) -> bool:
         try:
-            conn.sendall(encode(msg))
+            payload = encode(msg)
+            with send_lock:
+                conn.sendall(payload)
             return True
         except (OSError, ValueError):
             return False
+
+    def _safe_send_session(self, sess: VehicleSession | None,
+                           msg: dict[str, Any]) -> bool:
+        if sess is None:
+            return False
+        with self._lock:
+            if self.sessions.get(sess.car_id) is not sess or not sess.alive:
+                return False
+        sent = self._safe_send_conn(sess.conn, msg, sess.send_lock)
+        if sent:
+            return True
+        # sendall may have emitted a partial NDJSON frame before raising.  The
+        # stream is no longer reusable: fail/retire this exact session and let
+        # HELLO create a clean replacement instead of appending more bytes.
+        self._comm_fail(sess.car_id, {"type": "SOCKET_SEND_FAILED"},
+                        expected_session=sess)
+        with self._lock:
+            if self.sessions.get(sess.car_id) is sess:
+                sess.alive = False
+        sess.sender.clear_pending()
+        with sess.command_condition:
+            sess.command_condition.notify_all()
+        self._safe_close(sess.conn)
+        return False
+
+    def _defer_for_queued_rx(self, sess: VehicleSession, now_ms: float) -> bool:
+        """Give bytes already in the kernel one bounded RX scheduling turn."""
+        try:
+            readable = bool(select.select([sess.conn], [], [], 0)[0])
+        except (OSError, ValueError):
+            readable = False
+        with self._lock:
+            if self.sessions.get(sess.car_id) is not sess or not sess.alive:
+                return False
+            if not readable:
+                sess.rx_ready_since_ms = None
+                return False
+            if sess.rx_ready_since_ms is None:
+                sess.rx_ready_since_ms = now_ms
+                return True
+            return now_ms - sess.rx_ready_since_ms <= self.rx_drain_grace_ms
 
     def _comm_fail(self, car_id: int, msg: dict[str, Any], *,
                    expected_session: VehicleSession | None = None) -> None:
@@ -568,25 +787,21 @@ class VehicleServer:
                 # 끊긴 링크에 재전송해도 소용없다. pending 을 비워 복구 후
                 # 새 명령이 막히지 않게 한다.
                 sess.sender.clear_pending()
+                with sess.command_condition:
+                    sess.command_condition.notify_all()
                 msg = dict(msg)
                 msg.update({
                     "session_id": sess.session_id,
                     "boot_id": sess.boot_id,
+                    "firmware_version": sess.firmware_version,
                     "last_rx_type": sess.last_rx_type,
                     "last_tx_type": sess.last_tx_type,
+                    "last_status_seq": sess.last_status.get("status_seq"),
+                    "last_rx_gap_ms": round(sess.last_rx_gap_ms, 1),
+                    "max_rx_gap_ms": round(sess.max_rx_gap_ms, 1),
                     "last_rx_ms": round(sess.last_rx_ms, 1),
                     "last_tx_ms": (round(sess.last_tx_ms, 1)
                                    if sess.last_tx_ms else None),
                 })
         if self.on_comm_fail is not None:
             self.on_comm_fail(car_id, msg)
-
-    def _comm_recovered(self, sess: VehicleSession) -> None:
-        """수신이 재개되면 장애 상태를 푼다 (엣지에서 1회 통지)."""
-        if not sess.comm_failed:
-            return
-        sess.comm_failed = False
-        # control_held deliberately remains latched.  Fresh pose + route
-        # validation in the production pipeline is the only release boundary.
-        if self.on_comm_recovered is not None:
-            self.on_comm_recovered(sess.car_id)

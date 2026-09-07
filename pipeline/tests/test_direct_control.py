@@ -25,13 +25,19 @@ from pipeline.tests.test_pipeline_integration import (
 FRAME = 1200
 
 
+
 class DirectControlTestBase(unittest.TestCase):
     direct_control = True
 
     def setUp(self) -> None:
         self.policy_patch = patch(
             "rl.bridge.select_action",
-            side_effect=lambda obs, masks, **kw: next(
+            # 이 픽스처가 검증하는 것은 제어/통신 배선이지 슬롯 선택이 아니다.
+            # 예전 stub 은 첫 후보(B4, x=1100)를 골랐고, 그 칸으로는 경로가
+            # 안 나와서 **경로 실패 fallback** 이 다른 칸으로 옮겨 준 덕에
+            # 미션이 시작됐다. 이제 배정된 칸은 예약이라 그렇게 바뀌지 않으므로,
+            # stub 이 처음부터 경로가 나오는 칸을 고르게 한다.
+            side_effect=lambda obs, masks, **kw: max(
                 i for i, allowed in enumerate(masks[:8]) if allowed))
         self.policy_patch.start()
         self.config = PipelineConfig(

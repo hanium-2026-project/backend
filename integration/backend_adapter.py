@@ -61,6 +61,8 @@ def waypoint_from_backend(obj: Any) -> Waypoint:
         curvature=float(getattr(obj, "curvature", 0.0) or 0.0),
         path_capture_tolerance_cm=_opt_float(
             getattr(obj, "path_capture_tolerance_cm", None)),
+        terminal_motion_clearance_mm=_opt_float(
+            getattr(obj, "terminal_motion_clearance_mm", None)),
         route_id=getattr(obj, "route_id", None),
         waypoint_id=getattr(obj, "waypoint_id", None),
         phase=getattr(obj, "phase", None),

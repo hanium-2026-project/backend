@@ -206,6 +206,39 @@ class ControllerConfig:
     # reverse_straight_phases 는 그중 실제로 고정할 phase 목록이다.
     reverse_straight_steering: bool = True
     reverse_straight_phases: tuple[str, ...] = ("RECOVERY",)
+    # FINAL 직선 후진(곡률 0)에서 차량이 **이미 슬롯 축에 정렬돼 있으면**
+    # 앞바퀴를 11자로 고정한다.
+    #
+    # FINAL waypoint 는 슬롯 중심을 향한 곡률 0 직선 후진인데, 제어기는 끝점
+    # bearing 을 향해 조향한다. 목표에 가까워질수록 그 bearing 오차는
+    # atan(횡오차 / 남은거리) 로 커져(거리→0) 조향이 firmware turn-duty 구간
+    # (|steer|>=0.5 에서 pwm_turn/strong_turn)으로 올라간다. 그 PWM 상승이
+    # 개루프 속도를 높여 정지거리를 늘리고, 슬롯 뒤(=맵 경계, 여유 25mm)를
+    # 넘어 BOUNDARY_HARD 를 낸다. 실측: 191010/191220/193043/193223/193518/
+    # 224157/224451 의 최초 rear FINAL 이 depth +51~88mm 로 과주행했고, 성공한
+    # 002703/022217 은 FINAL |steer| 0.15~0.21 로 낮았다.
+    #
+    # "정렬됨" 판정은 이 waypoint 가 이미 들고 있는 FINAL 도착 허용오차
+    # (heading_tolerance_deg / position_tolerance_cm)를 그대로 쓴다 — 새 튜닝
+    # 상수가 아니다. 정렬 범위 **밖**이면 기존 조향을 그대로 유지하므로 크게
+    # 틀어진 자세의 보정은 막지 않는다. 002703 은 FRONT_CUSHION heading 이
+    # 실제 진행방향과 28° 벌어진 측정 자세여서 heading gate 를 통과하지 못하고
+    # 기존 동작을 유지한다(회귀 없음). 이 스위치를 끄면 예전 동작으로 돌아간다.
+    final_reverse_straight_when_aligned: bool = True
+    # 정렬된 FINAL 직선 후진에서 허용하는 최대 wire steering.
+    #
+    # 0 lock 이 아니라 cap 인 이유: 실차 FRONT_CUSHION body heading 과 실제
+    # 진행 접선이 8~11° 벌어져(motion crab), 조향을 완전히 끊으면 그 crab 이
+    # 미보정으로 남아 남은 후진 거리만큼 횡오차를 오히려 키운다(sim 확인:
+    # lock 시 5mm 섭동이 -26~-38mm 로 벌어짐). cap 은 그 완만한 crab 보정은
+    # 남기고, 종점 근처에서 point-bearing 이 포화(→1.0)하는 것만 깎는다.
+    #
+    # 값 유도: firmware throttle_to_duty 는 |steer| 0→0.5 에서 duty 를
+    # pwm_forward(15/23)→pwm_turn(32/40) 으로 보간한다. 그 전이의 중앙
+    # |steer|=0.25 는 duty 가 아직 pwm_forward 쪽(≈24)이라 정지거리 상승이
+    # 작다. 그 위로는 조향이 duty 를 급히 turn 영역으로 밀어올린다. 튜닝
+    # 상수가 아니라 firmware duty 곡선의 전이 중앙이다.
+    final_reverse_aligned_steer_cap: float = 0.25
 
     # === 최대 조향 정지 마찰 =================================================
     # 바퀴를 끝까지 꺾으면 정지 마찰이 급증한다. 펌웨어 throttle_to_duty 는
@@ -341,6 +374,29 @@ class ControllerConfig:
 
     # === 안전/신선도 =========================================================
     max_pose_age_s: float = 0.5           # 이 시간 초과한 pose 는 stale → 정지
+    # 정지해야 하는 waypoint(is_final)에서 "관측 없이 목표를 지나칠 수 있으면
+    # 움직이지 않는다" 는 공간 계약을 켠다.
+    #
+    # max_pose_age_s 만으로는 부족하다. 그건 시간 기준이라 속도와 남은 거리를
+    # 모른다. 실측(run_20260901_154551) FINAL 후진 속도는 134mm/s 인데 슬롯
+    # 깊이 여유는 25mm 라, 카메라가 정상(4.3fps)이어도 프레임 하나 사이에
+    # 31mm 를 움직여 여유를 넘긴다. 그래서 이건 인지 성능 문제가 아니라
+    # 제어 안전 계약 문제다.
+    #
+    # 끄면 예전 동작(시간 기준 stale 판정만)으로 돌아간다.
+    blind_travel_guard: bool = True
+    # 실측 run_20260901_154551에서 zero 이후 약 54.5mm / 134mm/s =
+    # 0.407s 동안 관성 이동했다. 한 run의 거리를 박는 대신 정지 시간으로
+    # 보정하고 0.45s로 올림해 현재 관측 속도에 비례시킨다.
+    final_stopping_time_s: float = 0.45
+    # route load 직후처럼 서로 다른 pose가 아직 두 개 없어 실측 속도가 0인
+    # 경우의 bootstrap 하한. 현재 검증된 FINAL 최고 134mm/s를 140으로 올림한
+    # 실차 calibration이며, 관측 속도가 생기면 둘 중 큰 값이 자동 사용된다.
+    final_speed_estimate_floor_mm_s: float = 140.0
+    # calibration/heading/center-point 오차를 spatial budget에 별도 보수값으로
+    # 포함한다. boundary predictor가 쓰는 기본 measurement uncertainty와 같은
+    # 10mm이지만 계층 간 숨은 결합을 피하려고 controller calibration으로 둔다.
+    final_measurement_uncertainty_mm: float = 10.0
 
     def brake_radius_cm(self, position_tolerance_cm: float) -> float:
         """기존 CRUISE 도착 반경(cm)."""

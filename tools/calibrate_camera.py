@@ -15,7 +15,6 @@
     좌클릭   모서리 지정 (좌상 → 우상 → 우하 → 좌하 순서)
     u        마지막 점 취소
     r        전부 지우고 다시
-    g        격자 오버레이 켜기/끄기 (100mm 간격)
     s        결과 저장 후 종료
     q        저장 없이 종료
 
@@ -38,12 +37,13 @@ from cv.homography import compute_homography, warp_point  # noqa: E402
 
 # 클릭 순서 — pipeline.config.homography_pairs 의 dst 순서와 일치해야 한다
 CORNER_LABELS = [
-    "좌상 (맵 0, H)",
-    "우상 (맵 W, H)",
-    "우하 (맵 W, 0)",
-    "좌하 (맵 0, 0) = 원점",
+    "TL 좌상 (맵 0, H)",
+    "TR 우상 (맵 W, H)",
+    "BR 우하 (맵 W, 0)",
+    "BL 좌하 (맵 0, 0) = 원점",
 ]
 WINDOW = "calibration"
+FRAME_SIZE = (640, 480)
 
 
 class Calibrator:
@@ -51,7 +51,6 @@ class Calibrator:
         self.lot_w, self.lot_h = lot_w, lot_h
         self.corners: list[tuple[float, float]] = []
         self.probes: list[tuple[tuple[float, float], tuple[float, float]]] = []
-        self.show_grid = True
         self.homography: np.ndarray | None = None
 
     # ─── 입력 ────────────────────────────────────────────────────────────────
@@ -61,8 +60,12 @@ class Calibrator:
             return
         if len(self.corners) < 4:
             self.corners.append((float(x), float(y)))
+            index = len(self.corners) - 1
+            print(f"  {CORNER_LABELS[index]}: 픽셀({x}, {y})")
             if len(self.corners) == 4:
                 self._build()
+            else:
+                print(f"  다음: {CORNER_LABELS[len(self.corners)]} 클릭")
         elif self.homography is not None:
             world = warp_point((float(x), float(y)), self.homography)
             self.probes.append(((float(x), float(y)), world))
@@ -74,11 +77,13 @@ class Calibrator:
         elif self.corners:
             self.corners.pop()
             self.homography = None
+            print(f"  다시: {CORNER_LABELS[len(self.corners)]} 클릭")
 
     def reset(self) -> None:
         self.corners.clear()
         self.probes.clear()
         self.homography = None
+        print(f"  초기화 완료: {CORNER_LABELS[0]} 클릭")
 
     def _build(self) -> None:
         dst = [(0.0, self.lot_h), (self.lot_w, self.lot_h), (self.lot_w, 0.0), (0.0, 0.0)]
@@ -91,52 +96,9 @@ class Calibrator:
 
     def draw(self, frame: np.ndarray) -> np.ndarray:
         vis = frame.copy()
-        for i, (x, y) in enumerate(self.corners):
-            cv2.circle(vis, (int(x), int(y)), 7, (0, 255, 255), -1)
-            cv2.putText(vis, str(i + 1), (int(x) + 10, int(y) - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        if len(self.corners) >= 2:
-            pts = np.array(self.corners, dtype=np.int32)
-            closed = len(self.corners) == 4
-            cv2.polylines(vis, [pts], closed, (0, 255, 0), 2)
-
-        if self.homography is not None and self.show_grid:
-            self._draw_grid(vis)
-
-        for (px, py), (wx, wy) in self.probes:
-            cv2.drawMarker(vis, (int(px), int(py)), (255, 0, 255),
-                           cv2.MARKER_CROSS, 16, 2)
-            cv2.putText(vis, f"({wx:.0f},{wy:.0f})", (int(px) + 8, int(py) + 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
-
-        hint = (CORNER_LABELS[len(self.corners)] + " 를 클릭"
-                if len(self.corners) < 4 else "검증: 아는 지점 클릭 | s=저장 q=종료")
-        cv2.rectangle(vis, (0, 0), (vis.shape[1], 34), (0, 0, 0), -1)
-        cv2.putText(vis, hint, (10, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        for x, y in self.corners:
+            cv2.circle(vis, (int(x), int(y)), 4, (0, 255, 255), -1, cv2.LINE_AA)
         return vis
-
-    def _draw_grid(self, vis: np.ndarray, step: float = 100.0) -> None:
-        """맵 좌표 격자를 역투영해 화면에 그린다 (왜곡·오차 눈으로 확인용)."""
-        inv = np.linalg.inv(np.asarray(self.homography, dtype=float))
-
-        def to_px(wx: float, wy: float) -> tuple[int, int] | None:
-            v = inv @ np.array([wx, wy, 1.0])
-            if abs(v[2]) < 1e-9:
-                return None
-            return int(v[0] / v[2]), int(v[1] / v[2])
-
-        x = 0.0
-        while x <= self.lot_w + 1e-6:
-            a, b = to_px(x, 0.0), to_px(x, self.lot_h)
-            if a and b:
-                cv2.line(vis, a, b, (80, 80, 80), 1)
-            x += step
-        y = 0.0
-        while y <= self.lot_h + 1e-6:
-            a, b = to_px(0.0, y), to_px(self.lot_w, y)
-            if a and b:
-                cv2.line(vis, a, b, (80, 80, 80), 1)
-            y += step
 
     # ─── 저장 ────────────────────────────────────────────────────────────────
 
@@ -183,8 +145,17 @@ def main() -> int:
             print("첫 프레임을 읽지 못했습니다.")
             return 1
 
+    h, w = frame.shape[:2]
+    if (w, h) != FRAME_SIZE:
+        if cap is not None:
+            cap.release()
+        print(f"입력은 640x480 원본이어야 합니다: 현재 {w}x{h}")
+        return 1
+
     calib = Calibrator(args.lot[0], args.lot[1])
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW, *FRAME_SIZE)
+    cv2.moveWindow(WINDOW, 40, 40)
     cv2.setMouseCallback(WINDOW, calib.on_mouse)
     print(__doc__.split("사용법")[0])
     print(f"바닥판 크기: {args.lot[0]:.0f} x {args.lot[1]:.0f} mm")
@@ -203,8 +174,6 @@ def main() -> int:
             calib.undo()
         elif key == ord("r"):
             calib.reset()
-        elif key == ord("g"):
-            calib.show_grid = not calib.show_grid
         elif key == ord("s"):
             if len(calib.corners) < 4:
                 print("네 모서리를 모두 지정해야 저장할 수 있습니다.")

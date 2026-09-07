@@ -57,7 +57,22 @@ _WARMUP_REASONS = frozenset({"NO_HEADING"})
 # silent RUNNING+zero 교착이 생긴다.
 _REVERSE_OBSERVATION_HOLD_REASONS = frozenset({
     "REVERSE_HEADING_UNSAFE", "POSE_STALE", "NO_POSE", "NO_HEADING",
+    "POSE_BLIND_TRAVEL",
 })
+
+# ALIGN terminal 에서 reverse START anchor 로 승격할 수 있는 heading 출처.
+#
+# 둘 다 "이번 관측에서 실제로 잰 값"이다 — FRONT_CUSHION 은 현재 프레임의
+# 물리적 차체 방향(primary), TRAJECTORY 는 직전 전진 운동에서 유도한 방향.
+# LAST_VALID 는 과거 값의 복제라 절대 승격하지 않는다. 승격하면 정지 상태에서
+# 자기 자신을 근거로 후진을 시작하는 신뢰 고리가 생긴다.
+#
+# FRONT_CUSHION 을 뺀 채로 두면 anchor 는 "cushion 이 없을 때만" 만들어지는데,
+# anchor 가 필요한 상황이 바로 "ALIGN 도착 직후 cushion 을 잃는" 경우라서
+# 조건이 역전돼 있었다. 실측(run_20260824_192746): ALIGN 도착 tick 의 출처가
+# FRONT_CUSHION 이라 anchor 가 안 만들어졌고, 다음 프레임부터 cushion 이
+# 사라져 ENTRY 24 tick 이 전부 throttle 0 → REVERSE_HEADING_TIMEOUT.
+_REVERSE_ANCHOR_SOURCES = frozenset({"FRONT_CUSHION", "TRAJECTORY"})
 
 
 class ReverseObservationState(str, Enum):
@@ -67,6 +82,7 @@ class ReverseObservationState(str, Enum):
     WAIT_PRIMARY = "REVERSE_WAIT_PRIMARY_HEADING"
     START_ANCHOR = "REVERSE_START_TRAJECTORY_ANCHOR"
     TRACK_PRIMARY = "REVERSE_TRACK_PRIMARY"
+    TRACK_PRIMARY_MOTION = "REVERSE_TRACK_PRIMARY_MOTION_GUIDANCE"
     TRACK_TRAJECTORY = "REVERSE_TRACK_TRAJECTORY_FALLBACK"
     OBSERVATION_LOST = "REVERSE_OBSERVATION_LOST"
 
@@ -105,7 +121,11 @@ class HostController:
         self._recent_observations: deque[Pose] = deque(maxlen=window)
         self._reverse_observations: deque[Pose] = deque(maxlen=window)
         self._reverse_observation_state = ReverseObservationState.IDLE
+        # 후진 **명령이 나갔다** (actuator 가 실제로 뒤로 갔다는 뜻이 아니다).
         self._reverse_motion_started = False
+        # 차체 기준 뒤쪽 변위가 pose 로 **확인됐다**. 이게 서야 비로소
+        # reverse trajectory 표본을 모으기 시작한다.
+        self._reverse_motion_confirmed = False
         self._reverse_start_anchor: Pose | None = None
         self._reverse_start_anchor_route_id: int | None = None
         self._reverse_bootstrap_origin: Pose | None = None
@@ -176,6 +196,12 @@ class HostController:
             control_pose, target, allow_drive=True, now=now
         )
 
+        if cmd.reason == "ARC_CORRIDOR_MISSED":
+            self.mission.request_replan("ARC_CORRIDOR_MISSED")
+            self.auto_producer.reset()
+            self.final_pose_guard.reset()
+            return self._finish(_zero_command("ARC_CORRIDOR_MISSED"), zero=True)
+
         # Rear reverse observation contract:
         # unsafe/stale -> immediate zero -> short fresh-heading reacquisition
         # -> resume, or bounded timeout -> parking setup/replan.
@@ -238,6 +264,7 @@ class HostController:
                 target_bearing_deg=cmd.target_bearing_deg,
                 reason=f"FINAL_CONFIRMING_{final_progress.count}_OF_{final_progress.required}",
                 logical_steering=0.0,
+                telemetry=cmd.telemetry,
             )
             return self._finish(cmd, zero=True)
 
@@ -251,10 +278,14 @@ class HostController:
         if (cmd.throttle < 0.0
                 and target.motion_direction is MotionDirection.REVERSE):
             if not self._reverse_motion_started:
+                # 명령이 나갔을 뿐이다. ALIGN 관성으로 차는 아직 앞으로 밀리는
+                # 중일 수 있으므로 이 pose 를 reverse 표본으로 넣지 않는다 —
+                # 넣으면 전진 변위에 180° 보정이 붙어 차체 방향과 정반대인
+                # heading 이 나온다 (run_20260824_204134).
                 self._reverse_motion_started = True
+                self._reverse_motion_confirmed = False
                 self._reverse_observations.clear()
                 if pose is not None:
-                    self._append_distinct(self._reverse_observations, pose)
                     self._reverse_bootstrap_origin = pose
                 self._reverse_bootstrap_started = now
 
@@ -318,14 +349,59 @@ class HostController:
             return
         samples.append(pose)
 
+    def _trusted_body_heading(self) -> float | None:
+        """Body heading that may be used as the sign reference for travel.
+
+        Only headings this contract already validated: the direction-corrected
+        reverse track / FRONT_CUSHION value, else the same-route ALIGN anchor.
+        A raw TRAJECTORY or LAST_VALID heading is never used here — TRAJECTORY
+        flips 180 degrees while reversing and LAST_VALID is a stale copy, so
+        either would invert the very sign this test exists to determine.
+        """
+        if self._last_trusted_reverse_heading is not None:
+            return float(self._last_trusted_reverse_heading)
+        anchor = self._reverse_start_anchor
+        if anchor is not None and anchor.heading_deg is not None:
+            return float(anchor.heading_deg)
+        return None
+
+    def _is_rearward(self, previous: Pose, pose: Pose) -> bool:
+        """Whether travel between two poses points behind the body.
+
+        ``ds = dx*cos(h) + dy*sin(h)`` is the signed along-body displacement the
+        curvature contract already uses (``dtheta = curvature * ds``).  Negative
+        means the vehicle moved opposite to where it points, i.e. it reversed.
+        """
+        heading = self._trusted_body_heading()
+        if heading is None:
+            return False
+        rad = math.radians(heading)
+        ds = ((pose.x_mm - previous.x_mm) * math.cos(rad)
+              + (pose.y_mm - previous.y_mm) * math.sin(rad))
+        return ds < 0.0
+
     def _record_distinct_observation(self, pose: Pose | None) -> None:
         if pose is None or not pose.valid:
             return
-        before = self._recent_observations[-1].timestamp if self._recent_observations else None
+        previous = self._recent_observations[-1] if self._recent_observations else None
+        before = previous.timestamp if previous is not None else None
         self._append_distinct(self._recent_observations, pose)
-        if (self._reverse_motion_started
-                and (before is None or pose.timestamp > before)):
-            self._append_distinct(self._reverse_observations, pose)
+        if not self._reverse_motion_started:
+            return
+        if previous is None or before is None or pose.timestamp <= before:
+            return
+        if not self._is_rearward(previous, pose):
+            # ALIGN 관성으로 아직 앞으로 밀리는 중이다. 이 표본은 reverse
+            # trajectory 창에 넣지 않는다. 창을 비우지도 않는다 — 이미 확인된
+            # 후진 표본이 있으면 잡음 한 프레임으로 버리지 않는다.
+            return
+        if not self._reverse_motion_confirmed:
+            # 첫 후진 변위. 여기부터가 실제 후진 궤적의 시작점이므로 창을
+            # 새로 열고 이 변위를 만든 두 pose 로 시작한다.
+            self._reverse_motion_confirmed = True
+            self._reverse_observations.clear()
+            self._append_distinct(self._reverse_observations, previous)
+        self._append_distinct(self._reverse_observations, pose)
 
     @staticmethod
     def _heading_delta(a: float, b: float) -> float:
@@ -359,17 +435,26 @@ class HostController:
         self, pose: Pose | None, target: Waypoint, *, now: float,
     ) -> None:
         if (pose is None or not pose.valid or not pose.has_heading
-                or pose.heading_source != "TRAJECTORY"
+                or pose.heading_source not in _REVERSE_ANCHOR_SOURCES
                 or now - pose.timestamp > self.config.max_pose_age_s):
             return
-        heading = self._quality_trajectory_heading(
+        # 출처가 무엇이든 최근 전진 궤적과의 교차검증은 그대로 요구한다.
+        # anchor 는 단독 신뢰가 아니라 "primary heading + 실제 운동" 두 증거가
+        # 일치할 때만 만들어진다.
+        motion_heading = self._quality_trajectory_heading(
             self._recent_observations, reverse=False)
-        if (heading is None
-                or self._heading_delta(heading, float(pose.heading_deg))
+        if (motion_heading is None
+                or self._heading_delta(motion_heading, float(pose.heading_deg))
                 > self.config.reverse_start_anchor_max_heading_delta_deg):
             return
+        # 교차검증을 통과했으면 FRONT_CUSHION 은 궤적 유도값보다 상위 출처다.
+        # 실제로 관측된 차체 방향을 남기고, TRAJECTORY 일 때만 기존처럼
+        # 궤적에서 유도한 heading 을 쓴다.
+        anchor_heading = (float(pose.heading_deg)
+                          if pose.heading_source == "FRONT_CUSHION"
+                          else motion_heading)
         self._reverse_start_anchor = replace(
-            pose, heading_deg=heading,
+            pose, heading_deg=anchor_heading,
             heading_source="REVERSE_START_TRAJECTORY_ANCHOR")
         self._reverse_start_anchor_route_id = target.route_id
 
@@ -384,6 +469,7 @@ class HostController:
         if not guarded:
             self._reverse_observation_state = ReverseObservationState.IDLE
             self._reverse_motion_started = False
+            self._reverse_motion_confirmed = False
             self._reverse_observations.clear()
             self._last_trusted_reverse_heading = None
             return pose
@@ -394,13 +480,49 @@ class HostController:
 
         source = str(pose.heading_source or "").upper()
         if source == "FRONT_CUSHION" and pose.has_heading:
-            self._reverse_observation_state = ReverseObservationState.TRACK_PRIMARY
             self._last_trusted_reverse_heading = float(pose.heading_deg)
+            # FRONT_CUSHION stays authoritative for body orientation.  Once
+            # reverse motion is independently confirmed, use the quality
+            # trajectory only as the tracked centre point's motion tangent.
+            # This does not promote TRAJECTORY to a planning/terminal heading.
+            trajectory_body = None
+            if self._reverse_motion_confirmed:
+                # Safety confirmation keeps the full bounded window, while
+                # guidance uses the newest minimum-quality window.  A five
+                # sample chord on a curve is the tangent several frames in the
+                # past; the latest three still satisfy the existing 30 mm /
+                # linearity contract in the real runs and materially reduce
+                # that geometric lag without adding a gain.
+                count = max(3, int(
+                    self.config.reverse_trajectory_min_observations))
+                recent = deque(
+                    list(self._reverse_observations)[-count:], maxlen=count)
+                trajectory_body = self._quality_trajectory_heading(
+                    recent, reverse=True)
+                if trajectory_body is None:
+                    trajectory_body = self._quality_trajectory_heading(
+                        self._reverse_observations, reverse=True)
+            if (trajectory_body is not None
+                    and self._heading_delta(
+                        trajectory_body, float(pose.heading_deg))
+                        <= self.config.reverse_trajectory_max_heading_delta_deg):
+                self._reverse_observation_state = (
+                    ReverseObservationState.TRACK_PRIMARY_MOTION)
+                return replace(
+                    pose,
+                    motion_heading_deg=(trajectory_body + 180.0) % 360.0,
+                    motion_heading_source="REVERSE_TRAJECTORY",
+                )
+            self._reverse_observation_state = ReverseObservationState.TRACK_PRIMARY
             return pose
 
         if self._reverse_motion_started:
-            heading = self._quality_trajectory_heading(
-                self._reverse_observations, reverse=True)
+            # 후진 변위가 확인되기 전에는 궤적 fallback 자체를 시도하지 않는다.
+            # 창에 전진 관성 표본만 있는 상태에서 방향을 유도하면 정확히
+            # 반대 방향이 나온다.
+            heading = (self._quality_trajectory_heading(
+                           self._reverse_observations, reverse=True)
+                       if self._reverse_motion_confirmed else None)
             if (heading is not None
                     and (self._last_trusted_reverse_heading is None
                          or self._heading_delta(
@@ -457,6 +579,7 @@ class HostController:
         self._reverse_observation_wait_started = None
         self._reverse_observation_state = ReverseObservationState.IDLE
         self._reverse_motion_started = False
+        self._reverse_motion_confirmed = False
         self._reverse_observations.clear()
         self._reverse_start_anchor = None
         self._reverse_start_anchor_route_id = None

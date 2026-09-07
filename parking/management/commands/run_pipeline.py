@@ -15,12 +15,14 @@ from __future__ import annotations
 import logging
 import os
 
+from dataclasses import asdict
 from pathlib import Path
 
 from django.core.management.base import BaseCommand, CommandError
 
 from control import VehicleLimits
 from controller.config import ControllerConfig
+from parking.waypoints import CAR_LENGTH_MM, CAR_WIDTH_MM
 from pipeline import ParkingPipeline, PipelineConfig
 from tools.run_recorder import RunRecorder
 
@@ -55,6 +57,31 @@ class Command(BaseCommand):
         parser.add_argument("--steering-sign", type=float, default=None,
                             choices=[1.0, -1.0],
                             help="wire 조향 부호. 실차 확인값은 -1 (음수 = 좌회전)")
+        parser.add_argument("--calibrate-speed", action="store_true",
+                            help="throttle→속도/정지거리 실측 시퀀스를 자동으로 "
+                                 "수행한다 (--manual 을 함께 켠 것과 같다). "
+                                 "WASD 는 W/S 가 항상 1.0 이라 0.10/0.15/0.25 "
+                                 "같은 정확한 크기를 낼 수 없어서 필요하다.")
+        parser.add_argument("--calibrate-throttles", default="0.10,0.15,0.25",
+                            help="측정할 throttle 크기 목록 (쉼표 구분). "
+                                 "--parking-throttle 을 넘는 값은 잘라낸다.")
+        parser.add_argument("--calibrate-vehicle", action="store_true",
+                            help="차량 시스템 식별 전체 시퀀스를 한 번에 수행한다: "
+                                 "deadband/속도 -> 정지거리 -> 조향 곡률 -> "
+                                 "좌우/전후진 비대칭. primitive 마다 STOP 으로 "
+                                 "끊고, 끝나면 같은 run 을 자동 분석한다.")
+        parser.add_argument("--calibrate-steerings", default="0.4,-0.4,0.7,-0.7,1.0,-1.0",
+                            help="--calibrate-vehicle 의 조향 명령 목록. "
+                                 "부호가 좌우를 가른다.")
+        parser.add_argument("--calibrate-repeats", type=int, default=1,
+                            help="각 조건 반복 횟수. 첫 실차 검증은 1 을 쓴다.")
+        parser.add_argument("--calibrate-steering-throttle", type=float, default=0.15,
+                            help="조향 primitive 를 구동할 throttle 크기.")
+        parser.add_argument("--calibrate-once", action="store_true",
+                            help="첫 throttle 로 전진 primitive 한 번만 수행한다. "
+                                 "6개를 연속으로 돌리기 전 배선 확인용.")
+        parser.add_argument("--calibrate-seconds", type=float, default=2.5,
+                            help="한 primitive 를 구동하는 시간(초)")
         parser.add_argument("--manual", action="store_true",
                             help="수동 계측 모드: 슬롯 배정·자동 주행을 하지 않고 "
                                  "WASD 창으로 직접 몬다. 카메라 pose 는 계속 "
@@ -92,12 +119,17 @@ class Command(BaseCommand):
         parser.add_argument("--record", default=None, metavar="DIR",
                             help="Run 단위 실차 기록을 남길 상위 디렉터리 "
                                  "(예: runs). run_YYYYMMDD_HHMMSS/ 가 생성된다")
+        parser.add_argument("--record-video", action="store_true",
+                            help="--record run 디렉터리에 annotated e2e.mp4와 "
+                                 "video_frames.jsonl을 기록한다")
 
     def handle(self, *args, **options) -> None:
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         )
+        if options["record_video"] and not options["record"]:
+            raise CommandError("--record-video requires --record DIR")
         if (options["parking_mode"] == "rear"
                 and options["control_mode"] != "auto-host"):
             raise CommandError(
@@ -197,7 +229,8 @@ class Command(BaseCommand):
                                  else options["turn_radius"] * 10.0),
             vehicle_limits=limits,
             controller_config=controller_config,
-            manual_only=options["manual"],
+            manual_only=(options["manual"] or options["calibrate_speed"]
+                         or options["calibrate_vehicle"]),
         ))
         recorder = self._start_recorder(pipeline, options, controller_config,
                                         lot_w, lot_h)
@@ -207,11 +240,17 @@ class Command(BaseCommand):
         ))
         outcome = "OK"
         try:
-            if options["manual"]:
+            if options["calibrate_vehicle"]:
+                self._run_vehicle_calibration(pipeline, options, recorder)
+            elif options["calibrate_speed"]:
+                self._run_speed_calibration(pipeline, options)
+            elif options["manual"]:
                 self._run_manual(pipeline, options)
             else:
                 pipeline.run_camera(max_frames=options["max_frames"],
-                                    show=options["show"])
+                                    show=options["show"],
+                                    frame_sink=(recorder.log_video_frame
+                                                if options["record_video"] else None))
         except KeyboardInterrupt:
             outcome = "ABORTED"
             self.stdout.write("중단 요청 — 정리 중")
@@ -226,7 +265,377 @@ class Command(BaseCommand):
                     f"(pose {summary.get('pose_rows', 0)}행, "
                     f"control {summary.get('control_rows', 0)}행)"
                 ))
+                video = summary.get("video") or {}
+                if options["record_video"]:
+                    if video.get("path"):
+                        self.stdout.write(self.style.SUCCESS(
+                            f"Video saved: {video['path']}"))
+                    else:
+                        self.stdout.write(self.style.ERROR(
+                            f"Video recording failed: "
+                            f"{video.get('error') or 'no frames recorded'}"))
             pipeline.stop()
+
+    def _run_speed_calibration(self, pipeline, options) -> None:
+        """throttle 크기별 직진/후진 + 정지거리 실측 시퀀스.
+
+        새 actuator 경로를 만들지 않는다. WASD 창이 쓰는 것과 **똑같은**
+        production 경로(set_manual_drive -> HybridControlMux.set_manual_wire ->
+        HostController.tick -> VehicleServerDirectSender -> REMOTE_DIRECT)로
+        내려간다. 다른 점은 입력이 키보드가 아니라 정해진 숫자라는 것뿐이다.
+
+        WASD 로는 이 측정을 할 수 없다: control.wasd_logic.compute_throttle 이
+        0.0 / +1.0 / -1.0 만 돌려주기 때문에 0.10 같은 크기를 낼 방법이 없다.
+
+        안전: primitive 마다 zero -> 물리적 정지 확인을 끼우고, 경계에 다가가면
+        그 primitive 를 즉시 끝낸다. throttle 은 --parking-throttle 로 자른다.
+        기존 boundary/COMM/stale 계약은 그대로 살아 있다 (manual_only 는 슬롯
+        배정만 건너뛴다).
+        """
+        import threading
+        import time as _time
+
+        from parking.waypoints import _path_clearance
+
+        car_id = 1
+        cap = abs(float(options["parking_throttle"]))
+        try:
+            levels = [abs(float(v)) for v in
+                      str(options["calibrate_throttles"]).split(",") if v.strip()]
+        except ValueError:
+            raise CommandError("--calibrate-throttles 는 숫자 목록이어야 합니다")
+        levels = [min(v, cap) for v in levels if v > 0.0]
+        if not levels:
+            raise CommandError("측정할 throttle 이 없습니다")
+        drive_s = max(0.3, float(options["calibrate_seconds"]))
+        # 차체가 경계에 이만큼까지 다가오면 그 primitive 를 끝낸다. 계획용
+        # 여유(35mm)보다 넉넉히 잡는다 — 사람이 지켜보는 계측이므로 보수적으로.
+        stop_clearance_mm = 120.0
+
+        self.stdout.write(self.style.WARNING(
+            "속도 계측 모드 — 슬롯 배정·자동 주행 없음. "
+            f"throttle {levels} × 전진/후진, 각 {drive_s:.1f}s. Ctrl+C 로 중단."))
+
+        cam = threading.Thread(
+            target=pipeline.run_camera,
+            kwargs={"max_frames": options["max_frames"], "show": options["show"]},
+            name="camera-loop", daemon=True)
+        cam.start()
+
+        def pose():
+            """차량 pose. **track_of_car 에 의존하지 않는다.**
+
+            _bind_car 는 차가 entry_nodes(junction/entrance) 에 있을 때만
+            불린다. 계측은 통로 한가운데에서 하므로 binding 이 영영 안 생긴다 —
+            실측 run_20260903_123402: node=lane_pt_3, car_id=None 인 채로 171
+            프레임이 흘렀고, 계측 루프는 pose 를 못 찾아 대기만 하다 끝났다.
+
+            계측 모드는 1대 전용이므로, 묶인 track 이 있으면 그것을 쓰고
+            없으면 **관측된 track 이 정확히 하나일 때만** 그것을 쓴다.
+            둘 이상이면 어느 것이 차인지 알 수 없으므로 움직이지 않는다.
+            """
+            bound = pipeline.track_of_car.get(car_id)
+            if bound is not None and bound in pipeline.views:
+                view = pipeline.views[bound]
+            else:
+                seen = [v for v in pipeline.views.values()
+                        if v.heading_deg is not None]
+                if len(seen) != 1:
+                    return None
+                view = seen[0]
+            if view.heading_deg is None:
+                return None
+            return (view.position_mm[0], view.position_mm[1], view.heading_deg)
+
+        def clearance():
+            p = pose()
+            return None if p is None else _path_clearance([p])[1]
+
+        def hold_zero(seconds: float) -> None:
+            end = _time.monotonic() + seconds
+            while _time.monotonic() < end:
+                pipeline.set_manual_drive(car_id, 0.0, 0.0)
+                _time.sleep(0.1)
+
+        try:
+            # 차량 접속과 첫 pose 를 기다린다. 무엇을 기다리는지 알려준다 —
+            # 조용히 60초 서 있으면 사용자는 차가 고장난 줄 안다.
+            waited = 0.0
+            while waited < 60.0:
+                has_session = car_id in pipeline.hybrid_controls
+                p = pose()
+                if has_session and p is not None:
+                    break
+                if waited and abs(waited % 5.0) < 0.05:
+                    self.stdout.write(
+                        f"  대기 {waited:.0f}s — session={has_session} "
+                        f"pose={'OK' if p else 'None'} "
+                        f"tracks={len(pipeline.views)}")
+                _time.sleep(0.1)
+                waited += 0.1
+            else:
+                raise CommandError(
+                    "차량 세션 또는 카메라 pose 를 못 받았습니다 "
+                    f"(session={car_id in pipeline.hybrid_controls}, "
+                    f"tracks={len(pipeline.views)})")
+            pipeline.switch_to_manual(car_id)
+            hold_zero(1.0)
+
+            if options["calibrate_once"]:
+                # 첫 실차 검증용: +throttle 전진 한 번만. 6개 primitive 를
+                # 연속으로 돌리기 전에 배선이 살아 있는지부터 확인한다.
+                levels = levels[:1]
+                directions = ((1.0, "FORWARD"),)
+                self.stdout.write("  단일 primitive 모드 (전진 1회만)")
+            else:
+                directions = ((1.0, "FORWARD"), (-1.0, "REVERSE"))
+
+            for level in levels:
+                for sign, label in directions:
+                    start = pose()
+                    self.stdout.write(
+                        f"  throttle {sign * level:+.2f} {label} … "
+                        f"start=({start[0]:.0f},{start[1]:.0f})")
+                    end = _time.monotonic() + drive_s
+                    reason = "duration"
+                    while _time.monotonic() < end:
+                        c = clearance()
+                        if c is not None and c < stop_clearance_mm:
+                            reason = f"boundary({c:.0f}mm)"
+                            break
+                        pipeline.set_manual_drive(car_id, sign * level, 0.0)
+                        _time.sleep(0.05)
+                    pipeline.set_manual_drive(car_id, 0.0, 0.0)
+                    hold_zero(3.0)          # 타행이 끝날 때까지 zero 유지
+                    fin = pose()
+                    self.stdout.write(
+                        f"      stop=({fin[0]:.0f},{fin[1]:.0f}) [{reason}]")
+        except KeyboardInterrupt:
+            self.stdout.write("계측 중단 — 정지")
+            raise
+        finally:
+            try:
+                pipeline.manual_stop(car_id)
+            except Exception:               # noqa: BLE001
+                pass
+            pipeline.stop()
+            cam.join(timeout=2.0)
+
+    def _run_vehicle_calibration(self, pipeline, options, recorder) -> None:
+        """차량 시스템 식별 전체 시퀀스 (단일 명령).
+
+        구동은 WASD 창과 **같은** production 경로다
+        (set_manual_drive -> HybridControlMux -> HostController ->
+        REMOTE_DIRECT). 여기서 더하는 것은 orchestration 과 기록뿐이고,
+        안전 판정은 tools.calibration_sequence 가 갖고 있다 — 그쪽은 실차
+        없이 경계/무동작/정지/통신/중단 경로가 전부 단위 테스트되어 있다.
+        """
+        import csv as _csv
+        import json as _json
+        import math as _math
+        import threading
+        import time as _time
+
+        from parking.waypoints import _path_clearance
+        from tools.calibration_sequence import (CALIBRATION_SCHEMA_VERSION,
+                                                CalibrationAborted,
+                                                CalibrationLimits,
+                                                CalibrationSequence,
+                                                build_plan)
+
+        car_id = 1
+        cap = abs(float(options["parking_throttle"]))
+
+        def _floats(raw, what):
+            try:
+                return [float(v) for v in str(raw).split(",") if v.strip()]
+            except ValueError:
+                raise CommandError(f"{what} 는 숫자 목록이어야 합니다")
+
+        throttles = [min(abs(v), cap) for v in
+                     _floats(options["calibrate_throttles"],
+                             "--calibrate-throttles") if v]
+        steerings = [max(-1.0, min(1.0, v)) for v in
+                     _floats(options["calibrate_steerings"],
+                             "--calibrate-steerings")]
+        repeats = max(1, int(options["calibrate_repeats"]))
+        if not throttles:
+            raise CommandError("측정할 throttle 이 없습니다")
+        limits = CalibrationLimits(max_throttle=cap)
+        plan = build_plan(throttles, steerings, repeats)
+
+        self.stdout.write(self.style.WARNING(
+            "차량 계측 모드 - 슬롯 배정/자동 주행 없음. "
+            f"primitive {len(plan)}개 (throttle {throttles}, "
+            f"steering {steerings}, repeat {repeats}). Ctrl+C 로 즉시 중단."))
+
+        cam = threading.Thread(
+            target=pipeline.run_camera,
+            kwargs={"max_frames": options["max_frames"], "show": options["show"]},
+            name="camera-loop", daemon=True)
+        cam.start()
+
+        run_dir = getattr(recorder, "dir", None)
+        events_file = None
+        if run_dir is not None:
+            events_file = (run_dir / "calibration_events.jsonl").open(
+                "w", buffering=1, encoding="utf-8")
+
+        def emit(event: dict) -> None:
+            # recorder 가 source of truth. 기록 실패가 구동/정지를 막지 않는다.
+            if events_file is None:
+                return
+            try:
+                events_file.write(_json.dumps(event, ensure_ascii=False) + "\n")
+            except Exception:                       # noqa: BLE001
+                pass
+
+        def pose():
+            """계측 pose. binding 에 의존하지 않는다 (run_20260903_123402).
+
+            그리고 신뢰 못 하는 heading 으로는 계측하지 않는다 — 측정
+            무결성과 안전이 같은 방향이다.
+            """
+            bound = pipeline.track_of_car.get(car_id)
+            if bound is not None and bound in pipeline.views:
+                view = pipeline.views[bound]
+            else:
+                seen = [v for v in pipeline.views.values()
+                        if v.heading_deg is not None]
+                if len(seen) != 1:
+                    return None
+                view = seen[0]
+            if (view.heading_deg is None
+                    or view.heading_source not in ("FRONT_CUSHION",
+                                                   "TRAJECTORY")):
+                return None
+            return (view.position_mm[0], view.position_mm[1], view.heading_deg)
+
+        def clearance():
+            p = pose()
+            return None if p is None else _path_clearance([p])[1]
+
+        def comm_ok() -> bool:
+            return car_id not in getattr(pipeline, "_comm_lost", set())
+
+        sequence = CalibrationSequence(
+            drive=lambda t, s: pipeline.set_manual_drive(car_id, t, s),
+            pose=pose, clearance=clearance, comm_ok=comm_ok,
+            now=_time.monotonic, sleep=_time.sleep,
+            emit=emit, log=lambda m: self.stdout.write(m),
+            limits=limits,
+            steering_throttle=float(options["calibrate_steering_throttle"]))
+
+        aborted = ""
+        try:
+            waited = 0.0
+            while waited < 60.0:
+                if car_id in pipeline.hybrid_controls and pose() is not None:
+                    break
+                if waited and abs(waited % 5.0) < 0.05:
+                    self.stdout.write(
+                        f"  대기 {waited:.0f}s - "
+                        f"session={car_id in pipeline.hybrid_controls} "
+                        f"pose={'OK' if pose() else 'None'} "
+                        f"tracks={len(pipeline.views)}")
+                _time.sleep(0.1)
+                waited += 0.1
+            else:
+                raise CommandError(
+                    "차량 세션 또는 신뢰 가능한 pose 를 못 받았습니다 "
+                    f"(session={car_id in pipeline.hybrid_controls}, "
+                    f"tracks={len(pipeline.views)})")
+            pipeline.switch_to_manual(car_id)
+
+            if run_dir is not None:
+                manifest = {
+                    "schema_version": CALIBRATION_SCHEMA_VERSION,
+                    "throttles": throttles, "steerings": steerings,
+                    "repeats": repeats, "max_throttle": cap,
+                    "steering_throttle": float(
+                        options["calibrate_steering_throttle"]),
+                    "limits": dict(limits.__dict__),
+                    "start_pose": pose(),
+                    "weights": options.get("weights"),
+                    "calibration": options.get("calibration"),
+                    "primitive_count": len(plan),
+                }
+                (run_dir / "calibration_manifest.json").write_text(
+                    _json.dumps(manifest, indent=2, ensure_ascii=False),
+                    encoding="utf-8")
+
+            sequence.run(plan)
+        except CalibrationAborted as exc:
+            aborted = exc.reason
+            self.stdout.write(self.style.WARNING(f"계측 중단: {exc}"))
+        except KeyboardInterrupt:
+            aborted = "USER_ABORT"
+            self.stdout.write("계측 중단 - 정지")
+            raise
+        finally:
+            # 순서가 중요하다: 먼저 차를 세우고, 그 다음에 분석한다.
+            try:
+                pipeline.manual_stop(car_id)
+            except Exception:                       # noqa: BLE001
+                pass
+            if events_file is not None:
+                events_file.close()
+            self.stdout.write(
+                f"primitive {len(sequence.results)}/{len(plan)} 수행"
+                + (f" (중단: {aborted})" if aborted else ""))
+            self._calibration_summary(run_dir, sequence.results,
+                                      _csv, _json, _math)
+            pipeline.stop()
+            cam.join(timeout=2.0)
+
+    def _calibration_summary(self, run_dir, results, _csv, _json, _math) -> None:
+        """차가 멈춘 뒤에만 부른다. 분석 실패가 계측 결과를 망치지 않는다."""
+        if not results:
+            return
+        try:
+            rows = [r.as_event() for r in results]
+            moved = [r for r in results if r.motion_detected]
+            still = [r for r in results if not r.motion_detected]
+            self.stdout.write("")
+            self.stdout.write("=== DEADBAND / NO-MOTION ===")
+            for r in still:
+                self.stdout.write(
+                    f"  {r.direction:<7} thr={r.requested_throttle:.2f} "
+                    f"steer={r.requested_steering:+.1f} "
+                    f"move={r.displacement_mm:5.1f}mm  {r.termination_reason}")
+            if not still:
+                self.stdout.write("  (없음 - 모든 조건에서 움직였습니다)")
+            self.stdout.write("=== MOTION ===")
+            for r in moved:
+                secs = max(1e-6, (r.zero_t or 0.0) - (r.command_start_t or 0.0))
+                extra = ""
+                if r.kind == "ARC" and abs(r.heading_change_deg) > 1e-6:
+                    radius = r.displacement_mm / abs(
+                        _math.radians(r.heading_change_deg))
+                    extra = f" R~{radius:6.0f}mm"
+                self.stdout.write(
+                    f"  {r.phase:<8} {r.direction:<7} "
+                    f"thr={r.requested_throttle:.2f} "
+                    f"steer={r.requested_steering:+.1f} "
+                    f"v~{r.displacement_mm / secs:6.1f}mm/s "
+                    f"coast={r.coast_mm:5.1f}mm{extra}")
+            if run_dir is not None:
+                (run_dir / "vehicle_dynamics_summary.json").write_text(
+                    _json.dumps(rows, indent=2, ensure_ascii=False),
+                    encoding="utf-8")
+                with (run_dir / "calibration_samples.csv").open(
+                        "w", newline="", encoding="utf-8") as fh:
+                    writer = _csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+                    writer.writeheader()
+                    for row in rows:
+                        writer.writerow(row)
+                self.stdout.write(
+                    f"calibration 결과: {run_dir} "
+                    "(calibration_events.jsonl / calibration_manifest.json / "
+                    "vehicle_dynamics_summary.json / calibration_samples.csv)")
+        except Exception as exc:                    # noqa: BLE001
+            self.stdout.write(self.style.WARNING(
+                f"요약 생성 실패(원시 기록은 무사): {exc}"))
 
     def _run_manual(self, pipeline, options) -> None:
         """수동 계측: 카메라 루프는 스레드, WASD 창은 메인 스레드.
@@ -283,6 +692,7 @@ class Command(BaseCommand):
                 "wire_steering_sign": cfg.wire_steering_sign,
                 "max_wire_steering": cfg.max_wire_steering,
                 "steer_kp": cfg.steer_kp,
+                "steer_kd": cfg.steer_kd,
                 "steer_normalize_deg": cfg.steer_normalize_deg,
                 "approach_capture_tolerance_cm": cfg.approach_capture_tolerance_cm,
                 "final_confirm_observations": cfg.final_confirm_observations,
@@ -291,6 +701,11 @@ class Command(BaseCommand):
                 "control_period_s": pipeline.config.auto_host_period_s,
                 "imgsz": options["imgsz"], "conf": options["conf"],
                 "weights": options["weights"],
+                "record_video": bool(options["record_video"]),
+                "video_fps": 4.0 if options["record_video"] else None,
+                "vehicle_length_mm": CAR_LENGTH_MM,
+                "vehicle_width_mm": CAR_WIDTH_MM,
+                "runtime_controller_config": asdict(cfg),
             },
             calibration={
                 "source": options["calibration"] or "full-frame",
@@ -301,5 +716,7 @@ class Command(BaseCommand):
         pipeline.on_event_record = recorder.event
         pipeline.on_route_load = lambda wps, rec: recorder.write_route(wps, recovery=rec)
         recorder.start()
+        if options["record_video"]:
+            recorder.start_video(fps=4.0)
         self.stdout.write(f"Run 기록: {recorder.dir}")
         return recorder

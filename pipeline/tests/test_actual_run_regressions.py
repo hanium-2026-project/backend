@@ -268,7 +268,7 @@ class TestActualRunRearAcquisition(unittest.TestCase):
         self.assertAlmostEqual(capture.heading_error_deg, 5.4, places=1)
         self.assertEqual(capture.throttle, 0.0)
 
-    def test_align_settled_capture_does_not_accept_one_shot_miss(self) -> None:
+    def test_one_shot_miss_continues_to_arc_endpoint_without_arriving(self) -> None:
         wp3 = Waypoint(
             717.8932188134522, 342.8932188134521,
             target_heading_deg=315.0, position_tolerance_cm=4.0,
@@ -282,7 +282,11 @@ class TestActualRunRearAcquisition(unittest.TestCase):
                 Pose(704.6, 350.0, 309.6, 1350.890,
                      heading_source="TRAJECTORY"), wp3, now=1350.890)
         self.assertFalse(capture.arrived)
-        self.assertEqual(capture.reason, "HEADING_OUT_OF_TOLERANCE")
+        # This observation is 15 mm from the sample, but its endpoint tangent
+        # is still ahead and it remains inside the declared R=1000 corridor.
+        # It must neither be accepted as settled nor stopped prematurely.
+        self.assertEqual(capture.reason, "")
+        self.assertGreater(capture.throttle, 0.0)
 
     def test_161336_crossed_align_endpoint_uses_settled_observation(self) -> None:
         wp3 = Waypoint(
@@ -508,6 +512,56 @@ class TestActualRunReverseObservationContract(unittest.TestCase):
         self.assertLess(first.command.throttle, 0.0)
         self.assertLess(second.command.throttle, 0.0)
         self.assertIs(second.mission_status, MissionStatus.RUNNING)
+
+    def test_222507_align_to_entry_did_start_reverse_after_interlock(self) -> None:
+        """실차에서 gate 는 통과했고 reverse 는 boundary stop 전 실제 시작됐다."""
+        align = Waypoint(
+            972.18, 927.82, target_heading_deg=45.0,
+            speed_cm_s=5.0, position_tolerance_cm=4.0,
+            heading_tolerance_deg=5.0, heading_required=True,
+            route_id=9, waypoint_id=2, phase="ALIGN",
+            motion_direction=MotionDirection.FORWARD,
+            curvature=1.0 / 1100.0, path_capture_tolerance_cm=10.0)
+        entry = Waypoint(
+            860.08, 796.56, target_heading_deg=54.0,
+            speed_cm_s=5.0, position_tolerance_cm=4.0,
+            heading_tolerance_deg=12.0,
+            route_id=9, waypoint_id=3, phase="ENTRY",
+            motion_direction=MotionDirection.REVERSE,
+            curvature=-1.0 / 1100.0, path_capture_tolerance_cm=10.0)
+        host = self._align_to_reverse_host(
+            route_id=9, align=align, entry=entry)
+
+        # 실차의 ALIGN 전진 구간 (t=46.843~47.718, throttle +0.08).
+        # 이걸 빼면 제어기가 FORWARD 를 한 번도 latch 하지 않아 방향전환
+        # 인터록 자체가 성립하지 않는다 — 실차에서는 1.42초 동안 전진했다.
+        for t, x, y, h, src in (
+            (46.843, 833.1, 821.0, 35.5, "TRAJECTORY"),
+            (47.062, 866.3, 834.5, 31.8, "TRAJECTORY"),
+            (47.281, 896.6, 855.0, 31.4, "TRAJECTORY"),
+            (47.500, 928.2, 876.9, 29.9, "TRAJECTORY"),
+            (47.718, 955.7, 898.7, 38.0, "FRONT_CUSHION"),
+        ):
+            forward = host.tick(
+                t, observation=Pose(x, y, h, timestamp=t,
+                                    heading_source=src))
+        self.assertGreater(forward.command.throttle, 0.0)
+
+        arrived = host.tick(
+            47.937, observation=Pose(
+                973.5, 913.7, 44.5, timestamp=47.937,
+                heading_source="FRONT_CUSHION"))
+        self.assertEqual(host.mission.current_target().waypoint_id, 3)
+        self.assertEqual(arrived.command.throttle, 0.0)
+
+        interlock = host.tick(48.047)
+        started = host.tick(
+            48.156, observation=Pose(
+                996.7, 936.9, 45.3, timestamp=48.156,
+                heading_source="FRONT_CUSHION"))
+        self.assertEqual(interlock.command.reason, "DIRECTION_CHANGE_STOP")
+        self.assertLess(started.command.throttle, 0.0)
+        self.assertIs(started.mission_status, MissionStatus.RUNNING)
 
     @staticmethod
     def _align_to_reverse_host(

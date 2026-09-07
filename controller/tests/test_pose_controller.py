@@ -175,6 +175,61 @@ class TestArcGuidance(unittest.TestCase):
         self.assertLess(abs(cmd.logical_steering - ff), abs(old_final - ff))
         self.assertLess(cmd.logical_steering, -0.35)
 
+    def test_203434_alignment_keeps_driving_to_endpoint_tangent(self) -> None:
+        """route 6 wp3 was stopped 33 mm before its tangent in the real run."""
+        wp = far_waypoint(
+            925.0, 183.9745962155614, phase="ALIGN",
+            curvature=-1.0 / 1000.0,
+            target_heading_deg=330.0, heading_required=True,
+            position_tolerance_cm=4.0, heading_tolerance_deg=5.0,
+            path_capture_tolerance_cm=10.0,
+        )
+        ctl = PoseWaypointController(self.cfg)
+        approaching = ctl.compute(
+            make_pose(890.5, 190.1, 339.6), wp, now=100.0)
+
+        self.assertFalse(approaching.arrived)
+        self.assertGreater(approaching.throttle, 0.0)
+        self.assertNotEqual(approaching.reason, "HEADING_OUT_OF_TOLERANCE")
+
+        # The physical-stop observation after the premature zero was already
+        # on the same planned circle and had the required terminal heading.
+        captured = ctl.compute(
+            make_pose(936.2, 167.8, 330.5, t=100.1), wp, now=100.1)
+        self.assertTrue(captured.arrived)
+        self.assertEqual(captured.throttle, 0.0)
+
+    def test_heading_mismatch_outside_arc_corridor_still_stops(self) -> None:
+        wp = far_waypoint(
+            925.0, 183.9745962155614, phase="ALIGN",
+            curvature=-1.0 / 1000.0,
+            target_heading_deg=330.0, heading_required=True,
+            position_tolerance_cm=4.0, heading_tolerance_deg=5.0,
+            path_capture_tolerance_cm=10.0,
+        )
+        cmd = PoseWaypointController(self.cfg).compute(
+            make_pose(890.5, 90.1, 339.6), wp, now=100.0)
+        self.assertFalse(cmd.arrived)
+        self.assertEqual(cmd.throttle, 0.0)
+        self.assertEqual(cmd.reason, "HEADING_OUT_OF_TOLERANCE")
+
+    def test_setup_arc_inside_stop_distance_keeps_bounded_motion(self) -> None:
+        """A RECOVERY primitive must not stall at zero before its tangent."""
+        wp = far_waypoint(
+            248.17994692906547, 529.7184427062157, phase="RECOVERY",
+            curvature=1.0 / 610.0,
+            target_heading_deg=33.5, heading_required=True,
+            position_tolerance_cm=8.0, heading_tolerance_deg=5.0,
+            path_capture_tolerance_cm=10.0,
+            motion_direction=MotionDirection.REVERSE,
+            speed_cm_s=5.0,
+        )
+        cmd = PoseWaypointController(self.cfg).compute(
+            make_pose(262.3, 534.1, 43.0), wp, now=100.0)
+        self.assertFalse(cmd.arrived)
+        self.assertLess(cmd.throttle, 0.0)
+        self.assertNotEqual(cmd.reason, "HEADING_OUT_OF_TOLERANCE")
+
     def test_actual_route_arcs_hold_planned_radius_closed_loop(self) -> None:
         cases = (
             ((677.4419, 423.4859, 341.6),

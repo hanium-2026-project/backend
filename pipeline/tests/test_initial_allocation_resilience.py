@@ -54,7 +54,7 @@ def bare_pipeline() -> ParkingPipeline:
     p.dashboard = _Dashboard()
     p.server = _Server()
     p._allocation_state = {}
-    p._unreachable_slots = set()
+    p._unreachable_slots = {}
     p._last_no_route_warn = 0.0
     p._initial_pose_samples = {}
     p._heading_wait_state = {}
@@ -63,7 +63,16 @@ def bare_pipeline() -> ParkingPipeline:
     return p
 
 
-class TestCandidateFallback(unittest.TestCase):
+class TestAssignedSlotIsNeverSwappedByRouteFailure(unittest.TestCase):
+    """배정된 칸은 예약이다 — 경로가 안 나와도 다른 칸으로 바뀌지 않는다.
+
+    allocator.allocate() 는 반환 전에 이미 assigned_slot 과 점유 선점을
+    기록한다. 그 뒤 주행 경로 실패로 다른 칸을 고르면 주행 계층이 배정을
+    뒤집는 것이다. 실차 run_20260904_214712 에서 그 경로가 B1 -> A3 재배정을
+    만들었다.
+
+    예전 계약("첫 칸이 안 되면 다음 칸")은 여기서 폐기된다.
+    """
     def setUp(self) -> None:
         self.p = bare_pipeline()
         self.view = VehicleView(track_id=7, car_id=1,
@@ -74,20 +83,38 @@ class TestCandidateFallback(unittest.TestCase):
         self.p._warn_no_route = lambda view, reason: None
         self.p._trajectory_safe = lambda view, route, **kwargs: True
 
-    def test_first_slot_infeasible_selects_second_feasible(self) -> None:
+    def test_infeasible_assigned_slot_is_not_swapped(self) -> None:
+        """다른 칸이면 경로가 나오더라도 배정을 바꾸지 않는다."""
+        for target in ("A1", "B2", "A3"):
+            with self.subTest(target=target):
+                self.setUp()
+
+                def build(spec, _view, _route_id, _t=target):
+                    if spec.slot_id == _t:
+                        raise InfeasibleRouteError(_t, "too tight")
+                    return [spec.slot_id]
+
+                self.p._build_route = build
+                selected, route = self.p._feasible_route(self.view, target, 9)
+                self.assertIsNone(selected)
+                self.assertIsNone(route)
+                self.assertEqual(self.p.allocator.reassigned, [],
+                                 "경로 실패로 재배정하면 안 된다")
+                names = [name for name, _ in self.events]
+                self.assertIn("SLOT_CANDIDATE", names)
+                self.assertIn("SLOT_ROUTE_UNAVAILABLE", names)
+                self.assertNotIn("SLOT_REJECTED", names)
+
+    def test_only_the_assigned_slot_is_ever_evaluated(self) -> None:
+        tried: list[str] = []
+
         def build(spec, _view, _route_id):
-            if spec.slot_id == "A1":
-                raise InfeasibleRouteError("A1", "too tight")
-            return [spec.slot_id]
+            tried.append(spec.slot_id)
+            raise InfeasibleRouteError(spec.slot_id, "no route")
 
         self.p._build_route = build
-        selected, route = self.p._feasible_route(self.view, "A1", 9)
-        self.assertNotEqual(selected, "A1")
-        self.assertEqual(route, [selected])
-        self.assertIn((7, selected), self.p.allocator.reassigned)
-        names = [name for name, _ in self.events]
-        self.assertIn("SLOT_CANDIDATE", names)
-        self.assertIn("SLOT_REJECTED", names)
+        self.p._feasible_route(self.view, "B2", 9)
+        self.assertEqual(tried, ["B2"], f"다른 칸까지 평가했다: {tried}")
 
     def test_all_slots_infeasible_stays_alive_and_zeroes_control(self) -> None:
         self.p._build_route = lambda spec, view, rid: (_ for _ in ()).throw(
@@ -98,6 +125,7 @@ class TestCandidateFallback(unittest.TestCase):
         self.assertEqual(self.p._allocation_state[1], "WAIT_NO_FEASIBLE_SLOT")
         self.assertEqual(self.p.server.zeroed, [1])
         self.assertIn("SLOT_WAIT", [name for name, _ in self.events])
+        self.assertEqual(self.p.allocator.reassigned, [])
 
     def test_infeasible_candidate_never_escapes_as_exception(self) -> None:
         self.p._build_route = lambda spec, view, rid: (_ for _ in ()).throw(
@@ -107,21 +135,14 @@ class TestCandidateFallback(unittest.TestCase):
         except InfeasibleRouteError as exc:  # pragma: no cover
             self.fail(f"candidate exception escaped: {exc}")
 
-    def test_reject_event_contains_reason(self) -> None:
-        calls = 0
-
-        def build(spec, _view, _route_id):
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                raise InfeasibleRouteError(spec.slot_id, "radius 610")
-            return [spec.slot_id]
-
-        self.p._build_route = build
+    def test_unavailable_event_contains_reason(self) -> None:
+        self.p._build_route = lambda spec, view, rid: (_ for _ in ()).throw(
+            InfeasibleRouteError(spec.slot_id, "radius 610"))
         self.p._feasible_route(self.view, "A1", 12)
-        rejected = [fields for name, fields in self.events
-                    if name == "SLOT_REJECTED"]
-        self.assertEqual(rejected[0]["reason"], "radius 610")
+        unavailable = [fields for name, fields in self.events
+                       if name == "SLOT_ROUTE_UNAVAILABLE"]
+        self.assertEqual(unavailable[0]["reason"], "radius 610")
+        self.assertEqual(unavailable[0]["slot"], "A1")
 
 
 class TestPoseBeforeMission(unittest.TestCase):

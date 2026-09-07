@@ -12,8 +12,9 @@ from cv.vehicle_detector import MockVehicleDetector
 from parking.models import Camera, EntryExit, ParkingLot, ParkingSpot, Vehicle
 from parking.protocol import VehicleTelemetryMessage
 from parking.services import process_entry, process_exit, recommend_spot, seed_demo_data
-from rl.inference import heuristic_policy, load_policy
-from rl.parking_env import ParkingRoutingEnv
+from rl.inference import heuristic_policy, load_policy, select_action
+from rl.parking_env import (NUM_SLOTS, SLOT_NAMES, STATE_DIM, WAIT_ACTION,
+                            ParkingRoutingEnv)
 
 
 class ParkingModelTests(APITestCase):
@@ -62,9 +63,21 @@ class ParkingApiTests(APITestCase):
         self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
 
     def test_recommendation_prefers_vehicle_type(self) -> None:
+        # seed_demo_data 는 실제 주차장 8칸(전부 standard)만 만든다. 선호 타입
+        # 우선순위(SPOT_PREFERENCE_BY_VEHICLE)를 확인하려면 그 타입의 칸이
+        # 하나는 있어야 하므로 여기서 EV 칸을 하나 추가한다.
+        lot = ParkingLot.objects.first()
+        ParkingSpot.objects.create(lot=lot, section="EV1", spot_type="ev",
+                                   coord_x=9, coord_y=9, status="vacant")
         response = self.client.get(reverse("recommend-spot"), {"vehicle_type": "ev"})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["recommended_spot"]["spot_type"], "ev")
+
+    def test_recommendation_falls_back_when_preferred_type_is_absent(self) -> None:
+        """EV 칸이 없으면 선호 목록의 다음 타입(standard)으로 내려간다."""
+        response = self.client.get(reverse("recommend-spot"), {"vehicle_type": "ev"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["recommended_spot"]["spot_type"], "standard")
 
     def test_entry_and_exit_flow_updates_spot_status(self) -> None:
         entry_response = self.client.post(
@@ -142,7 +155,9 @@ class ComputerVisionTests(APITestCase):
         frame = create_synthetic_frame()
         vehicle_detections = MockVehicleDetector().detect(frame.image)
         plate_detections = MockPlateDetector().detect(frame.image)
-        self.assertEqual(vehicle_detections[0].label, "vehicle")
+        # 2클래스 실차 모델로 바뀌면서 라벨이 rc_car 로 확정됐다
+        # (cv/vehicle_detector.py::LABEL_CAR, 짝이 되는 front_cushion 과 함께).
+        self.assertEqual(vehicle_detections[0].label, "rc_car")
         self.assertEqual(plate_detections[0].text, "12가3456")
 
     def test_homography_projects_point(self) -> None:
@@ -158,25 +173,49 @@ class ReinforcementLearningTests(APITestCase):
     """Validate the Gymnasium-style environment and mock policy."""
 
     def test_environment_step_and_heuristic_policy(self) -> None:
-        env = ParkingRoutingEnv(spot_types=[0, 1], coordinates=[(3, 0), (1, 0)])
-        observation, _ = env.reset(options={"vehicle_type": 1})
-        action = heuristic_policy(observation)
-        self.assertEqual(action, 1)
-        _, reward, terminated, truncated, info = env.step(action)
-        self.assertTrue(terminated)
-        self.assertFalse(truncated)
-        self.assertEqual(info["assigned_index"], 1)
-        self.assertGreater(reward, 0)
+        # 환경은 이제 실제 주차장(8칸 고정)을 그대로 쓴다 — spot_types/coordinates
+        # 를 주입하지 않는다. 정책도 관측이 아니라 action_masks 로 고른다.
+        env = ParkingRoutingEnv()
+        env.reset(seed=0)
+        masks = env.action_masks()
+        self.assertEqual(masks.shape, (NUM_SLOTS + 1,))
 
-    def test_load_policy_returns_heuristic_without_model(self) -> None:
-        policy = load_policy()
-        observation = {
-            "vehicle_type": 0,
-            "spot_statuses": np.array([1, 0]),
-            "spot_types": np.array([0, 0]),
-            "spot_coordinates": np.array([[0, 0], [2, 0]]),
-        }
-        self.assertEqual(policy(observation), 1)
+        action = heuristic_policy(masks)
+        self.assertIn(action, range(NUM_SLOTS))
+        self.assertTrue(bool(masks[action]), "마스크가 막은 칸을 골랐다")
+
+        _obs, _reward, terminated, truncated, _info = env.step(action)
+        self.assertFalse(truncated)
+        self.assertIsInstance(terminated, bool)
+
+    def test_heuristic_policy_never_picks_a_masked_slot(self) -> None:
+        masks = np.zeros(NUM_SLOTS + 1, dtype=bool)
+        masks[SLOT_NAMES.index("A2")] = True
+        masks[WAIT_ACTION] = True
+        self.assertEqual(heuristic_policy(masks), SLOT_NAMES.index("A2"))
+
+    def test_heuristic_policy_waits_when_every_slot_is_taken(self) -> None:
+        masks = np.zeros(NUM_SLOTS + 1, dtype=bool)
+        masks[WAIT_ACTION] = True
+        self.assertEqual(heuristic_policy(masks), WAIT_ACTION)
+
+    def test_select_action_falls_back_to_the_heuristic_without_a_policy(self):
+        """학습 정책을 못 불러오면 결정론적 heuristic 으로 떨어진다.
+
+        load_policy 는 예외를 던지지 않고 None 을 돌려주고(파일이 없거나
+        sb3-contrib 미설치), select_action 이 그 자리에서 heuristic 으로
+        대체한다. 실차 실행이 실제로 타는 경로가 이쪽이다.
+        """
+        self.assertIsNone(load_policy("models/__no_such_policy__.zip"))
+
+        observation = np.zeros(STATE_DIM, dtype=np.float32)
+        masks = np.zeros(NUM_SLOTS + 1, dtype=bool)
+        masks[SLOT_NAMES.index("A2")] = True
+        masks[WAIT_ACTION] = True
+        action = select_action(observation, masks,
+                               model_path="models/__no_such_policy__.zip")
+        self.assertEqual(action, SLOT_NAMES.index("A2"))
+        self.assertEqual(action, heuristic_policy(masks))
 
 
 class ProtocolTests(APITestCase):
@@ -189,6 +228,10 @@ class ProtocolTests(APITestCase):
             "pos": [10.5, 3.2],
             "status": "moving",
             "target_spot_id": 3,
+            "track_id": 7,
+            "assigned_slot": "B1",
+            "parking_stage": "PARKING",
+            "connection_state": "CONNECTED",
         }
         message = VehicleTelemetryMessage.from_dict(payload)
         wire = message.to_dict()

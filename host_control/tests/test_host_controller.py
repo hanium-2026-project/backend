@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import unittest
+from dataclasses import replace
 
 from controller.config import ControllerConfig
 from controller.models import (ControlCommand, ControlMode, MotionDirection,
@@ -399,6 +401,298 @@ class TestTransportContract(unittest.TestCase):
         self.assertEqual(r.payload["type"], "DIRECT_CONTROL")
         self.assertEqual(r.payload["throttle"], 0.0)
         self.assertEqual(r.payload["steering"], 0.0)
+
+
+class TestReverseStartAnchorCapture(unittest.TestCase):
+    """run_20260824_192746: ALIGN 도착 tick 의 heading 출처가 anchor 를 좌우한다.
+
+    실측 실패: 도착 tick 이 FRONT_CUSHION 이라 anchor 가 만들어지지 않았고, 다음
+    프레임부터 쿠션이 사라져 ENTRY 24 tick 이 전부 throttle 0 →
+    REVERSE_HEADING_TIMEOUT. 후진이 단 한 번도 시작되지 않았다.
+    """
+
+    # ALIGN 종점 직전 실제 관측(값은 run_20260824_192746 pose.jsonl).
+    FORWARD_TRACK = (
+        (677.7, 330.1, 318.7, 44.74),
+        (687.6, 322.8, 320.1, 44.95),
+        (698.8, 312.6, 318.5, 45.17),
+        (710.1, 305.2, 322.1, 45.39),
+    )
+    ARRIVAL = (720.0, 293.6, 315.9, 45.58)      # ALIGN wp4 도착 tick
+    AFTER = (729.9, 283.3, 317.0, 45.80)        # 쿠션 소실 직후 첫 프레임
+
+    def _align_then_entry_host(self) -> HostController:
+        mission = HostWaypointMission([
+            Waypoint(747.2, 272.2, target_heading_deg=315.0,
+                     position_tolerance_cm=4.0, heading_tolerance_deg=5.0,
+                     motion_direction=MotionDirection.FORWARD,
+                     phase="ALIGN", route_id=18, waypoint_id=4),
+            Waypoint(635.1, 403.4, target_heading_deg=306.0,
+                     position_tolerance_cm=4.0, heading_tolerance_deg=12.0,
+                     motion_direction=MotionDirection.REVERSE,
+                     phase="ENTRY", route_id=18, waypoint_id=5),
+        ])
+        hc = HostController(
+            mission=mission,
+            config=ControllerConfig(allow_reverse=True,
+                                    reverse_heading_wait_timeout_s=2.5),
+        )
+        hc.arm_auto()
+        return hc
+
+    def _drive_to_align_terminal(self, hc: HostController,
+                                 arrival_source: str) -> None:
+        for x, y, h, t in self.FORWARD_TRACK:
+            hc.tick(t, observation=Pose(x, y, h, timestamp=t,
+                                        heading_source="FRONT_CUSHION"))
+        x, y, h, t = self.ARRIVAL
+        hc.tick(t, observation=Pose(x, y, h, timestamp=t,
+                                    heading_source=arrival_source))
+
+    def test_front_cushion_align_terminal_still_yields_reverse_start(self) -> None:
+        hc = self._align_then_entry_host()
+        self._drive_to_align_terminal(hc, "FRONT_CUSHION")
+
+        # 방향 전환 interlock: 첫 tick 은 반드시 zero 이고 pose 를 버린다.
+        x, y, h, t = self.AFTER
+        flip = hc.tick(t, observation=Pose(x, y, h, timestamp=t,
+                                           heading_source="TRAJECTORY"))
+        self.assertEqual(flip.command.throttle, 0.0)
+
+        started = hc.tick(t + 0.11,
+                          observation=Pose(x, y, h, timestamp=t + 0.11,
+                                           heading_source="TRAJECTORY"))
+        self.assertLess(started.command.throttle, 0.0)
+        self.assertEqual(hc.reverse_observation_state,
+                         "REVERSE_START_TRAJECTORY_ANCHOR")
+
+    def test_trajectory_align_terminal_keeps_existing_behaviour(self) -> None:
+        hc = self._align_then_entry_host()
+        self._drive_to_align_terminal(hc, "TRAJECTORY")
+
+        x, y, h, t = self.AFTER
+        hc.tick(t, observation=Pose(x, y, h, timestamp=t,
+                                    heading_source="TRAJECTORY"))
+        started = hc.tick(t + 0.11,
+                          observation=Pose(x, y, h, timestamp=t + 0.11,
+                                           heading_source="TRAJECTORY"))
+        self.assertLess(started.command.throttle, 0.0)
+        self.assertEqual(hc.reverse_observation_state,
+                         "REVERSE_START_TRAJECTORY_ANCHOR")
+
+    def test_last_valid_align_terminal_never_becomes_anchor(self) -> None:
+        hc = self._align_then_entry_host()
+        self._drive_to_align_terminal(hc, "LAST_VALID")
+
+        x, y, h, t = self.AFTER
+        held = hc.tick(t, observation=Pose(x, y, h, timestamp=t,
+                                           heading_source="TRAJECTORY"))
+        held = hc.tick(t + 0.11,
+                       observation=Pose(x, y, h, timestamp=t + 0.11,
+                                        heading_source="TRAJECTORY"))
+        self.assertEqual(held.command.throttle, 0.0)
+        self.assertEqual(hc.reverse_observation_state,
+                         "REVERSE_WAIT_PRIMARY_HEADING")
+
+    def test_anchor_still_bounded_by_distance(self) -> None:
+        hc = self._align_then_entry_host()
+        self._drive_to_align_terminal(hc, "FRONT_CUSHION")
+
+        # anchor 로부터 35mm 를 넘어선 첫 프레임은 bootstrap 대상이 아니다.
+        ax, ay, _, _ = self.ARRIVAL
+        far = Pose(ax + 40.0, ay - 20.0, 317.0, timestamp=45.80,
+                   heading_source="TRAJECTORY")
+        hc.tick(45.80, observation=far)
+        held = hc.tick(45.91, observation=replace(far, timestamp=45.91))
+        self.assertEqual(held.command.throttle, 0.0)
+        self.assertEqual(hc.reverse_observation_state,
+                         "REVERSE_WAIT_PRIMARY_HEADING")
+
+    def test_anchor_still_bounded_by_age(self) -> None:
+        hc = self._align_then_entry_host()
+        self._drive_to_align_terminal(hc, "FRONT_CUSHION")
+
+        # 0.75s 를 넘겨 도착한 첫 후진 프레임은 anchor 를 쓰지 못한다.
+        x, y, h, _ = self.AFTER
+        late = 45.58 + 0.9
+        hc.tick(late, observation=Pose(x, y, h, timestamp=late,
+                                       heading_source="TRAJECTORY"))
+        held = hc.tick(late + 0.11,
+                       observation=Pose(x, y, h, timestamp=late + 0.11,
+                                        heading_source="TRAJECTORY"))
+        self.assertEqual(held.command.throttle, 0.0)
+        self.assertEqual(hc.reverse_observation_state,
+                         "REVERSE_WAIT_PRIMARY_HEADING")
+
+    def test_front_cushion_inconsistent_with_motion_is_not_anchored(self) -> None:
+        """쿠션 heading 이 최근 전진 궤적과 20° 넘게 어긋나면 승격하지 않는다."""
+        hc = self._align_then_entry_host()
+        for x, y, h, t in self.FORWARD_TRACK:
+            hc.tick(t, observation=Pose(x, y, h, timestamp=t,
+                                        heading_source="FRONT_CUSHION"))
+        x, y, _, t = self.ARRIVAL
+        hc.tick(t, observation=Pose(x, y, 180.0, timestamp=t,
+                                    heading_source="FRONT_CUSHION"))
+
+        ax, ay, ah, _ = self.AFTER
+        hc.tick(t + 0.22,
+                observation=Pose(ax, ay, ah, timestamp=t + 0.22,
+                                 heading_source="TRAJECTORY"))
+        held = hc.tick(t + 0.33,
+                       observation=Pose(ax, ay, ah, timestamp=t + 0.33,
+                                        heading_source="TRAJECTORY"))
+        self.assertEqual(held.command.throttle, 0.0)
+        self.assertEqual(hc.reverse_observation_state,
+                         "REVERSE_WAIT_PRIMARY_HEADING")
+
+
+class TestReverseMotionConfirmation(unittest.TestCase):
+    """run_20260824_204134: 후진 명령 != 실제 후진.
+
+    실측: ALIGN 종료 직후 차는 관성으로 앞으로 밀리는 중이었는데, 첫 후진 명령이
+    나간 순간부터 그 전진 pose 들이 reverse trajectory 표본이 됐다. 표본에서
+    유도한 진행방향에 reverse 보정 180° 가 붙어 차체 방향과 177° 어긋났고,
+    궤적 fallback 이 거부돼 OBSERVATION_LOST → REVERSE_HEADING_TIMEOUT 이 됐다.
+    """
+
+    BODY_DEG = 333.0                     # ALIGN 종료 시 차체 방향(실측 근사)
+    ANCHOR = (809.1, 360.6, 45.30)       # ENTRY 진입 직전 pose
+
+    def _entry_host(self) -> HostController:
+        mission = HostWaypointMission([
+            Waypoint(700.0, 480.0, target_heading_deg=self.BODY_DEG,
+                     position_tolerance_cm=4.0, heading_tolerance_deg=12.0,
+                     motion_direction=MotionDirection.REVERSE,
+                     phase="ENTRY", route_id=4, waypoint_id=3),
+        ])
+        hc = HostController(
+            mission=mission,
+            config=ControllerConfig(allow_reverse=True,
+                                    reverse_heading_wait_timeout_s=2.5),
+        )
+        hc.arm_auto()
+        # ALIGN 이 검증한 body heading anchor 를 직접 세운다 (H-1 이 만드는 것).
+        anchor_pose = Pose(self.ANCHOR[0], self.ANCHOR[1], self.BODY_DEG,
+                           timestamp=self.ANCHOR[2],
+                           heading_source="REVERSE_START_TRAJECTORY_ANCHOR")
+        hc._reverse_start_anchor = anchor_pose
+        hc._reverse_start_anchor_route_id = 4
+        hc._last_trusted_reverse_heading = self.BODY_DEG
+        return hc
+
+    @staticmethod
+    def _along(x: float, y: float, ds: float, deg: float):
+        rad = math.radians(deg)
+        return (x + ds * math.cos(rad), y + ds * math.sin(rad))
+
+    def _feed(self, hc, start, offsets, t0, *, source="TRAJECTORY", step=0.22):
+        """차체축 기준 부호 있는 변위열을 pose 로 먹인다. 마지막 결과 반환."""
+        result = None
+        x, y = start
+        travelled = 0.0
+        for i, ds in enumerate(offsets, start=1):
+            travelled += ds
+            px, py = self._along(x, y, travelled, self.BODY_DEG)
+            t = t0 + i * step
+            result = hc.tick(t, observation=Pose(px, py, self.BODY_DEG,
+                                                 timestamp=t,
+                                                 heading_source=source))
+        return result
+
+    def test_forward_inertia_never_enters_reverse_window(self) -> None:
+        hc = self._entry_host()
+        # 후진 명령 + 관성 전진 3프레임 (실측 t=32.6~33.2 구간과 같은 형태)
+        self._feed(hc, self.ANCHOR[:2], [+22.0, +25.0, +7.0], self.ANCHOR[2])
+        self.assertTrue(hc._reverse_motion_started)
+        self.assertFalse(hc._reverse_motion_confirmed)
+        self.assertEqual(len(hc._reverse_observations), 0)
+
+    def test_forward_inertia_alone_never_reaches_trajectory_fallback(self) -> None:
+        hc = self._entry_host()
+        last = self._feed(hc, self.ANCHOR[:2],
+                          [+22.0, +25.0, +7.0, +5.0, +3.0], self.ANCHOR[2])
+        self.assertNotEqual(hc.reverse_observation_state,
+                            "REVERSE_TRACK_TRAJECTORY_FALLBACK")
+        self.assertEqual(last.command.throttle, 0.0)
+
+    def test_confirmed_reverse_motion_reaches_trajectory_fallback(self) -> None:
+        """관성 구간 뒤 실제 후진이 나타나면 궤적 fallback 이 서야 한다."""
+        hc = self._entry_host()
+        self._feed(hc, self.ANCHOR[:2], [+22.0, +25.0, +7.0], self.ANCHOR[2])
+        self.assertFalse(hc._reverse_motion_confirmed)
+
+        # 실제 후진 — 기존 품질 계약(3관측 / 30mm / 선형성 0.90)을 만족시킨다.
+        apex = self._along(self.ANCHOR[0], self.ANCHOR[1], 54.0, self.BODY_DEG)
+        self._feed(hc, apex, [-16.0, -16.0, -16.0], self.ANCHOR[2] + 0.66)
+
+        self.assertTrue(hc._reverse_motion_confirmed)
+        self.assertEqual(hc.reverse_observation_state,
+                         "REVERSE_TRACK_TRAJECTORY_FALLBACK")
+        # 전진 관성 표본이 창에 남아 있으면 안 된다.
+        self.assertTrue(all(
+            hc._is_rearward(a, b)
+            for a, b in zip(hc._reverse_observations,
+                            list(hc._reverse_observations)[1:])))
+
+    def test_stationary_vehicle_never_confirms_reverse(self) -> None:
+        """차가 전혀 안 움직이면 확인도 fallback 도 없고 bounded 하게 끝난다.
+
+        단 **출발 자체는 막지 않는다** — 정지 상태에서 bounded START_ANCHOR 로
+        첫 후진 명령을 내보내는 것이 H-1 의 목적이다. 여기서 막으면 다시
+        "움직여야 움직일 수 있다"는 교착이 된다.
+        """
+        hc = self._entry_host()
+        self._feed(hc, self.ANCHOR[:2], [0.0, 0.0, 0.0, 0.0], self.ANCHOR[2])
+        self.assertFalse(hc._reverse_motion_confirmed)
+        self.assertEqual(len(hc._reverse_observations), 0)
+        self.assertNotEqual(hc.reverse_observation_state,
+                            "REVERSE_TRACK_TRAJECTORY_FALLBACK")
+
+        # bootstrap 한계(1.5s)를 넘기면 더 이상 anchor 를 쓰지 않는다.
+        late = self.ANCHOR[2] + 2.0
+        stalled = hc.tick(late, observation=Pose(
+            self.ANCHOR[0], self.ANCHOR[1], self.BODY_DEG, timestamp=late,
+            heading_source="TRAJECTORY"))
+        self.assertEqual(stalled.command.throttle, 0.0)
+        self.assertEqual(hc.reverse_observation_state,
+                         "REVERSE_OBSERVATION_LOST")
+
+    def test_last_valid_alone_never_confirms_or_falls_back(self) -> None:
+        hc = self._entry_host()
+        last = self._feed(hc, self.ANCHOR[:2], [-16.0, -16.0, -16.0],
+                          self.ANCHOR[2], source="LAST_VALID")
+        self.assertNotEqual(hc.reverse_observation_state,
+                            "REVERSE_TRACK_TRAJECTORY_FALLBACK")
+        self.assertNotEqual(hc.reverse_observation_state,
+                            "REVERSE_START_TRAJECTORY_ANCHOR")
+        self.assertEqual(last.command.throttle, 0.0)
+
+    def test_front_cushion_return_keeps_body_authority_with_motion_guidance(self) -> None:
+        hc = self._entry_host()
+        self._feed(hc, self.ANCHOR[:2], [+22.0, +25.0], self.ANCHOR[2])
+        apex = self._along(self.ANCHOR[0], self.ANCHOR[1], 47.0, self.BODY_DEG)
+        self._feed(hc, apex, [-16.0, -16.0, -16.0], self.ANCHOR[2] + 0.44)
+        self.assertEqual(hc.reverse_observation_state,
+                         "REVERSE_TRACK_TRAJECTORY_FALLBACK")
+
+        back = self._along(self.ANCHOR[0], self.ANCHOR[1], -1.0, self.BODY_DEG)
+        t = self.ANCHOR[2] + 1.5
+        hc.tick(t, observation=Pose(back[0], back[1], self.BODY_DEG,
+                                    timestamp=t,
+                                    heading_source="FRONT_CUSHION"))
+        self.assertEqual(hc.reverse_observation_state,
+                         "REVERSE_TRACK_PRIMARY_MOTION_GUIDANCE")
+        self.assertEqual(hc._last_trusted_reverse_heading, self.BODY_DEG)
+
+    def test_sign_reference_never_taken_from_untrusted_heading(self) -> None:
+        """anchor/trusted heading 이 없으면 어떤 변위도 후진으로 인정하지 않는다."""
+        hc = self._entry_host()
+        hc._reverse_start_anchor = None
+        hc._last_trusted_reverse_heading = None
+        self.assertIsNone(hc._trusted_body_heading())
+        a = Pose(800.0, 360.0, 333.0, timestamp=1.0, heading_source="LAST_VALID")
+        b = Pose(780.0, 370.0, 333.0, timestamp=1.2, heading_source="LAST_VALID")
+        self.assertFalse(hc._is_rearward(a, b))
 
 
 if __name__ == "__main__":

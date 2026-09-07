@@ -37,6 +37,7 @@ class Runner:
         self.mission = Mission()
         self.prepared = 0
         self.terminal = bool(current.is_final)
+        self.stopped = False
 
     @property
     def current_is_terminal(self) -> bool:
@@ -44,6 +45,9 @@ class Runner:
 
     def prepare_route_switch(self) -> None:
         self.prepared += 1
+
+    def stop(self) -> None:
+        self.stopped = True
 
 
 class TestHandoffTerminal(unittest.TestCase):

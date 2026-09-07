@@ -54,6 +54,7 @@ class RCCarTracker:
         on_frame: Callable[[TrackState], None] | None = None,
         max_frames: int | None = None,
         show: bool = False,
+        frame_sink: Callable[[object, TrackState], None] | None = None,
     ) -> None:
         """카메라에서 프레임을 읽어 RC카를 추적하고 콜백을 호출합니다.
 
@@ -61,6 +62,7 @@ class RCCarTracker:
             on_frame: 각 프레임 처리 후 호출되는 콜백 (None이면 stdout 출력).
             max_frames: 지정 시 해당 수만큼만 처리 후 종료.
             show: True이면 바운딩박스가 그려진 웹캠 화면을 띄웁니다 (q로 종료).
+            frame_sink: annotated frame observer. ``show`` 없이도 호출된다.
         """
         import cv2
 
@@ -98,13 +100,16 @@ class RCCarTracker:
                 else:
                     _default_log(state)
 
-                if show:
+                if show or frame_sink is not None:
                     vis = _draw_detections(frame.image.copy(), state)
                     if self.overlay is not None:
                         vis = self.overlay(vis, state)
-                    cv2.imshow("RC Car Tracker", vis)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
+                    if frame_sink is not None:
+                        frame_sink(vis, state)
+                    if show:
+                        cv2.imshow("RC Car Tracker", vis)
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            break
 
                 if max_frames and frame.frame_index >= max_frames:
                     break

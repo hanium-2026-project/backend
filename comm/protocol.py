@@ -46,7 +46,8 @@ TIMING = {
     "POSE_INTERVAL": 100,
     "CONTROL_INTERVAL": 100,          # DIRECT_CONTROL 스트림 주기 (B안 제어)
     "POSE_TIMEOUT": 400,
-    "STATUS_INTERVAL": 150,
+    # integrated/esp32_main/main/app_config*.h production contract
+    "STATUS_INTERVAL": 200,
     "RESP_TIMEOUT_WAYPOINT": 300,
     "RESP_TIMEOUT_WAIT": 100,
     "RESP_TIMEOUT_STOP": 100,

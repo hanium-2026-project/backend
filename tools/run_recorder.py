@@ -22,7 +22,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
+import queue
 import subprocess
 import threading
 import time
@@ -35,6 +37,122 @@ from controller.config import FirmwareConstants
 __all__ = ["RunRecorder", "servo_angle_for", "motor_duty_for"]
 
 _FW = FirmwareConstants()
+log = logging.getLogger(__name__)
+
+
+class _RunVideoRecorder:
+    """Encode annotated camera frames off the perception/control threads."""
+
+    _SENTINEL = object()
+
+    def __init__(self, run_dir: Path, t0: float, *, fps: float = 4.0,
+                 queue_size: int = 8) -> None:
+        self.path = run_dir / "e2e.mp4"
+        self.frames_path = run_dir / "video_frames.jsonl"
+        self.t0 = t0
+        self.fps = fps
+        self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        self._thread: threading.Thread | None = None
+        self._accepting = False
+        self.frames_written = 0
+        self.frames_dropped = 0
+        self.error: str | None = None
+
+    def start(self) -> None:
+        self._accepting = True
+        self._thread = threading.Thread(
+            target=self._run, name="run-video-recorder", daemon=True)
+        self._thread.start()
+
+    def submit(self, image, state) -> None:
+        if not self._accepting or self.error is not None:
+            return
+        try:
+            import cv2
+
+            elapsed = max(0.0, float(state.timestamp) - self.t0)
+            wall = datetime.now().isoformat(timespec="milliseconds")
+            # ``image`` is already the tracker's private annotated copy.  Add
+            # sync text in place so recording does not allocate another frame.
+            cv2.putText(
+                image,
+                f"t={elapsed:8.3f}s  frame={state.frame_index}  {wall[11:]}",
+                (10, image.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                0.48, (255, 255, 255), 2, cv2.LINE_AA,
+            )
+            item = (image, {
+                "tracker_frame_index": int(state.frame_index),
+                "monotonic_timestamp": float(state.timestamp),
+                "elapsed_s": round(elapsed, 6),
+                "wall": wall,
+            })
+            self._queue.put_nowait(item)
+        except queue.Full:
+            # Observability may drop a video frame; it must never delay control.
+            self.frames_dropped += 1
+        except Exception as exc:  # noqa: BLE001
+            self.error = f"video frame enqueue failed: {exc}"
+            log.error(self.error)
+
+    def _run(self) -> None:
+        writer = None
+        frames_file = None
+        try:
+            import cv2
+
+            while True:
+                item = self._queue.get()
+                if item is self._SENTINEL:
+                    break
+                image, timing = item
+                if writer is None:
+                    height, width = image.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    writer = cv2.VideoWriter(
+                        str(self.path), fourcc, self.fps, (width, height))
+                    if not writer.isOpened():
+                        self.error = "OpenCV mp4v VideoWriter could not be opened"
+                        log.error("Video recording disabled: %s", self.error)
+                        writer.release()
+                        writer = None
+                        break
+                    frames_file = self.frames_path.open(
+                        "w", buffering=8192, encoding="utf-8")
+                writer.write(image)
+                timing["video_frame_index"] = self.frames_written
+                frames_file.write(json.dumps(timing, ensure_ascii=False) + "\n")
+                self.frames_written += 1
+        except Exception as exc:  # noqa: BLE001
+            self.error = f"video writer failed: {exc}"
+            log.exception("Video recording failed")
+        finally:
+            if writer is not None:
+                writer.release()
+            if frames_file is not None:
+                frames_file.close()
+
+    def stop(self) -> dict[str, Any]:
+        self._accepting = False
+        if self._thread is not None:
+            try:
+                self._queue.put(self._SENTINEL, timeout=2.0)
+            except queue.Full:
+                self.error = self.error or "video writer queue did not drain"
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                self.error = self.error or "video writer did not stop cleanly"
+            self._thread = None
+        playable = bool(
+            self.error is None and self.frames_written > 0
+            and self.path.exists() and self.path.stat().st_size > 0)
+        return {
+            "path": str(self.path) if playable else None,
+            "frames_path": str(self.frames_path) if playable else None,
+            "fps": self.fps,
+            "frames_written": self.frames_written,
+            "frames_dropped": self.frames_dropped,
+            "error": self.error,
+        }
 
 
 def _execution_gate_reason(sess: Any, authority: str | None,
@@ -175,6 +293,7 @@ class RunRecorder:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._video: _RunVideoRecorder | None = None
 
         self._pose_f = (self.dir / "pose.jsonl").open("w", buffering=1, encoding="utf-8")
         self._ctrl_f = (self.dir / "control.jsonl").open("w", buffering=1, encoding="utf-8")
@@ -189,6 +308,8 @@ class RunRecorder:
         self._prev_state: str | None = None
         self._prev_authority: str | None = None
         self._prev_confirm = 0
+        self._control_sample_index = 0
+        self._prev_control_sample_at: float | None = None
         self._sat_ticks = 0
         self._thr: list[float] = []
         self._pose_age: list[float] = []
@@ -263,6 +384,9 @@ class RunRecorder:
 
     def event(self, name: str, **fields: Any) -> None:
         try:
+            if name == "COMM_FAIL":
+                with self._lock:
+                    self._comm_events += 1
             t = time.monotonic() - self.t0
             extra = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
             self._evt_f.write(
@@ -272,6 +396,18 @@ class RunRecorder:
             pass
 
     # ─── 프레임 (카메라) ─────────────────────────────────────────────────────
+
+    def start_video(self, *, fps: float = 4.0) -> Path:
+        """Enable asynchronous annotated-frame recording in this run dir."""
+        if self._video is None:
+            self._video = _RunVideoRecorder(self.dir, self.t0, fps=fps)
+            self._video.start()
+        return self._video.path
+
+    def log_video_frame(self, image, state) -> None:
+        """Non-blocking frame observer used by ``RCCarTracker``."""
+        if self._video is not None:
+            self._video.submit(image, state)
 
     def log_pose(self, rec: dict) -> None:
         """카메라 프레임 1건. 호출자가 아는 필드만 채워 넘긴다."""
@@ -303,6 +439,10 @@ class RunRecorder:
 
     def _tick(self) -> None:
         now = time.monotonic()
+        sample_dt_s = (None if self._prev_control_sample_at is None
+                       else now - self._prev_control_sample_at)
+        self._prev_control_sample_at = now
+        self._control_sample_index += 1
         status = self.server.last_status(self.car_id) or {}
         sess = self.server.sessions.get(self.car_id)
         ctrl = (sess.latest_control if sess is not None else None) or {}
@@ -342,6 +482,8 @@ class RunRecorder:
 
         tick = getattr(runner, "last_tick_result", None) if runner else None
         command = getattr(tick, "command", None)
+        controller_telemetry = dict(
+            getattr(command, "telemetry", None) or {})
         head_err = (getattr(command, "heading_error_deg", None)
                     if command is not None else endpoint_head_err)
         logical = (getattr(command, "logical_steering", None)
@@ -385,25 +527,48 @@ class RunRecorder:
         execution_gate = _execution_gate_reason(
             sess, authority, getattr(authority_obj, "fault_reason", None),
             mstatus, thr, a_thr, controller_reason)
+        override_reason = controller_reason or execution_gate
 
         row = {
             "t_s": round(now - self.t0, 3),
             "wall": datetime.now().isoformat(timespec="milliseconds"),
             "car_id": self.car_id,
+            "control_sample_index": self._control_sample_index,
+            "control_sample_dt_s": sample_dt_s,
             "pose_x_mm": px, "pose_y_mm": py, "pose_heading_deg": ph,
             "pose_heading_source": (pose.get("heading_source") if pose else None),
+            "pose_timestamp": (pose.get("obs_time") if pose else None),
             "pose_age_ms": pose_age_ms,
+            "pose_fresh": controller_telemetry.get("pose_fresh"),
+            "pose_stale": (None if controller_telemetry.get("pose_fresh") is None
+                           else not controller_telemetry["pose_fresh"]),
             "route_id": (getattr(target, "route_id", None)
                          or lifecycle.get("owned_route_id")),
             "waypoint_id": getattr(target, "waypoint_id", None),
+            "waypoint_index": getattr(mission, "index", None),
+            "waypoint_total_count": getattr(mission, "total", None),
             "phase": phase,
             "motion_direction": (lambda v: v.value if hasattr(v, "value") else v)(
                 getattr(target, "motion_direction", None)),
             "target_x_mm": tx, "target_y_mm": ty, "target_heading_deg": th,
+            "heading_required": getattr(target, "heading_required", None),
+            "target_curvature": getattr(target, "curvature", None),
+            # planner 가 **요구한** 속도. 이게 없으면 "요구 40mm/s 에 실제
+            # 얼마가 나왔는가" 를 로그만으로 복원할 수 없다 — throttle 명령은
+            # 있지만 그건 controller 출력이지 planner 의도가 아니다.
+            # 단위는 mm/s 로 통일한다 (waypoint 는 cm/s 로 들고 있다).
+            "target_speed_mm_s": (
+                None if getattr(target, "speed_cm_s", None) is None
+                else 10.0 * float(target.speed_cm_s)),
             "curvature": getattr(target, "curvature", None),
             "path_capture_tolerance_cm": getattr(
                 target, "path_capture_tolerance_cm", None),
             "distance_error_cm": dist_cm, "heading_error_deg": head_err,
+            "distance_to_target_mm": (
+                None if dist_cm is None else dist_cm * 10.0),
+            "dx_to_target_mm": (None if None in (px, tx) else tx - px),
+            "dy_to_target_mm": (None if None in (py, ty) else ty - py),
+            "desired_bearing_deg": getattr(command, "target_bearing_deg", None),
             "endpoint_heading_error_deg": endpoint_head_err,
             "curvature_feedforward": feedforward,
             "steering_feedback": feedback,
@@ -417,22 +582,48 @@ class RunRecorder:
             "workflow_status": lifecycle.get("workflow_status"),
             "parking_stage": lifecycle.get("parking_stage"),
             "allocation_state": lifecycle.get("allocation_state"),
+            "slot_id": lifecycle.get("slot_id"),
+            "slot_center_x_mm": lifecycle.get("slot_center_x_mm"),
+            "slot_center_y_mm": lifecycle.get("slot_center_y_mm"),
+            "parked_heading_deg": lifecycle.get("parked_heading_deg"),
             "comm_recovery_state": lifecycle.get("comm_recovery_state"),
             "authority": authority,
             "fault_reason": getattr(authority_obj, "fault_reason", None),
             "controller_reason": controller_reason,
-            "command_reason": controller_reason or execution_gate,
+            "command_reason": override_reason,
+            "waypoint_arrived": getattr(command, "arrived", None),
             "execution_gate": execution_gate,
+            "control_override_reason": override_reason,
+            "direction_change_interlock_active": (
+                controller_reason == "DIRECTION_CHANGE_STOP"),
+            "stale_zero_override": controller_reason in {
+                "POSE_STALE", "POSE_INVALID", "NO_POSE", "NO_HEADING",
+                "POSE_BLIND_TRAVEL"},
+            "comm_zero_override": execution_gate in {
+                "COMM_FAILED", "COMM_ZERO_LATCH", "SESSION_CLOSED",
+                "NO_SESSION"},
+            "boundary_zero_override": bool(
+                override_reason and "BOUNDARY" in override_reason),
+            "safety_zero_override": bool(
+                override_reason and override_reason != "EXECUTING"),
             "direct_zero_latch": (None if sess is None else bool(
                 getattr(sess, "control_held", False))),
             "comm_failed": (None if sess is None else bool(
                 getattr(sess, "comm_failed", False))),
+            "firmware_version": (None if sess is None else getattr(
+                sess, "firmware_version", None)),
+            "transport_last_rx_gap_ms": (None if sess is None else round(
+                float(getattr(sess, "last_rx_gap_ms", 0.0)), 1)),
+            "transport_max_rx_gap_ms": (None if sess is None else round(
+                float(getattr(sess, "max_rx_gap_ms", 0.0)), 1)),
             "reverse_observation_state": reverse_observation_state,
             "replan_reason": getattr(mission, "replan_reason", None),
             "recovery_attempt": getattr(mission, "recovery_attempts", None),
             "final_confirm_count": confirm,
             "desired_throttle": desired_thr,
             "desired_steering": desired_str,
+            "throttle_command_final": thr,
+            "steering_command_final": wire_str,
             "throttle_cmd": thr, "steering_cmd": wire_str,
             "wire_steering": wire_str,
             "logical_steering": logical if logical is not None else (None if wire_str is None else
@@ -449,6 +640,11 @@ class RunRecorder:
             "boot_id": status.get("boot_id"), "session_id": status.get("session_id"),
             "status_seq": status.get("status_seq"),
         }
+        # Diagnostics are attached to the exact immutable ControlCommand that
+        # produced this sample.  Legacy recorder fields above remain the source
+        # of truth when a name overlaps.
+        for key, value in controller_telemetry.items():
+            row.setdefault(key, value)
         self._ctrl_f.write(json.dumps(row, ensure_ascii=False) + "\n")
         self.ctrl_rows += 1
         self._collect(row, thr, wire_str, dist_cm, pose_age_ms, phase,
@@ -458,7 +654,7 @@ class RunRecorder:
 
     def _collect(self, row, thr, wire_str, dist_cm, pose_age_ms, phase,
                  mstatus, stage, confirm, status) -> None:
-        if thr:
+        if thr is not None:
             self._thr.append(float(thr))
         if wire_str is not None and abs(float(wire_str)) >= 0.999:
             self._sat_ticks += 1
@@ -494,8 +690,6 @@ class RunRecorder:
         if st != self._prev_state:
             self.event("ESP_STATE", frm=self._prev_state, to=st,
                        wait_reason=status.get("wait_reason"))
-            if st in ("COMM_TIMEOUT", "EMERGENCY_STOP"):
-                self._comm_events += 1
             self._prev_state = st
         if confirm is not None and confirm != self._prev_confirm:
             if confirm:
@@ -509,6 +703,7 @@ class RunRecorder:
         if self._thread is not None:
             self._thread.join(timeout=1.5)
             self._thread = None
+        video = self._video.stop() if self._video is not None else None
         self.event("RUN_END", outcome=outcome, note=note or None)
 
         dur = time.monotonic() - self.t0
@@ -544,6 +739,10 @@ class RunRecorder:
             "comm_fault_events": self._comm_events,
             "battery_voltage": None,       # STATUS 에 없음 — 수집 불가
         }
+        # Keep the historical summary schema byte-for-byte compatible when
+        # video recording was not requested.
+        if video is not None:
+            summary["video"] = video
         (self.dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         for f in (self._pose_f, self._ctrl_f, self._evt_f):

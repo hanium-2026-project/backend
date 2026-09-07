@@ -177,21 +177,14 @@ class HybridControlWindow:
             self.RELEASE_DEBOUNCE_MS, lambda k=key: self._commit_release(k))
 
     def _commit_release(self, key: str) -> None:
-        """키를 뗀 것으로 확정. 조향은 **초기화하지 않는다**(래치).
-
-        macOS 는 자동반복을 마지막에 누른 키에만 적용한다. D 를 누른 채 W 를
-        누르면 D 의 반복이 끊기고 릴리스가 확정돼 조향이 0 으로 돌아갔다.
-        릴리스로 중앙 복귀시키는 방식은 이 환경에서 신뢰할 수 없어, 조향은
-        A/D 로 올린 값을 유지하고 C(또는 정지)로만 중앙으로 되돌린다.
-        """
+        """Release 확정 후 A/D가 모두 떼어졌으면 조향을 중앙 복귀한다."""
         self._release_jobs.pop(key, None)
         self.pressed.discard(key)
         self._apply_keys()
 
     def _steering_tick(self) -> None:
-        # A/D 를 누르고 있는 동안만 값을 올리고, 떼면 **그 값을 유지**한다(래치).
-        # 0 으로 되돌리면 안 된다 — macOS 는 W 를 누르는 순간 D 의 자동반복을
-        # 끊어 pressed 에서 빠지므로, 여기서 리셋하면 D 100% 가 풀린다.
+        # A/D를 누르고 있는 동안만 값을 올린다. release 후 중앙
+        # 복귀는 _apply_keys에서 하여 S/W 단독 입력에 예전 조향이 섞이지 않게 한다.
         direction = steering_direction(self.pressed)
         next_value = (
             advance_steering(self.current_steering, self.pressed)
@@ -204,11 +197,16 @@ class HybridControlWindow:
 
         self.root.after(STEERING_RAMP_INTERVAL_MS, self._steering_tick)
 
-    def _apply_keys(self) -> None:
+    def _apply_keys(self, *, force: bool = False) -> None:
+        # Steering is momentary: once neither A nor D has exclusive control,
+        # discard the accumulated ramp value.  Otherwise pressing W/S later
+        # would replay the previous turn even though no steering key is held.
+        if steering_direction(self.pressed) == 0:
+            self.current_steering = 0.0
         intent = compute_drive_intent(self.pressed, self.current_steering)
         current = (intent.throttle, intent.steering)
 
-        if current != self.last_sent:
+        if force or current != self.last_sent:
             self.pipeline.set_manual_drive(
                 self.car_id,
                 intent.throttle,
@@ -244,6 +242,12 @@ class HybridControlWindow:
             self.notice_var.set(
                 "AUTO_HOST mission/session 생성 대기 중 - 차량 배정 후 MANUAL/AUTO 전환 가능"
             )
+
+        # Refresh held-key intent as a lease, not an infinite latch.  If Tk
+        # loses a release/focus event, HybridControlMux expires this stream to
+        # zero after a bounded interval.
+        if self.pressed.intersection({"w", "a", "s", "d"}):
+            self._apply_keys(force=True)
 
         self.root.after(100, self._poll)
 

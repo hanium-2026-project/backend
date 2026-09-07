@@ -8,7 +8,8 @@ import unittest
 from types import SimpleNamespace
 
 from parking.trajectory_safety import validate_trajectory
-from parking.waypoints import (Waypoint, build_rear_candidate_waypoints,
+from parking.waypoints import (Waypoint, _car_footprint,
+                               build_rear_candidate_waypoints,
                                build_waypoints, default_slot_specs)
 from pipeline import ParkingPipeline, PipelineConfig
 from pipeline.runner import VehicleView
@@ -143,7 +144,36 @@ class TestRepresentativeRearSweep(unittest.TestCase):
                             rejected += 1           # production gate keeps zero control
         self.assertEqual(safe + rejected + planner_fail, 4 * 125)
         self.assertGreater(safe, 0)
-        self.assertGreater(rejected + planner_fail, 0)
+        # 예전에는 여기서 "일부는 거절된다" 를 요구했다. 그 거절은 전부
+        # **출발 자세가 이미 맵 밖** (이 sweep 은 x=100 에도 차를 놓는데
+        # 250mm 차체가 5~36mm 삐져나온다) 인데 탈출 허용치가 20mm 로
+        # 묶여 있어서 생긴 것이었다 — 즉 실제 위험을 잡은 것이 아니라
+        # 자기 출발 자세를 거절한 것이다 (run_20260901_154551 에서 차가
+        # 56.8mm 나간 뒤 어떤 복구 경로도 실을 수 없었던 것과 같은 원인).
+        #
+        # 지금 규칙은 "출발보다 나빠지지 않기" 이고, 이 sweep 의 500개
+        # 경로 중 자기 출발 초과량을 넘는 것은 하나도 없다. 그래서 전부
+        # 안전이 맞다. 게이트가 실제로 거절을 하는지는 아래에서 명시적으로
+        # 확인한다.
+        # 맵 안에서 출발해 맵 밖으로 걸어 나가는 경로는 반드시 거절된다.
+        # 100mm 씩 이어 붙여 연속성을 유지하므로 SEGMENT_JUMP 가 아니라
+        # 경계 판정으로 걸려야 한다.
+        start = (150.0, 600.0, 0.0)
+        self.assertLessEqual(
+            max(max(-px, px - 1200.0, -py, py - 1200.0)
+                for px, py in _car_footprint(*start)), 0.0,
+            "이 검사는 맵 안에서 출발해야 의미가 있다")
+        march = [Waypoint(route_id=99, waypoint_id=i, phase="CRUISE",
+                          x=150.0 + 100.0 * i, y=600.0,
+                          target_heading_deg=0.0, speed_cm_s=8.0,
+                          position_tolerance_cm=6.0,
+                          heading_tolerance_deg=12.0,
+                          heading_required=False, is_final=(i == 11),
+                          motion_direction="FORWARD")
+                 for i in range(1, 12)]      # x 250 -> 1250 (맵 밖으로 나간다)
+        result = validate_trajectory(march, start_pose=start, target_slot="B1")
+        self.assertFalse(result.safe)
+        self.assertEqual(result.reason, "MAP_FOOTPRINT")
 
 
 class TestAcceptedRouteProperty(unittest.TestCase):

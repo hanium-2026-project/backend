@@ -45,7 +45,11 @@ class DashboardBridge:
                   status: str = "moving", heading_deg: float | None = None,
                   heading_source: str | None = None, parking_phase: str | None = None,
                   route_id: int | None = None, waypoint_id: int | None = None,
-                  target_spot_id: int | None = None) -> None:
+                  target_spot_id: int | None = None,
+                  track_id: int | None = None,
+                  assigned_slot: str | None = None,
+                  parking_stage: str | None = None,
+                  connection_state: str | None = None) -> None:
         """실시간 위치를 보낸다. 화면 갱신에 필요한 정도로만 솎아낸다."""
         now = time.monotonic()
         if now - self._last_pose_at.get(car_id, 0.0) < self.pose_interval_s:
@@ -60,6 +64,8 @@ class DashboardBridge:
             target_spot_id=target_spot_id, heading_deg=heading_deg,
             heading_source=heading_source, parking_phase=parking_phase,
             route_id=route_id, waypoint_id=waypoint_id,
+            track_id=track_id, assigned_slot=assigned_slot,
+            parking_stage=parking_stage, connection_state=connection_state,
         ))
 
     def push_event(self, event: str, **payload) -> None:

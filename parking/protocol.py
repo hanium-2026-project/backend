@@ -23,6 +23,10 @@ class VehicleTelemetryMessage:
     parking_phase: str | None = None      # CRUISE | APPROACH | ALIGN | ENTRY | FINAL
     route_id: int | None = None
     waypoint_id: int | None = None
+    track_id: int | None = None
+    assigned_slot: str | None = None
+    parking_stage: str | None = None
+    connection_state: str | None = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "VehicleTelemetryMessage":
@@ -42,6 +46,10 @@ class VehicleTelemetryMessage:
             parking_phase=payload.get("parking_phase"),
             route_id=payload.get("route_id"),
             waypoint_id=payload.get("waypoint_id"),
+            track_id=payload.get("track_id"),
+            assigned_slot=payload.get("assigned_slot"),
+            parking_stage=payload.get("parking_stage"),
+            connection_state=payload.get("connection_state"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -57,4 +65,8 @@ class VehicleTelemetryMessage:
             "parking_phase": self.parking_phase,
             "route_id": self.route_id,
             "waypoint_id": self.waypoint_id,
+            "track_id": self.track_id,
+            "assigned_slot": self.assigned_slot,
+            "parking_stage": self.parking_stage,
+            "connection_state": self.connection_state,
         }

@@ -108,6 +108,42 @@ class PipelineConfig:
     # 기하가 같으면 같은 지점에서 계속 실패해 무한 루프가 된다.
     max_replan_attempts: int = 3
     max_parking_recovery_attempts: int = 3
+    # 입구에서 통로에 합류할 때 단일 90도 원호가 실측 최소 선회반경보다
+    # 작으면, rear planner를 확장하지 않고 bounded setup primitives로 먼저
+    # 통로 staging 자세를 만든다. 각 route 완료 뒤 fresh camera pose로만
+    # 다음 route를 계획하며, 동일 자세/종점 반복은 허용하지 않는다.
+    max_entry_staging_attempts: int = 3
+    entry_staging_heading_tolerance_deg: float = 15.0
+    entry_staging_alignment_max_mm: float = 1100.0
+    # 입구 staging 경로가 유지해야 할 최소 footprint-to-map 여유.
+    #
+    # 유도: runtime hard-stop band 는 boundary_hard_margin_mm(20) +
+    # boundary_measurement_uncertainty_mm(10) = 30mm 다. 계획 여유가 그보다
+    # 작으면 "계획상 안전"한 경로가 **측정 잡음만으로도** hard stop 을 밟는다.
+    # 그 위 5mm 를 둔다.
+    #
+    # 실측 sweep(231000 시작 자세 127.3,166.6,89.7°): 35mm 는 정확 자세와
+    # ±20mm 위치 / ±5° heading 섭동까지 모두 해가 있고, 40mm 로 올리면
+    # heading 섭동(달성 35.2/35.9mm)이 불필요하게 거절된다.
+    # 참고: 231000 이 실제로 실행한 경로의 여유는 9.8mm 였다.
+    entry_staging_min_clearance_mm: float = 35.0
+    # Silent-deadlock 최후 방어선. 주차가 진행 중인데 차는 서 있고, 명령은 0,
+    # perception 은 멀쩡하고, 명시적 sensor wait 도 아니고, route/recovery
+    # transaction 도 없는 상태가 이만큼 지속되면 PARKING_STALLED 를 올린다.
+    #
+    # 이건 primary fix 가 아니라 "읽는 곳 없는 상태" 가 또 생겼을 때를 잡는
+    # 그물이다. watchdog 자체는 절대 차를 움직이지 않는다 — 현재 pose 로
+    # recovery coordinator 를 호출하는 데까지만 한다.
+    #
+    # 8s: 관측 정지 확인(수 프레임) + heading 대기 2.5s + setup 계획 시간을
+    # 모두 지나고도 아무 일이 없었다는 뜻이 되도록 잡았다.
+    parking_stall_timeout_s: float = 8.0
+    # 최종 정렬(FINAL_ALIGNMENT / FINAL_STRAIGHT_REVERSE) 반복 상한.
+    # 초과하면 조용히 멈추지 않고 FINAL_ALIGNMENT_EXHAUSTED 로 명시 종료한다.
+    max_final_alignment_attempts: int = 3
+    # PARKED 를 확정하기 위해 연속으로 조건을 만족해야 하는 서로 다른 fresh
+    # 관측 수. 한 프레임 잡음으로 주차 완료를 찍지 않기 위한 것이다.
+    parked_confirm_observations: int = 3
     # 후진 복구를 걸 waypoint phase.
     #
     # 통로 중간(CRUISE)은 허용오차가 넓고 다음 점이 이어지므로, 조금 밀려도
