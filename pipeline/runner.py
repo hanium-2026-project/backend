@@ -45,7 +45,8 @@ from parking.recovery import (REVERSE_TRIGGER_REASONS, forward_unreachable,
                               plan_reverse_recovery)
 from parking.final_alignment import (build_final_alignment_waypoints,
                                      build_final_straight_reverse_waypoints,
-                                     evaluate_final_pose, in_final_region)
+                                     evaluate_final_pose, in_final_region,
+                                     rear_parked_heading_deg)
 from parking.safety import CollisionMonitor, VehiclePose
 from parking.trajectory_safety import validate_trajectory
 from parking.waypoints import (AISLE_Y, ALONG_AISLE_HEADING_TOLERANCE_DEG,
@@ -201,6 +202,11 @@ class ParkingPipeline:
         # 돌아오고 **새 route 가 검증되면** 다시 켤 수 있어야 한다.
         # BOUNDARY_HARD 같은 진짜 terminal fault 와 구분하기 위해 따로 표시한다.
         self._heading_fault_hold: set[int] = set()
+        # 슬롯별 vision 정적 점유 상태 (track_id 비의존).
+        self._vision_occupancy: dict[str, dict[str, Any]] = {}
+        # 확정된 칸의 **정적 장애물 자세**. _parked_obstacles 와 같은 의미이고
+        # 키만 car_id 대신 slot_id 다 (전원 꺼진 차에 가짜 car_id 를 주지 않는다).
+        self._vision_parked_obstacles: dict[str, tuple[float, float, float]] = {}
         # BOUNDARY_HARD 로 멈춘 차량. 여기 있다고 경계 판정이 완화되는 것은
         # 전혀 없다 — hard/soft/uncertain 임계값도, _check_boundary 도 그대로다.
         # 이 표시가 뜻하는 것은 하나뿐이다: "이 차는 **탈출 경로가 기존
@@ -491,6 +497,9 @@ class ParkingPipeline:
                                           obs_time=state.timestamp))
 
         self._record_pose(seen, state, t_recv)
+        # 배정(_ensure_mission → allocator.allocate)보다 **먼저** 돌아야
+        # 이번 프레임의 점유가 이번 프레임의 배정에 반영된다.
+        self._update_vision_occupancy(seen, state.timestamp)
 
         for view in seen:
             self._ensure_mission(view, state.frame_index)
@@ -500,6 +509,132 @@ class ParkingPipeline:
 
         self._check_collisions(seen)
         self._forget_stale(state.frame_index)
+
+    def _update_vision_occupancy(self, seen: list[VehicleView],
+                                 obs_time: float) -> None:
+        """카메라만으로 "그 칸에 이미 차가 서 있다" 를 판정한다.
+
+        촬영 시나리오: CAR_02 를 전원 OFF 로 슬롯에 손으로 놓는다. ESP 연결도
+        CAR_ID binding 도 없다. 따라서 판정은 **pose + 슬롯 기하** 만 쓴다.
+
+        설계 요점
+          - slot-centric: 상태를 슬롯별로 들고 있으므로 track_id 가 바뀌어도
+            같은 칸에 정지한 차가 계속 보이면 점유가 유지된다.
+          - 기존 기하 재사용: in_final_region(=차체 중심이 슬롯 사각형 안)은
+            이미 "통로를 지나가는 차를 슬롯 안으로 오인" 하는 문제를 잡으려고
+            depth 하한을 -slot.length/2 로 조인 함수다(실측 032539). 새 기하를
+            만들지 않는다.
+          - 정지 조건: 기존 is_stationary(stationary_tolerance_mm,
+            stationary_window)를 그대로 쓴다. 지나가는 차와 세워둔 차를 가른다.
+          - ego 제외: car_id 가 붙은 차(=CAR_01, 그리고 정상 미션으로 PARKED 된
+            차)는 후보에서 뺀다. 그 칸들은 예약/PARKED 로 base 상태가 이미
+            담당하므로 중복 판정할 필요가 없고, CAR_01 이 자기 칸에 들어가면서
+            자신을 "외부 주차 차량" 으로 오인하는 것도 여기서 막힌다(§14).
+          - base 를 건드리지 않는다: allocator.set_vision_occupied 는 별도
+            overlay 만 쓴다. 예약/PARKED 는 vision clear 로 절대 지워지지 않는다.
+
+        운용 순서 (실측으로 확인된 조건)
+        --------------------------------
+        **정적 차량의 점유가 확정된 뒤에 자율주행 차량을 활성화한다.**
+
+        확정에는 정지 이력(stationary_window) + 연속 관측
+        (vision_occupancy_confirm_observations)이 필요해 시간이 걸린다. 실측
+        run_20260906_190856 / _191008 에서는 4.5초였다 — 정지한 차인데도 pose
+        지터가 14~17mm 로 stationary_tolerance_mm(15) 문턱에 걸쳐 확정 카운터가
+        반복해서 되감겼기 때문이다.
+
+        그 사이에 자율주행 차량의 배정(_ensure_mission → allocator.allocate)이
+        먼저 일어나면 아직 확정되지 않은 칸이 배정될 수 있다. 위 두 run 에서
+        실제로 그렇게 됐다 (배정이 확정보다 0.445s / 0.778s 빨랐고, 결과적으로
+        정적 차량이 서 있는 칸이 배정됐다).
+
+        이 경합을 코드로 막는 게이트는 **이 변경 범위에 없다**. 현재 검증된
+        조건은 운용 순서뿐이다:
+
+            정적 차량 배치 → backend 시작 → VISION_SLOT_OCCUPIED 확정 로그 확인
+            → 그 다음에 자율주행 차량 전원 ON / bind → 배정
+
+        확정 전에 배정이 일어나면 그 칸은 제외되지 않는다.
+        """
+        if not bool(getattr(self.config, "vision_occupancy_enabled", False)):
+            return
+        setter = getattr(self.allocator, "set_vision_occupied", None)
+        if setter is None:
+            return                       # overlay 없는 allocator = 기능 비활성
+        specs = default_slot_specs()
+        state = self._vision_occupancy
+        # 이번 프레임에 "슬롯 안에 정지한 외부 차량" 이 보인 칸.
+        hits: dict[str, int] = {}
+        seen_pose: dict[str, tuple[float, float, float]] = {}
+        for view in seen:
+            if view.car_id is not None:
+                continue                     # ego / bound 차량은 base 담당
+            if not view.is_stationary(self.config.stationary_tolerance_mm,
+                                      self.config.stationary_window):
+                continue                     # 지나가는 차는 점유가 아니다
+            for slot_id, spec in specs.items():
+                if in_final_region(spec, view.position_mm[0],
+                                   view.position_mm[1]):
+                    hits[slot_id] = view.track_id
+                    # 정적 장애물 자세: **측정된 위치 + 슬롯의 주차 방향**.
+                    #
+                    # 위치는 rc_car 검출이 매 프레임 주므로 믿을 수 있다.
+                    # 못 믿는 것은 heading 하나뿐이다 — 전원이 꺼진 차는
+                    # front_cushion 이 잘 안 잡히고(실측 190856 25.9% /
+                    # 191008 4.7%), 정지 상태라 TRAJECTORY 도 못 만든다.
+                    # 그 한 축만 슬롯 기하로 바꾼다. 차가 그 칸 안에 있다는
+                    # 것은 in_final_region 이 이미 보장했으므로, 슬롯의
+                    # 후면주차 완료 방향이 그 차의 방향이다 (실측 CAR_02
+                    # heading 268.7 vs B1 주차방향 270.0 — 1.3도 차이).
+                    seen_pose[slot_id] = (
+                        float(view.position_mm[0]), float(view.position_mm[1]),
+                        rear_parked_heading_deg(spec))
+                    break
+
+        confirm = int(getattr(
+            self.config, "vision_occupancy_confirm_observations", 3))
+        release = float(getattr(
+            self.config, "vision_occupancy_release_s", 3.0))
+        for slot_id in specs:
+            st = state.setdefault(
+                slot_id, {"hits": 0, "last_seen": None, "occupied": False})
+            track_id = hits.get(slot_id)
+            if track_id is not None:
+                st["hits"] += 1
+                st["last_seen"] = obs_time
+                # 마지막으로 검증된 자세를 계속 갱신한다. _parked_obstacles 와
+                # 같은 이유로, 검출이 잠깐 끊겨도 장애물이 사라지면 안 된다.
+                if slot_id in seen_pose:
+                    st["pose"] = seen_pose[slot_id]
+                    if st["occupied"]:
+                        self._vision_parked_obstacles[slot_id] = st["pose"]
+                if not st["occupied"] and st["hits"] >= confirm:
+                    st["occupied"] = True
+                    setter(slot_id, True)
+                    pose = st.get("pose")
+                    if pose is not None:
+                        self._vision_parked_obstacles[slot_id] = pose
+                    self._emit_event("VISION_SLOT_OCCUPIED", slot=slot_id,
+                                     track_id=track_id, observations=st["hits"],
+                                     x_mm=None if pose is None else round(pose[0], 1),
+                                     y_mm=None if pose is None else round(pose[1], 1),
+                                     heading_deg=None if pose is None else round(pose[2], 1))
+                    log.info("[VISION_OCCUPANCY] confirmed %s track=%s",
+                             slot_id, track_id)
+                continue
+            # 이번 프레임에 안 보였다 — 확정 카운터만 되감고, 이미 확정된
+            # 점유는 유예 시간이 지나야 푼다(bbox 한두 프레임 유실 대비, §13).
+            st["hits"] = 0
+            if (st["occupied"] and st["last_seen"] is not None
+                    and obs_time - st["last_seen"] > release):
+                st["occupied"] = False
+                setter(slot_id, False)
+                # 점유가 풀리면 정적 장애물도 같은 순간에 사라진다.
+                self._vision_parked_obstacles.pop(slot_id, None)
+                self._emit_event("VISION_SLOT_CLEARED", slot=slot_id,
+                                 absent_s=round(obs_time - st["last_seen"], 2))
+                log.info("[VISION_OCCUPANCY] cleared %s (%.1fs 미검출)",
+                         slot_id, obs_time - st["last_seen"])
 
     def _record_pose(self, seen: list[VehicleView], state: TrackState,
                      t_recv: float) -> None:
@@ -557,6 +692,15 @@ class ParkingPipeline:
                     heading_deg=(None if view.heading_deg is None
                                  else round(view.heading_deg, 1)))
 
+    def _slot_occupancy(self):
+        """배정/안전 판단이 보는 실효 점유 = base OR vision overlay.
+
+        overlay 가 없는 allocator(테스트 스텁 등)에서는 base 를 그대로 쓴다 —
+        기능이 없을 때의 동작은 production 과 완전히 같다.
+        """
+        return getattr(self.allocator, "effective_slot_statuses",
+                       self.allocator.slot_statuses)
+
     def _emit_event(self, name: str, **fields: Any) -> None:
         if self.on_event_record is not None:
             self.on_event_record(name, **fields)
@@ -585,7 +729,7 @@ class ParkingPipeline:
                          self.config.lot_height_mm),
             target_slot=slot_id, occupied_slots=tuple(
                 sid for sid in SLOT_NAMES
-                if self.allocator.slot_statuses[SLOT_NAMES.index(sid)] >= 0.5
+                if self._slot_occupancy()[SLOT_NAMES.index(sid)] >= 0.5
                 and sid != slot_id),
             obstacle_poses=obstacles,
             obstacle_margin_mm=float(getattr(
@@ -641,6 +785,27 @@ class ParkingPipeline:
             poses.append(pose)
             included.add(car_id)
 
+        # ── vision 으로 확정된 정적 주차 차량 ─────────────────────────────
+        #
+        # 전원이 꺼진 채 슬롯에 세워둔 차는 rc_car 로는 매 프레임 잡히지만
+        # front_cushion 이 거의 안 잡혀 heading_source 가 LAST_VALID 로 굳는다
+        # (실측 run_20260906_190856 25.9% / _191008 4.7%). 그러면 아래의
+        # trusted 검사에 걸려 uncertain 이 되고, _trajectory_verdict 가 **모든**
+        # route/recovery 를 OTHER_VEHICLE_POSE_UNCERTAIN 으로 거절한다.
+        # 두 run 다 정확히 그렇게 끝났다.
+        #
+        # 그런데 그 차는 "자세를 모르는 움직이는 차" 가 아니라 "그 칸에 세워둔
+        # 차" 다. 그건 이 파이프라인이 이미 PARKED 차량에 쓰는 의미이고, 바로
+        # 위 _parked_obstacles 가 그 표현이다 — 마지막으로 검증된 정적 자세를
+        # 쓰고 heading 신선도를 요구하지 않는다. 같은 의미를 슬롯 단위로 쓴다.
+        #
+        # 장애물에서 빼는 것이 **아니다**. 실제 차체는 그대로 남고, 못 믿는
+        # heading 한 축만 슬롯의 주차 방향으로 대체된다.
+        vision_parked = dict(getattr(self, "_vision_parked_obstacles", {}))
+        for pose in vision_parked.values():
+            poses.append(pose)
+        specs = default_slot_specs() if vision_parked else {}
+
         max_age = float(getattr(
             getattr(self.config, "controller_config", None),
             "max_pose_age_s", 0.5))
@@ -679,6 +844,14 @@ class ParkingPipeline:
                         other.position_mm[0] - view.position_mm[0],
                         other.position_mm[1] - view.position_mm[1])
                     <= same_vehicle_mm):
+                continue
+            # 이미 정적 장애물로 들어간 그 차다 (bound 차량은 대상이 아니다).
+            # heading 이 FRONT_CUSHION 으로 되살아나도 같은 차를 static +
+            # dynamic 으로 두 번 넣지 않는다.
+            if other.car_id is None and any(
+                    in_final_region(specs[sid], other.position_mm[0],
+                                    other.position_mm[1])
+                    for sid in vision_parked if sid in specs):
                 continue
             age = now - other.last_obs_time
             fresh = (other.last_obs_time > 0.0 and age >= -0.05
@@ -1287,7 +1460,7 @@ class ParkingPipeline:
     def _entry_staging_candidate_slots(self, preferred: str) -> list[str]:
         specs = default_slot_specs()
         others = [sid for sid in specs if sid != preferred
-                  and self.allocator.slot_statuses[SLOT_NAMES.index(sid)] < 0.5]
+                  and self._slot_occupancy()[SLOT_NAMES.index(sid)] < 0.5]
         return [preferred, *others]
 
     def _preferred_slot_needs_reposition(self, view: VehicleView,
@@ -2009,8 +2182,8 @@ class ParkingPipeline:
             if slot_id == exclude:
                 continue
             idx = SLOT_NAMES.index(slot_id)
-            if self.allocator.slot_statuses[idx] >= 1.0:
-                continue                                  # 이미 점유/선점됨
+            if self._slot_occupancy()[idx] >= 1.0:
+                continue                          # 점유/선점/카메라 점유
             if self.rear_parking_mode:
                 rear, _ = choose_rear_parking_plan(
                     spec, min_radius_mm=self._plan_radius,
@@ -4455,7 +4628,7 @@ class ParkingPipeline:
         tracked = getattr(self.allocator, "vehicles", {}).get(view.track_id)
         owns_reservation = (tracked is not None
                             and tracked.assigned_slot == slot_id)
-        if (self.allocator.slot_statuses[slot_index] >= 0.5
+        if (self._slot_occupancy()[slot_index] >= 0.5
                 and not owns_reservation):
             self._comm_recovery_fault(car_id, "COMM_CONTEXT_SLOT_OCCUPIED",
                                       slot=slot_id)

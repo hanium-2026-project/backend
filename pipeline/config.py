@@ -144,6 +144,19 @@ class PipelineConfig:
     # PARKED 를 확정하기 위해 연속으로 조건을 만족해야 하는 서로 다른 fresh
     # 관측 수. 한 프레임 잡음으로 주차 완료를 찍지 않기 위한 것이다.
     parked_confirm_observations: int = 3
+
+    # ─── 촬영용: 카메라만으로 판정하는 정적 슬롯 점유 ────────────────────────
+    # 전원이 꺼진 채 슬롯에 세워둔 차량을 카메라만 보고 "그 칸은 이미 찼다" 로
+    # 판정한다. CAR_ID binding 도, ESP 연결도 필요 없다.
+    #
+    # 끄면 production 과 완전히 동일한 배정 동작이 된다 (안전 스위치).
+    vision_occupancy_enabled: bool = True
+    # 점유 확정에 필요한 연속 관측 수. parked_confirm_observations 와 같은
+    # 의미(=3)라 값을 새로 만들지 않고 맞춰 둔다. 실측 vision 4fps 기준 약 0.75s.
+    vision_occupancy_confirm_observations: int = 3
+    # 해제 유예. bbox 가 한두 프레임 빠졌다고 점유를 풀면 안 된다(§13).
+    # 4fps 기준 약 12프레임 — 차를 실제로 치우면 그 뒤에 풀린다.
+    vision_occupancy_release_s: float = 3.0
     # 후진 복구를 걸 waypoint phase.
     #
     # 통로 중간(CRUISE)은 허용오차가 넓고 다음 점이 이어지므로, 조금 밀려도

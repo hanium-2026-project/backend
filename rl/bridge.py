@@ -75,6 +75,10 @@ class RealtimeAllocator:
     def __init__(self, model_path: str = "models/sb3_parking_policy.zip") -> None:
         self.model_path = model_path
         self.slot_statuses = np.zeros(NUM_SLOTS, dtype=np.float32)
+        # 카메라만으로 판정한 정적 점유(전원 꺼진 채 세워둔 차 등).
+        # slot_statuses 와 **분리된 overlay** 다 — 예약/PARKED 상태를 덮어쓰지도,
+        # vision clear 가 그것들을 지우지도 않는다.
+        self.vision_occupied = np.zeros(NUM_SLOTS, dtype=np.float32)
         self.vehicles: dict[int, TrackedVehicle] = {}
 
     # ─── 상태 갱신 ────────────────────────────────────────────────────────────
@@ -93,6 +97,24 @@ class RealtimeAllocator:
 
     def set_slot_occupied(self, slot_name: str, occupied: bool = True) -> None:
         self.slot_statuses[SLOT_NAMES.index(slot_name)] = 1.0 if occupied else 0.0
+
+    def set_vision_occupied(self, slot_name: str, occupied: bool = True) -> None:
+        """카메라 관측만으로 판정한 정적 점유를 켜고 끈다.
+
+        base(slot_statuses)를 건드리지 않는다. 그래서
+          - allocate() 가 잡아둔 예약을 vision clear 가 풀 수 없고,
+          - _on_parked() 가 세운 PARKED 를 vision clear 가 지울 수 없다.
+        """
+        self.vision_occupied[SLOT_NAMES.index(slot_name)] = 1.0 if occupied else 0.0
+
+    @property
+    def effective_slot_statuses(self) -> np.ndarray:
+        """배정 판단에 쓰는 실효 점유 = base OR vision.
+
+        둘 중 하나라도 점유면 점유다 (idempotent — 같은 칸이 양쪽에서 점유로
+        잡혀도 값은 1.0 그대로다).
+        """
+        return np.maximum(self.slot_statuses, self.vision_occupied)
 
     def remove_vehicle(self, track_id: int) -> None:
         self.vehicles.pop(track_id, None)
@@ -143,7 +165,7 @@ class RealtimeAllocator:
 
     def _build_obs(self) -> np.ndarray:
         obs = np.zeros(STATE_DIM, dtype=np.float32)
-        obs[:NUM_SLOTS] = self.slot_statuses
+        obs[:NUM_SLOTS] = self.effective_slot_statuses
 
         num_nodes = max(len(_ALL_NODES), 1)
         max_eta = _MAX_ROUTE_LEN * NODE_TRAVEL_TIME
@@ -173,6 +195,6 @@ class RealtimeAllocator:
 
     def _build_masks(self) -> np.ndarray:
         masks = np.zeros(NUM_SLOTS + 1, dtype=bool)
-        masks[:NUM_SLOTS] = self.slot_statuses < 0.5   # 빈 슬롯만 선택 가능
+        masks[:NUM_SLOTS] = self.effective_slot_statuses < 0.5   # 빈 칸만 선택
         masks[WAIT_ACTION] = True
         return masks
