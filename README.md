@@ -1,7 +1,47 @@
-# Hanium Smart Parking Backend
+# 🚗 Hanium 2026 — AI Smart Parking System
 
-Django REST Framework backend for the intelligent parking scheduling and control MVP.
-**Strictly Docker-based development & deployment** — no local Python/conda/venv setup.
+CCTV 기반 차량 인식과 강화학습 기반 주차 공간 배정, RC Car 자동주차 제어를 통합한 AI 스마트 주차 시스템입니다. 차량 인식부터 주차 공간 배정, 경로/제어, 실제 RC Car 주차까지 연결되는 End-to-End 시스템을 세 저장소로 나누어 구현했습니다.
+
+## 📦 Repositories
+
+| Repository | Role |
+|---|---|
+| [Frontend](https://github.com/hanium-2026-project/frontend) | 실시간 주차 현황 및 시스템 상태를 제공하는 웹 대시보드 |
+| **Backend (현재 저장소)** | 차량 인식, 주차 상태 관리, RL 기반 주차 공간 배정 및 시스템 orchestration |
+| [Hardware](https://github.com/hanium-2026-project/hardware) | Host 기반 차량 제어, ESP32 firmware 및 RC Car 자동주차 |
+
+## 🏗️ System Architecture
+
+```
+고정 카메라 (CCTV)
+  ↓
+YOLO / OpenCV 차량 인식 · Homography 좌표 변환      ← 이 저장소 (cv/)
+  ↓
+Vehicle Pose (x, y, heading)
+  ↓
+주차 상태 관리 · RL(PPO) 기반 슬롯 배정             ← 이 저장소 (rl/, parking/)
+  ↓
+Route / Waypoint · 주차 mission (후면주차 포함)     ← 이 저장소 (parking/waypoints.py)
+  ↓
+경로 안전 검증 → HostController 폐루프 제어         ← Hardware 저장소
+  ↓
+Wi-Fi TCP/NDJSON → ESP32 firmware → 모터/서보       ← Hardware 저장소
+  ↓
+카메라 재관측 (closed loop)
+
+Frontend는 이 Backend의 REST/WebSocket 상태·텔레메트리·CCTV를 받아
+실시간 대시보드로 시각화합니다.
+```
+
+이 저장소는 위 구조에서 **Perception → Decision Making(RL) → System Orchestration** 계층을 담당합니다. 실차 제어(HostController, ESP32)는 [Hardware 저장소](https://github.com/hanium-2026-project/hardware)에서 이어집니다.
+
+## ✨ Key Features
+
+- **차량 인식 및 좌표 변환**: YOLO 2-class(`rc_car`, `front_cushion`) 검출 + 차량-마커 association + heading 추정 + Homography 기반 실좌표 변환 (`cv/`)
+- **주차 상태 관리**: 슬롯 예약/점유 상태 관리, 카메라만으로 전원 꺼진 정차 차량을 인식하는 `VISION_OCCUPIED` (`pipeline/runner.py`, `parking/`)
+- **RL 기반 주차 공간 배정**: MaskablePPO 환경 + action masking + Safety Shield, 정책/의존성이 없으면 규칙 기반(heuristic) 배정으로 자동 fallback (`rl/`)
+- **Route / 주차 Mission**: 후면주차 route(ALIGN/ENTRY/FINAL) 생성과 실행 전 궤적 안전 검증 (`parking/waypoints.py`, `parking/trajectory_safety.py`, `parking/final_alignment.py`)
+- **System Orchestration**: 인식→배정→경로→제어를 하나의 파이프라인으로 엮고(`pipeline/runner.py`), Django REST/WebSocket으로 Frontend·Hardware와 연동
 
 ## Prerequisites
 
@@ -74,7 +114,7 @@ REST/WS API 와 별개로, RC카 자동주차는 아래 경로로 동작한다.
   → 실행 전 경로 안전 검증               (parking/trajectory_safety.py)
   → 노트북 AUTO_HOST                    (control/, controller/, host_control/)
   → TCP / NDJSON                        (comm/)
-  → ESP32 REMOTE_DIRECT
+  → ESP32 REMOTE_DIRECT                 [Hardware 저장소]
   → DC 모터 / 서보 / 엔코더
   → 카메라 재관측 (closed loop)
 ```
@@ -101,6 +141,17 @@ python manage.py run_pipeline --control-mode auto-host --parking-mode rear --cal
 python -m unittest discover -s . -p "test_*.py" -t .
 python tools/run_auto_parking_tests.py
 ```
+
+## 🛠️ Engineering Challenges
+
+단순히 모델을 붙이는 것으로 끝나지 않았습니다. 인식 결과가 실제로 배정·경로·제어로 이어지는 과정에서 발생한 문제들을 **원인 분석 → 설계 변경 → 검증**의 흐름으로 해결했습니다. 대표 사례:
+
+- **FINAL 후진 Blind-Travel Overshoot** — 실측 run에서 목표까지 65mm 남은 상태로 547ms 무관측 후진해 맵 밖으로 78.7mm 이탈한 사례를, 카메라 fps·실측 속도·물리적 여유를 하나의 거리 기반 부등식으로 엮어 해결
+- **PPO Reward 설계 실패** — `CONFLICT_PENALTY`가 다른 신호를 압도해 PPO가 "충돌회피 전문가"가 되어 처리량을 희생하던 문제와, WAIT penalty가 너무 작아 정책이 아무 행동도 하지 않던 deadlock을 reward 재설계로 해결
+- **Vision Occupancy → Planning 실패 전파** — 전원 꺼진 정차 차량의 마커 미검출이 `heading_source=LAST_VALID` 고착으로 이어져 모든 route가 거절되던 문제를, "정적 차량"이라는 기존 개념을 확장해 해결
+- **Production E2E Failure Modes** — Route 실패 전파, stale heading으로 미션 시작, waypoint overshoot 재계획 루프, 통신 재접속 후 stale 세션 재사용 등 시스템 lifecycle 전 구간의 실패 모드를 실차 통합 과정에서 찾아 수정
+
+수치와 검증 근거를 포함한 전체 내용은 **[`docs/engineering-challenges.md`](docs/engineering-challenges.md)** 에 정리되어 있습니다. (PPO는 시뮬레이션에서 검증되었으며, 문서화된 최종 실차 검증에서는 `sb3-contrib` 부재로 규칙 기반 fallback이 실행되었다는 점도 해당 문서에 명시되어 있습니다.)
 
 ### 현재 개발 상태
 
@@ -132,12 +183,23 @@ fresh observation과 현재 Pose 기준 재계획을 요구한다.
 - Dashboard REST/WebSocket은 구현되어 있으며 Redis 설정이 없으면 in-memory channel
   layer를 사용한다. Dashboard 전송 실패는 차량 제어와 안전정지를 막지 않는다.
 
+## 🧰 Tech Stack
+
+Python, Django 5 / DRF / Channels(Daphne), Redis, SQLite, OpenCV(`opencv-python-headless`), Ultralytics YOLO, Gymnasium — (선택) Stable-Baselines3 + sb3-contrib(MaskablePPO), Ray RLlib, Docker/docker-compose.
+
 ## Live Viz Demo
 
 차량 라우팅을 시각화하는 standalone HTML 데모는 별도 프론트 레포에 있다:
 [`hanium-2026-project/frontend → viz/`](https://github.com/hanium-2026-project/frontend/tree/main/viz)
 
 로컬 백엔드를 띄운 상태에서 viz의 README에 따라 `python3 -m http.server 5173`으로 서빙하면 즉시 동작한다.
+
+## 상세 문서
+
+- [`docs/engineering-challenges.md`](docs/engineering-challenges.md) — 문제 해결 사례 (Problem → Root Cause → Solution → Validation)
+- [`docs/autohost/TEST_REPORT.md`](docs/autohost/TEST_REPORT.md) — 제어/통신 계층 unit·integration 테스트 118건 결과
+- [`docs/autohost/REAL_CAR_TEST_PLAN.md`](docs/autohost/REAL_CAR_TEST_PLAN.md) — 실차 테스트 계획
+- [`docs/hw_team_handoff_2026-08-07.md`](docs/hw_team_handoff_2026-08-07.md) 등 — HW팀 인수인계 문서
 
 ## Troubleshooting
 
