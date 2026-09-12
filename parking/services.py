@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+import logging
 
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
@@ -11,6 +11,9 @@ from django.db.models import Count, Q
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
+logger = logging.getLogger(__name__)
+
+from .protocol import VehicleTelemetryMessage
 from .models import (
     Camera,
     EntryExit,
@@ -22,6 +25,10 @@ from .models import (
     Vehicle,
 )
 
+
+ENTRY_POINT: tuple[float, float] = (150.0, 0.0)      # 주차장 입구 — 좌측 도로(300mm) 중심, 하단
+EXIT_POINT: tuple[float, float] = (150.0, 1200.0)    # 주차장 출구 — 좌측 도로(300mm) 중심, 상단
+AISLE_Y: float = 600.0                               # 중앙 주행로 y좌표 — B열(150)과 A열(1050) 사이 중간
 
 SPOT_PREFERENCE_BY_VEHICLE = {
     "ev": ["ev", "standard", "compact"],
@@ -39,29 +46,47 @@ def seed_demo_data() -> None:
     plus this function, while tests can call it repeatedly because lookups are
     idempotent.
     """
-    lot, _ = ParkingLot.objects.get_or_create(
+    # update_or_create ensures dimensions are refreshed on every seed run.
+    # get_or_create would silently keep the old 0.0 default for lots that were
+    # created before lot_width/lot_height were introduced (migration 0002).
+    lot, _ = ParkingLot.objects.update_or_create(
         lot_id=1,
-        defaults={"name": "Hanium Smart Parking", "address": "Seoul Demo Campus", "total_capacity": 12},
+        defaults={
+            "name": "Hanium Smart Parking",
+            "address": "Seoul Demo Campus",
+            "total_capacity": 8,
+            "lot_width": 1200.0,
+            "lot_height": 1200.0,
+        },
     )
-    specs: Iterable[tuple[str, str, float, float]] = [
-        ("A1", "standard", 1, 1),
-        ("A2", "standard", 2, 1),
-        ("A3", "compact", 3, 1),
-        ("A4", "ev", 4, 1),
-        ("B1", "standard", 1, 2),
-        ("B2", "standard", 2, 2),
-        ("B3", "compact", 3, 2),
-        ("B4", "disabled", 4, 2),
-        ("C1", "standard", 1, 3),
-        ("C2", "standard", 2, 3),
-        ("C3", "ev", 3, 3),
-        ("C4", "standard", 4, 3),
+    # Layout dimensions (mm): spot 200x300, line 25, aisle 550
+    # Origin (0, 0) = 주차장 입구 (bottom-left)
+    _PITCH = 225.0    # spot_width(200) + line_width(25)
+    _START_X = 425.0  
+    _A_Y = 150.0      # half_depth(150) from bottom — 입구 방향 (아래쪽)
+    _B_Y = 1050.0     # B_depth(300) + line(25) + aisle(550) + line(25) + half_depth(150) — 출구 방향 (위쪽)
+
+    specs: list[tuple[str, str, float, float]] = [
+        # A열 — 입구 방향 (아래쪽), 실측 라벨 기준
+        ("A1", "standard", _START_X,               _A_Y),
+        ("A2", "standard", _START_X + _PITCH,       _A_Y),
+        ("A3", "standard", _START_X + _PITCH * 2,   _A_Y),
+        ("A4", "standard", _START_X + _PITCH * 3,   _A_Y),
+        # B열 — 출구 방향 (위쪽)
+        ("B1", "standard", _START_X,               _B_Y),
+        ("B2", "standard", _START_X + _PITCH,       _B_Y),
+        ("B3", "standard", _START_X + _PITCH * 2,   _B_Y),
+        ("B4", "standard", _START_X + _PITCH * 3,   _B_Y),
     ]
+    # specs에 없는 스팟 제거 (ex. 이전 C열 잔존 데이터 정리)
+    current_sections = [section for section, *_ in specs]
+    lot.spots.exclude(section__in=current_sections).delete()
+
     for section, spot_type, x, y in specs:
-        ParkingSpot.objects.get_or_create(
+        ParkingSpot.objects.update_or_create(
             lot=lot,
             section=section,
-            defaults={"spot_type": spot_type, "status": "vacant", "coord_x": x, "coord_y": y},
+            defaults={"spot_type": spot_type, "coord_x": x, "coord_y": y},
         )
     lot.total_capacity = lot.spots.count()
     lot.save(update_fields=["total_capacity"])
@@ -78,7 +103,7 @@ def seed_demo_data() -> None:
 
 def _distance_from_entry(spot: ParkingSpot) -> float:
     """Score a spot by distance from the current MVP entry coordinate."""
-    return (spot.coord_x**2 + spot.coord_y**2) ** 0.5
+    return ((spot.coord_x - ENTRY_POINT[0]) ** 2 + (spot.coord_y - ENTRY_POINT[1]) ** 2) ** 0.5
 
 
 def recommend_spot(lot_id: int | None = None, vehicle_type: str = "sedan") -> ParkingSpot:
@@ -112,12 +137,20 @@ def recommend_spot(lot_id: int | None = None, vehicle_type: str = "sedan") -> Pa
     return recommended
 
 
-def build_route_plan(vehicle: Vehicle, target_spot: ParkingSpot, start: tuple[float, float] = (0.0, 0.0)) -> RoutePlan:
-    """Create a simple waypoint route that can later be replaced by RL output."""
+def build_route_plan(vehicle: Vehicle, target_spot: ParkingSpot, start: tuple[float, float] = ENTRY_POINT) -> RoutePlan:
+    """Create a polyline waypoint route along the actual driving path.
+
+    MVP 수준의 단순 route graph: 대각선 이동 없이 직교 경로(entry → aisle 진입 →
+    aisle 수평 이동 → spot 진입)로 구성해 프론트 polyline 렌더링이 실제 차량
+    이동처럼 보이도록 한다.
+    """
     start_x, start_y = start
+    # aisle_entry: 입구에서 수직으로 중앙 주행로까지 이동
+    # aisle: 주행로를 수평으로 목표 칸 x까지 이동 후 수직 진입
     waypoints = [
         {"x": start_x, "y": start_y, "label": "entry"},
-        {"x": target_spot.coord_x, "y": start_y, "label": "aisle"},
+        {"x": start_x, "y": AISLE_Y, "label": "aisle_entry"},
+        {"x": target_spot.coord_x, "y": AISLE_Y, "label": "aisle"},
         {"x": target_spot.coord_x, "y": target_spot.coord_y, "label": target_spot.section},
     ]
     return RoutePlan.objects.create(
@@ -131,14 +164,60 @@ def build_route_plan(vehicle: Vehicle, target_spot: ParkingSpot, start: tuple[fl
 
 
 def _broadcast_state(event: str, payload: dict) -> None:
-    """Publish a state update to dashboard WebSocket clients when available."""
+    """Publish a state update to dashboard WebSocket clients when available.
+
+    Broadcast is a side-effect of business operations. A failure here (e.g.
+    Redis is briefly unavailable) must NOT roll back the surrounding DB
+    transaction, so any exception is logged and swallowed.
+    """
     channel_layer = get_channel_layer()
     if not channel_layer:
         return
-    async_to_sync(channel_layer.group_send)(
-        "parking_dashboard",
-        {"type": "parking.state", "payload": {"event": event, **payload}},
-    )
+    try:
+        async_to_sync(channel_layer.group_send)(
+            "parking_dashboard",
+            {"type": "parking.state", "payload": {"event": event, **payload}},
+        )
+    except Exception as exc:  # pragma: no cover - depends on broker availability
+        logger.warning("dashboard broadcast failed (event=%s): %s", event, exc)
+
+
+def _broadcast_after_commit(event: str, payload: dict) -> None:
+    """Schedule a broadcast to fire after the current DB transaction commits.
+
+    Without on_commit, the broadcast would observe (and downstream consumers
+    could react to) state that may still be rolled back. Combined with the
+    try/except inside _broadcast_state, this gives us at-most-once delivery
+    with no impact on transactional integrity.
+    """
+    transaction.on_commit(lambda: _broadcast_state(event, payload))
+
+
+def broadcast_vehicle_pose(telemetry: "VehicleTelemetryMessage") -> None:
+    """CV 파이프라인의 실시간 차량 관측을 대시보드로 흘린다.
+
+    `event` 키를 넣지 않는다. 대시보드는 event 가 있을 때 REST 를 다시 조회하는데,
+    pose 는 초당 수 회 들어오므로 event 를 붙이면 불필요한 재조회 폭주가 된다.
+    지도 갱신처럼 스트림이 필요한 화면은 `vehicle.telemetry` 타입을 직접 구독한다.
+    """
+    channel_layer = get_channel_layer()
+    if not channel_layer:
+        return
+    try:
+        async_to_sync(channel_layer.group_send)(
+            "parking_dashboard",
+            {"type": "parking.telemetry", "payload": telemetry.to_dict()},
+        )
+    except Exception as exc:  # pragma: no cover - depends on broker availability
+        logger.warning("pose broadcast failed (car=%s): %s", telemetry.car_id, exc)
+
+
+def broadcast_vehicle_event(event: str, payload: dict) -> None:
+    """상태가 바뀐 시점에만 보내는 이벤트 (대시보드 재조회를 유발한다).
+
+    슬롯 배정·주차 완료·충돌 정지처럼 요약 수치가 실제로 달라지는 순간에만 쓴다.
+    """
+    _broadcast_state(event, payload)
 
 
 @transaction.atomic
@@ -160,7 +239,7 @@ def process_entry(license_plate: str, vehicle_type: str = "sedan", lot_id: int |
     transaction_record = EntryExit.objects.create(vehicle=vehicle, spot=spot)
     ParkingAssignment.objects.create(vehicle=vehicle, spot=spot, status="occupied")
     route_plan = build_route_plan(vehicle=vehicle, target_spot=spot)
-    _broadcast_state(
+    _broadcast_after_commit(
         "entry",
         {"license_plate": license_plate, "spot_id": spot.spot_id, "transaction_id": transaction_record.transaction_id},
     )
@@ -189,7 +268,7 @@ def process_exit(license_plate: str) -> EntryExit:
         status="completed",
         released_at=timezone.now(),
     )
-    _broadcast_state(
+    _broadcast_after_commit(
         "exit",
         {"license_plate": license_plate, "spot_id": spot.spot_id, "transaction_id": transaction_record.transaction_id},
     )
@@ -201,7 +280,7 @@ def update_camera_heartbeat(camera: Camera, status: str = "online") -> Camera:
     camera.status = status
     camera.last_heartbeat = timezone.now()
     camera.save(update_fields=["status", "last_heartbeat"])
-    _broadcast_state("camera_heartbeat", {"camera_id": camera.camera_id, "status": camera.status})
+    _broadcast_after_commit("camera_heartbeat", {"camera_id": camera.camera_id, "status": camera.status})
     return camera
 
 
@@ -227,6 +306,8 @@ def dashboard_state() -> dict:
                 "name": lot.name,
                 "address": lot.address,
                 "total_capacity": lot.total_capacity,
+                "lot_width": lot.lot_width,
+                "lot_height": lot.lot_height,
                 "vacant_count": lot.vacant_count,
                 "occupied_count": lot.occupied_count,
                 "reserved_count": lot.reserved_count,

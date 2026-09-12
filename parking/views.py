@@ -20,6 +20,7 @@ from .serializers import (
     VehicleSerializer,
 )
 from .services import (
+    ENTRY_POINT,
     build_route_plan,
     dashboard_state,
     parking_lot_queryset_with_counts,
@@ -43,18 +44,19 @@ class VehicleViewSet(viewsets.ModelViewSet):
         vehicle = self.get_object()
         serializer = RouteRequestSerializer(data=request.data if request.method == "POST" else request.query_params)
         serializer.is_valid(raise_exception=True)
-        start_values = serializer.validated_data.get("start") or [0.0, 0.0]
+        raw_start = serializer.validated_data.get("start")
+        start = (raw_start[0], raw_start[1]) if raw_start else ENTRY_POINT
         target_spot_id = serializer.validated_data.get("target_spot_id")
 
         if target_spot_id:
             target_spot = get_object_or_404(ParkingSpot, spot_id=target_spot_id)
-            route_plan = build_route_plan(vehicle, target_spot, start=(start_values[0], start_values[1]))
+            route_plan = build_route_plan(vehicle, target_spot, start=start)
         else:
             route_plan = vehicle.route_plans.select_related("target_spot").first()
             if route_plan is None:
                 active = EntryExit.objects.filter(vehicle=vehicle, exit_time__isnull=True).select_related("spot").first()
                 target_spot = active.spot if active else recommend_spot(vehicle_type=vehicle.vehicle_type)
-                route_plan = build_route_plan(vehicle, target_spot, start=(start_values[0], start_values[1]))
+                route_plan = build_route_plan(vehicle, target_spot, start=start)
 
         return Response(RoutePlanSerializer(route_plan).data)
 

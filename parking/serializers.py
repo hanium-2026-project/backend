@@ -33,7 +33,17 @@ class ParkingLotSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ParkingLot
-        fields = ["lot_id", "name", "address", "total_capacity", "vacant_count", "occupied_count", "reserved_count"]
+        fields = [
+            "lot_id",
+            "name",
+            "address",
+            "total_capacity",
+            "lot_width",
+            "lot_height",
+            "vacant_count",
+            "occupied_count",
+            "reserved_count",
+        ]
 
 
 class ParkingSpotSerializer(serializers.ModelSerializer):

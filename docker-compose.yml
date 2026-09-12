@@ -1,0 +1,28 @@
+services:
+  redis:
+    image: redis:alpine
+    container_name: hanium-redis
+    networks:
+      hanium:
+        aliases:
+          - redis        # .env의 REDIS_URL=redis://redis:6379/0 호스트네임 매칭
+    ports:
+      - "6379:6379"
+    restart: always
+
+  backend:
+    build: .
+    container_name: hanium-backend
+    networks:
+      - hanium
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+networks:
+  hanium:
+    name: hanium
+    driver: bridge

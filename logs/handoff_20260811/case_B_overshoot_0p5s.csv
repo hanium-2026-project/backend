@@ -1,0 +1,8 @@
+wall_time,t_s,target_x_mm,target_y_mm,cam_x_mm,cam_y_mm,heading_deg,heading_source,dist_err_cm,heading_err_deg,cmd_throttle,cmd_steering,applied_throttle,applied_steering,servo_deg_calc,motor_pwm_calc,encoder_count,state,mode,control_seq
+11:54:52.000,0.0,339,579,,,89,,23.2,,0.22,1.000,,,122.0,55,,MOVING,REMOTE_DIRECT,
+11:54:52.500,0.5,339,579,,,86,,18.4,,0.22,1.000,,,122.0,55,,MOVING,REMOTE_DIRECT,
+11:54:53.000,1.0,339,579,,,77,,13.5,,0.22,1.000,,,122.0,55,,MOVING,REMOTE_DIRECT,
+11:54:53.500,1.5,339,579,,,63,,14.1,,0.22,1.000,,,122.0,55,,MOVING,REMOTE_DIRECT,
+11:54:54.000,2.0,339,579,,,49,,21.6,,0.22,1.000,,,122.0,55,,MOVING,REMOTE_DIRECT,
+11:54:54.500,2.5,339,579,,,36,,30.2,,0.22,1.000,,,122.0,55,,MOVING,REMOTE_DIRECT,
+11:54:55.000,3.0,339,579,,,9,,53.8,,0.22,-1.000,,,50.0,55,,MOVING,REMOTE_DIRECT,

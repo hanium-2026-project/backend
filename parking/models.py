@@ -42,6 +42,8 @@ class ParkingLot(models.Model):
     name = models.CharField(max_length=120)
     address = models.CharField(max_length=255)
     total_capacity = models.PositiveIntegerField(default=0)
+    lot_width = models.FloatField(default=0.0)   # mm, x축 전체 폭
+    lot_height = models.FloatField(default=0.0)  # mm, y축 전체 높이
 
     class Meta:
         ordering = ["lot_id"]
